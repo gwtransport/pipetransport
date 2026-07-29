@@ -99,9 +99,10 @@ symmetric across the network.
 **What you can do.**
 
 - Check the regime for the pipes that matter: :math:`\mathrm{Re} = vD/\nu` with
-  :math:`\nu \approx 10^{-6}` m²/s and :math:`v = 4 Q_e / (\pi D^2)` from
-  :meth:`~pipetransport.network.PipeNetwork.segment_flow` (converted to m³/s). Trust sharp-front
-  timing where the flow is turbulent; treat it as a bulk-arrival estimate where it is not.
+  :math:`\nu \approx 1.3 \times 10^{-6}` m²/s for water at 10 °C and
+  :math:`v = 4 Q_e / (\pi D^2)` from :meth:`~pipetransport.network.PipeNetwork.segment_flow`
+  (converted to m³/s). Trust sharp-front timing where the flow is turbulent; treat it as a
+  bulk-arrival estimate where it is not.
 - Decide what you want from a service line before you model it. Its volume adds only a small delay,
   but its wall reaction can dominate the residual loss, so keeping it as a segment is usually right
   --- just do not read a sharp front at its outlet as sharp. If only the arrival time matters, report
@@ -111,6 +112,39 @@ symmetric across the network.
 - Do not reach for ``retardation_factor`` here. It models a *reversible exchange with the wall* that
   delays a compound relative to the water; it multiplies the pipe volume and shifts the arrival. It
   does not spread anything.
+
+The check itself is three lines; the unit conversion is the part that bites, since the package works
+in m³/day and the Reynolds number in m³/s.
+
+.. code:: python
+
+   import numpy as np
+   import pandas as pd
+
+   from pipetransport.examples import example_demand, example_network
+
+   network = example_network()
+   tedges = pd.date_range("2025-06-01", periods=25, freq="h")
+   demand = example_demand(tedges=tedges, network=network)
+
+   flow = network.segment_flow(flow=demand) / 86400.0  # m3/day -> m3/s
+   diameter = network.segments["diameter"].to_numpy()[:, None]
+   velocity = 4.0 * flow / (np.pi * diameter**2)  # m/s
+   reynolds = velocity * diameter / 1.3e-6  # water at 10 C
+
+   for name, row in zip(network.segments.index, reynolds, strict=True):
+       flag = "" if row.min() > 4000.0 else "   <- leaves the turbulent regime"
+       print(f"{name}: Re {row.min():6.0f} - {row.max():6.0f}{flag}")
+
+   # Every main stays turbulent around the clock; the thin, low-demand branch does not.
+   row_of = {name: i for i, name in enumerate(network.segments.index)}
+   assert reynolds[row_of["Plant-A"]].min() > 4000.0
+   assert reynolds[row_of["C-T4"]].min() < 4000.0
+
+In the example network the 100 mm branch to T4 falls to :math:`\mathrm{Re} \approx 2.8 \times 10^3`
+at the afternoon trough of its industrial demand --- the transitional regime, where the plug-flow
+front is least trustworthy --- and that is precisely the branch carrying the oldest water and the
+lowest residual.
 
 **How it is checked.** Not checkable from the inputs the package receives --- it is a statement
 about the flow regime, and the package never sees a velocity. Compare a measured breakthrough (a
