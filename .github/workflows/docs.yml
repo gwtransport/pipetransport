@@ -46,14 +46,16 @@ jobs:
           mv docs/build/html coverage
           zip -FSr documentation.zip coverage
           mv documentation.zip coverage
-      - name: Download functional and example coverage results
+      - name: Download the other jobs' published site pieces
+        # -f makes curl fail on a 404 and --remove-on-error deletes the partial file, so a piece
+        # that is not published yet (a fresh repository, or a job whose deploy lagged) is simply
+        # absent instead of being saved as GitHub's 404 page and re-published under a .zip name.
         run: |
-          curl https://pipetransport.github.io/pipetransport/coverage-functional.zip -L -o coverage-functional.zip
-          curl https://pipetransport.github.io/pipetransport/coverage-examples.zip -L -o coverage-examples.zip
-          unzip -o coverage-functional.zip || true
-          unzip -o coverage-examples.zip || true
-          mv coverage-functional.zip coverage || true
-          mv coverage-examples.zip coverage || true
+          for name in coverage-functional coverage-examples; do
+            curl -fsSL --remove-on-error "https://gwtransport.github.io/pipetransport/$name.zip" -o "$name.zip" || continue
+            unzip -o "$name.zip"
+            mv "$name.zip" coverage
+          done
       - name: Upload both coverage results
         uses: actions/upload-pages-artifact@v5
         with:
