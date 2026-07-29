@@ -84,6 +84,12 @@ if TYPE_CHECKING:
 # threshold only has to sit above the round-off of the interpolated cell boundaries.
 _COVERAGE_TOLERANCE = 1e-8
 
+# Slack, in ulps of the cumulative-volume scale, allowed when a displacement target misses the
+# record's volume range. It has to clear both the round-trip interpolation error (about one ulp
+# per segment on the path) and the 16-ulp plateau separation in _make_strictly_monotone. At
+# 1.4e-14 relative it is far below any physically meaningful volume.
+_ROUNDTRIP_ULPS = 64.0
+
 
 class PathTransfer(NamedTuple):
     """Everything the public modules read off one source-to-node path.
@@ -185,7 +191,9 @@ def path_transfer(
 
     # Per-segment cumulative volume. Plateaus from a closed valve make the volume-to-time
     # inversion multi-valued, so they are separated before the maps below invert them.
-    segment_cumulative = np.stack([
+    # np.array rather than np.stack: reporting at the source itself is a zero-segment path, and
+    # the empty list it produces has to reshape to (0, n_cin + 1) instead of raising.
+    segment_cumulative = np.array([
         _make_strictly_monotone(cumulative_flow_volume(path_flow[i], dt_days)) for i in range(n_path)
     ]).reshape(n_path, n_cin + 1)
     # Label axis: cumulative throughflow past the reporting node. Only ever read forward
@@ -212,7 +220,16 @@ def path_transfer(
         cumulative = segment_cumulative[segment]
         displaced = np.interp(times, tedges_days, cumulative, left=np.nan, right=np.nan)
         target = displaced + path_volume[segment] if downstream else displaced - path_volume[segment]
-        return np.interp(target, cumulative, tedges_days, left=np.nan, right=np.nan)
+        # Mapping a time back upstream and forward again is not bit-exact -- each composition
+        # step costs about an ulp of the cumulative volume, and the plateau separation above
+        # spends up to 16 more. A bare right=np.nan would read that miss as "the parcel left the
+        # record" and void the last output bin, so a target within _ROUNDTRIP_ULPS of the range
+        # is snapped into it. A genuine excursion is still NaN, and NaN input stays NaN.
+        low, high = cumulative[0], cumulative[-1]
+        slack = _ROUNDTRIP_ULPS * np.spacing(max(abs(low), abs(high)))
+        with np.errstate(invalid="ignore"):
+            inside = (target >= low - slack) & (target <= high + slack)
+        return np.where(inside, np.interp(np.clip(target, low, high), cumulative, tedges_days), np.nan)
 
     # Refined source-time grid. Walking the path inwards and re-seeding with tedges at every
     # node collects, in source time, every parcel that crosses a flow change anywhere along

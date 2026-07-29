@@ -134,6 +134,12 @@ invalid-argument-type = "ignore"
 missing-argument = "ignore"
 # builtins monkey-patching in conftest.py
 invalid-assignment = "ignore"
+# Plot tests introspect matplotlib artists (ax.get_legend() -> Legend | None, Annotation.xy,
+# Line2D data) and feed ArrayLike straight into numpy.testing. Both stub sets under-describe
+# what the objects actually carry at runtime, so these three fire on correct assertions.
+not-subscriptable = "ignore"
+no-matching-overload = "ignore"
+unresolved-attribute = "ignore"
 
 [[tool.ty.overrides]]
 include = ["tests/notebooks/**/*.ipynb"]

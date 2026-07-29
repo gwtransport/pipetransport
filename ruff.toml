@@ -56,6 +56,7 @@ convention = "numpy"
     "DOC201",  # Small notebook helpers don't need Returns docs
 ]
 "tests/**/*.py" = [
+    "INP001",  # The test trees are not packages; pytest imports them under --import-mode=importlib
     "DOC201",  # Test functions returning None don't need Returns docs
     "DOC501",  # Test functions don't need Raises docs
     "DOC502",  # Test helpers may document exceptions not directly raised
