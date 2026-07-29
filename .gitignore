@@ -1,0 +1,196 @@
+# =============================================================================
+# Project-specific
+# =============================================================================
+cache
+.claude/
+.claire/
+
+# =============================================================================
+# Python
+# =============================================================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Cython debug symbols
+cython_debug/
+
+# SageMath parsed files
+*.sage.py
+
+# =============================================================================
+# Distribution / Packaging
+# =============================================================================
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# =============================================================================
+# Dependency Management
+# =============================================================================
+
+# pip
+pip-log.txt
+
+# pipenv
+# Pipfile.lock
+
+# poetry
+# poetry.lock
+
+# pdm
+.pdm.toml
+.pdm-python
+.pdm-build/
+# pdm.lock
+
+# uv
+uv.lock
+
+# PEP 582 (__pypackages__)
+__pypackages__/
+
+# =============================================================================
+# Virtual Environments
+# =============================================================================
+.env
+.venv
+.venv-claude
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# pyenv
+# .python-version
+
+# =============================================================================
+# Testing / Coverage
+# =============================================================================
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+coverage/
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# =============================================================================
+# Linting / Type Checking
+# =============================================================================
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+
+# =============================================================================
+# Documentation
+# =============================================================================
+
+# Sphinx
+docs/_build/
+
+# mkdocs
+/site
+
+# =============================================================================
+# IDEs / Editors
+# =============================================================================
+.vscode/
+# .idea/
+
+# Spyder
+.spyderproject
+.spyproject
+
+# Rope
+.ropeproject
+
+# IPython / Jupyter
+.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# =============================================================================
+# Frameworks
+# =============================================================================
+
+# Django
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask
+instance/
+.webassets-cache
+
+# Scrapy
+.scrapy
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# PyBuilder
+.pybuilder/
+target/
+
+# =============================================================================
+# Translations
+# =============================================================================
+*.mo
+*.pot
+
+# =============================================================================
+# OS-specific
+# =============================================================================
+**/.DS_Store
+
+# =============================================================================
+# JupyterLite / jupyterlite-sphinx (client-side interactive docs)
+# =============================================================================
+docs/source/_interactive/
+docs/source/_contents/
+docs/source/.jupyterlite.doit.db
+.jupyterlite.doit.db
+docs/source/_static/js/pyodide-prewarm-config.js
+docs/build/

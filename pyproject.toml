@@ -1,0 +1,159 @@
+[build-system]
+requires = ["hatchling >= 1.26", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pipetransport"
+dynamic = ["version"]
+description = "Timeseries analysis of water quality in branched drinking water distribution networks"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+keywords = [
+  "chlorine-decay",
+  "distribution-network",
+  "drinking-water",
+  "hydraulics",
+  "pipe-network",
+  "residence-time",
+  "time-series",
+  "transport",
+  "water-age",
+  "water-quality",
+]
+authors = [
+  { name = "Bas des Tombe"},
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: GNU Affero General Public License v3",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering",
+  "Topic :: Scientific/Engineering :: Hydrology",
+  "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+  "ipykernel>=4.0.1",
+  "matplotlib>=3.8.4",
+  "numpy>=2.0.0",
+  "pandas>=2.2.2",
+  "scipy>=1.13.0",
+]
+[project.optional-dependencies]
+test = [
+  "nbconvert>=7.1.0",
+  "nbformat>=5.0.2",
+  "pytest>=6.2.5",
+  "pytest-cov>=2.3.1",
+  "pytest-xdist>=3.0.0",
+  "ruff==0.15.6",
+  "ty",
+  "validate-pyproject[all,store]",
+  # schema-store 2026.7.20 ships a uv.json schema that crashes validate-pyproject 0.25's
+  # generated validator (UnboundLocalError: 'data_keys'), failing the lint job on every
+  # branch. Exclude the broken release; drop the exclusion once a fixed version is out.
+  "validate-pyproject-schema-store!=2026.7.20",
+]
+docs = [
+  # Do NOT add the "jupyter" metapackage (or "notebook"/"jupyterlab") here. The docs
+  # build does not need the JupyterLab/Notebook apps: nbsphinx renders with
+  # nbsphinx_execute="never", and the in-browser examples use the JupyterLite app
+  # bundled by jupyterlite-core. The hazard: "jupyter lite build" federates EVERY
+  # labextension present in the env, so an externally-installed lab-extension built
+  # against a different JupyterLab than the JupyterLite app can request a shared
+  # @jupyterlab/* singleton the app cannot satisfy, breaking the interactive examples
+  # with a module-federation error.
+  "jupyterlite-core>=0.6",
+  "jupyterlite-pyodide-kernel>=0.6",
+  "jupyterlite-sphinx>=0.22",
+  # conf.py imports nbformat directly (reads/writes the Pyodide notebook copies). It is
+  # otherwise present only transitively via nbsphinx; declare it so the direct import does
+  # not rest on a transitive dependency.
+  "nbformat>=5.0.2",
+  "nbsphinx",
+  "nbsphinx-link",
+  "sphinx>=9.0,<10.0",
+  "sphinx-autodoc-typehints",
+  "sphinx-book-theme>=1.2.0",
+  "sphinx-copybutton",
+  "sphinxext-opengraph[social_cards]",
+]
+
+[project.urls]
+Homepage = "https://github.com/gwtransport/pipetransport"
+Documentation = "https://gwtransport.github.io/pipetransport/"
+Sponsor = "https://www.savethechildren.net/what-we-do/emergencies/war-gaza-escalations-west-bank"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+# TestPyPI/PyPI reject local version identifiers (+gsha), and release.yml uploads
+# untagged builds to TestPyPI; without this every such upload would error instead
+# of versioning as 0.1.1.devN.
+local_scheme = "no-local-version"
+
+[tool.uv]
+# Overriding cache-keys replaces uv's default (pyproject.toml only), so list it
+# explicitly. The git key makes uv re-derive the hatch-vcs version when the commit
+# or tags change; otherwise editable installs keep serving a stale cached version.
+cache-keys = [{ file = "pyproject.toml" }, { git = { commit = true, tags = true } }]
+
+[tool.hatch.envs.hatch-static-analysis]
+config-path = "ruff.toml"
+
+[tool.pytest.ini_options]
+addopts = [
+    "--import-mode=importlib",
+    "-n=auto",
+    "--doctest-modules",
+]
+filterwarnings = [
+    "ignore:.*Jupyter is migrating.*:DeprecationWarning",
+]
+
+[tool.coverage.run]
+concurrency = ["multiprocessing"]
+parallel = true
+sigterm = true
+
+[[tool.ty.overrides]]
+include = ["tests/**"]
+
+[tool.ty.overrides.rules]
+# pytest.skip's @_with_exception decorator confuses ty's signature analysis
+too-many-positional-arguments = "ignore"
+# **kwargs / **params dict unpacking with mixed-type values in parameterized tests
+invalid-argument-type = "ignore"
+# Tests intentionally call functions with wrong/missing args to verify error handling
+missing-argument = "ignore"
+# builtins monkey-patching in conftest.py
+invalid-assignment = "ignore"
+
+[[tool.ty.overrides]]
+include = ["tests/notebooks/**/*.ipynb"]
+
+[tool.ty.overrides.rules]
+# Intentionally broken notebook for testing error handling
+unresolved-reference = "ignore"
+
+[[tool.ty.overrides]]
+include = ["docs/source/conf.py"]
+
+[tool.ty.overrides.rules]
+# conf.py imports docs-only packages (e.g. jupyterlite_pyodide_kernel); the linting
+# env installs only --extra test, so they don't resolve here.
+unresolved-import = "ignore"
+
+[tool.coverage.report]
+exclude_lines = [
+    "def __repr__",
+    "pragma: no cover",
+    "raise AssertionError",
+    "raise NotImplementedError",
+]

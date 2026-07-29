@@ -1,0 +1,85 @@
+extend = "ruff_defaults.toml"
+
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".ipynb_checkpoints",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pyenv",
+    ".pytest_cache",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    ".vscode",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "site-packages",
+    "venv",
+]
+
+target-version = "py312"
+
+[format]
+preview = true
+
+[lint]
+preview = true
+
+extend-select = ["D"]
+
+[lint.pydocstyle]
+convention = "numpy"
+
+[lint.per-file-ignores]
+'**/*.py' = [
+    "RUF001",
+    "TC003",    # Type checking is fine.
+]
+"examples/**/*.ipynb" = [
+    "INP001",  # __init__.py is not needed for the examples folder
+    "T201",  # Allow for print statements
+    "B018", # allow notebooks printing out variables in the mid cell with variable names only
+    "PLR2004",
+    "E402",
+    "DOC201",  # Small notebook helpers don't need Returns docs
+]
+"tests/**/*.py" = [
+    "DOC201",  # Test functions returning None don't need Returns docs
+    "DOC501",  # Test functions don't need Raises docs
+    "DOC502",  # Test helpers may document exceptions not directly raised
+    "PLC2701",  # Test code (incl. oracle helpers) may import package internals
+]
+"tests/**/test_*.py" = [
+    "S101",    # asserts allowed in tests
+    "D",
+    "PT011",   # ValueError should be allowed
+    "PLR2004",
+    "PLR6301",  # Tests may be grouped in classes for clarity
+    "INP001",  # __init__.py is not needed for the test folders
+    "RUF002",  # Greek / math unicode in physics-module test docstrings
+    "RUF003",  # Same rationale in comments
+]
+"src/pipetransport/network.py" = [
+    "DOC502",  # Public entry points document ValueError; the raises happen inside the validation helpers
+]
+"src/pipetransport/transport.py" = [
+    "DOC502",  # Public entry points document ValueError; the raises happen inside the validation helpers
+]
+"src/pipetransport/residence_time.py" = [
+    "DOC502",  # Public entry points document ValueError; the raises happen inside the validation helpers
+]
+"src/pipetransport/plot.py" = [
+    "PLR0913",  # Plot helpers legitimately take many styling keywords
+]
