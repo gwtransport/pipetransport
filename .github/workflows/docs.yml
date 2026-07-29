@@ -47,14 +47,25 @@ jobs:
           zip -FSr documentation.zip coverage
           mv documentation.zip coverage
       - name: Download the other jobs' published site pieces
-        # -f makes curl fail on a 404 and --remove-on-error deletes the partial file, so a piece
-        # that is not published yet (a fresh repository, or a job whose deploy lagged) is simply
-        # absent instead of being saved as GitHub's 404 page and re-published under a .zip name.
+        # Each workflow publishes one slice of the site and pulls the others back down. A slice
+        # can legitimately be missing (a fresh repository, or a deploy that has not propagated),
+        # and it can be stale garbage (a bare curl once saved GitHub's 404 page under the .zip
+        # name and republished it). -f drops the first case; the archive test drops the second,
+        # and because a rejected file is never moved into the upload, publishing it again is how
+        # the bad copy leaves the site.
         run: |
           for name in coverage-functional coverage-examples; do
-            curl -fsSL --remove-on-error "https://gwtransport.github.io/pipetransport/$name.zip" -o "$name.zip" || continue
-            unzip -o "$name.zip"
-            mv "$name.zip" coverage
+            if ! curl -fsSL --remove-on-error "https://gwtransport.github.io/pipetransport/$name.zip" -o "$name.zip"; then
+              echo "::notice::$name.zip is not published yet; skipping"
+              continue
+            fi
+            if unzip -tq "$name.zip"; then
+              unzip -o "$name.zip"
+              mv "$name.zip" coverage
+            else
+              echo "::warning::$name.zip is not a valid archive; dropping it from this upload"
+              rm -f "$name.zip"
+            fi
           done
       - name: Upload both coverage results
         uses: actions/upload-pages-artifact@v5
