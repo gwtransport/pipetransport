@@ -1,0 +1,220 @@
+pipetransport
+=============
+
+``pipetransport`` computes the water quality delivered at the far end of a branched pipe network -- a drinking water distribution system -- from the quality of the produced water, the pipe dimensions, and the demand metered at each delivery point. It also runs the other way: from quality measured at a few delivery points, back to the quality that must have left the treatment plant. Water age and chlorine residual come out of the same machinery. All without a hydraulic solver!
+
++------------------------+--------------------------------------------+
+| Testing of source code | |Functional Testing| |Test Coverage|       |
+|                        | |Linting| |Build and release package|      |
++------------------------+--------------------------------------------+
+| Testing of examples    | |Testing of examples|                      |
+|                        |                                            |
++------------------------+--------------------------------------------+
+| Package                | |PyPI - Python Version| |PyPI - Version|   |
+|                        | |GitHub commits since latest release|      |
++------------------------+--------------------------------------------+
+
+What you can do
+---------------
+
+-  **Trace a contamination event** from the plant to every delivery point, with arrival times that follow the real demand pattern
+-  **Model chlorine residual** with separate bulk and wall decay, so thin service lines lose residual faster than trunk mains -- as they do
+-  **Map water age** across the network and watch it swing over the day
+-  **Reconstruct the produced water quality** from measurements at a handful of delivery points
+-  **Size a monitoring campaign** by asking which part of the production history each sampling point actually constrains
+
+The idea
+--------
+
+A branched network has one path from the plant to each delivery point, and a split does not change concentration. So the delivered quality is the produced quality, delayed -- and the delay is set by how much water has to be pushed through each pipe on the way.
+
+Inside a pipe of water volume ``V`` carrying flow ``Q(t)``, a parcel entering at time ``s`` leaves when it has displaced exactly ``V``. Chain that pipe by pipe and you have the arrival time at any node, exactly, for any demand pattern. Nothing has to be steady.
+
+When the demands *do* move in proportion, the chain collapses to a single number per path: ``sum(V_i / f_i)``, with ``f_i`` the fraction of production that segment ``i`` carries. A shared trunk main enters every downstream path in full rather than being divided among them. ``pipetransport`` does not need that assumption, but it reproduces it exactly when it holds.
+
+Installation
+------------
+
+.. code:: bash
+
+   pip install pipetransport
+
+Forward: what arrives at the taps
+---------------------------------
+
+.. code:: python
+
+   import numpy as np
+   import pandas as pd
+
+   from pipetransport.examples import example_demand, example_network
+   from pipetransport.transport import source_to_endmember
+
+   network = example_network()  # plant -> trunk main -> two district mains -> four taps
+   tedges = pd.date_range("2025-06-01", "2025-06-08", freq="h")  # n+1 edges for n bins
+   demand = example_demand(tedges=tedges, network=network)  # m3/day, one column per tap
+
+   # A three-hour contamination event leaves the plant on 2 June, 06:00-09:00
+   cin = np.zeros(len(tedges) - 1)
+   cin[30:33] = 1.0
+
+   cout = source_to_endmember(
+       cin=cin,
+       flow=demand,
+       tedges=tedges,
+       cout_tedges=tedges,
+       network=network,
+   )  # (4 taps, 168 hours), same units as cin
+
+   for tap, series in zip(network.endmembers, cout, strict=True):
+       peak = int(np.nanargmax(series))
+       print(f"{tap}: peak {series[peak]:.2f} at {tedges[peak]}")
+
+Only the demand at the taps is needed. Every internal pipe flow follows from mass conservation, and the split is recomputed at every time step -- no proportional-demand assumption.
+
+Reverse: what left the plant
+----------------------------
+
+.. code:: python
+
+   import numpy as np
+   import pandas as pd
+
+   from pipetransport.examples import example_demand, example_network
+   from pipetransport.transport import endmember_to_source
+
+   network = example_network()
+   tedges = pd.date_range("2025-06-01", "2025-06-15", freq="h")
+   demand = example_demand(tedges=tedges, network=network)
+
+   # Hourly grab samples at two taps; NaN wherever nothing was sampled
+   measured = pd.DataFrame(
+       {"T1": np.full(len(tedges) - 1, 0.6), "T4": np.full(len(tedges) - 1, 0.4)},
+       index=tedges[:-1],
+   )
+
+   cin = endmember_to_source(
+       cout=measured,
+       flow=demand,
+       tedges=tedges,
+       cout_tedges=tedges,
+       network=network,
+       nodes=["T1", "T4"],
+       regularization_strength=1e-4,  # ~ (noise / signal)^2
+   )  # (336,), NaN where no measurement constrains the bin
+   print(f"reconstructed {np.isfinite(cin).sum()} of {len(cin)} production bins")
+
+Each sampling point constrains a different -- and moving -- window of the production history, so several of them together pin down more than any one alone.
+
+Chlorine residual and water age
+-------------------------------
+
+.. code:: python
+
+   import numpy as np
+   import pandas as pd
+
+   from pipetransport.examples import example_demand, example_network
+   from pipetransport.logremoval import segment_decay_rate
+   from pipetransport.residence_time import full
+   from pipetransport.transport import source_to_endmember
+
+   network = example_network()
+   tedges = pd.date_range("2025-06-01", "2025-06-08", freq="h")
+   demand = example_demand(tedges=tedges, network=network)
+
+   # Bulk decay plus a wall reaction that scales with 4 / diameter
+   decay = segment_decay_rate(network=network, bulk_decay_rate=0.3, wall_decay_rate=0.02)
+
+   residual = source_to_endmember(
+       cin=np.full(len(tedges) - 1, 1.0),  # dosed to 1 mg/L at the plant
+       flow=demand,
+       tedges=tedges,
+       cout_tedges=tedges,
+       network=network,
+       decay_rate=decay,
+   )
+   age = full(flow=demand, tedges=tedges, network=network)  # days
+
+   for tap, res, hours in zip(network.endmembers, residual, age * 24, strict=True):
+       print(f"{tap}: residual {np.nanmin(res):.2f}-{np.nanmax(res):.2f} mg/L, age up to {np.nanmax(hours):.1f} h")
+
+Scope
+-----
+
+``pipetransport`` models a **single source feeding a tree**: flow splits, never merges, and never reverses. That is what makes one source signal enough to describe the whole network. Loops, a second plant, storage tanks and flow reversals are outside it. Transport inside a pipe is plug flow, which is a good approximation for turbulent mains and an optimistic one for laminar service lines.
+
+See :doc:`user_guide/assumptions` for the full list and what each one costs you.
+
+Documentation Contents
+----------------------
+
+For the label coordinate, the arrival map, and why the flow-weighted average is exact, see :doc:`user_guide/concepts`. To decide whether ``pipetransport`` fits your network, see :doc:`user_guide/assumptions`. For which module answers which question, see :doc:`user_guide/modules`.
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Guide
+   :hidden:
+
+   user_guide/concepts
+   user_guide/assumptions
+   user_guide/modules
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Examples
+
+   examples/01_Distribution_Network_Water_Quality.nblink
+
+.. toctree::
+   :maxdepth: 2
+   :caption: API Reference
+
+   api/modules
+
+License
+-------
+
+GNU Affero General Public License v3.0, a strong copyleft license that requires making the source code of any modifications available. Commercial use, distribution, modification, patent use and private use are permitted; the source, the license and copyright notice, and a statement of changes must be disclosed, and network use counts as distribution. The software comes without warranty or liability. See the `full AGPL-3.0 license text <https://choosealicense.com/licenses/agpl-3.0/>`_.
+
+``pipetransport`` is the distribution-network sibling of `gwtransport <https://github.com/gwtransport/gwtransport>`_, which does the same kind of timeseries transport for groundwater.
+
+Indices and tables
+==================
+
+* :ref:`genindex`
+* :ref:`modindex`
+* :ref:`search`
+
+.. |Functional Testing| image:: https://github.com/gwtransport/pipetransport/actions/workflows/functional_testing.yml/badge.svg?branch=main
+   :target: https://github.com/gwtransport/pipetransport/actions/workflows/functional_testing.yml
+   :width: 178
+   :height: 20
+.. |Test Coverage| image:: https://gwtransport.github.io/pipetransport/coverage-badge.svg
+   :target: https://gwtransport.github.io/pipetransport/htmlcov/
+   :width: 114
+   :height: 20
+.. |Linting| image:: https://github.com/gwtransport/pipetransport/actions/workflows/linting.yml/badge.svg?branch=main
+   :target: https://github.com/gwtransport/pipetransport/actions/workflows/linting.yml
+   :width: 115
+   :height: 20
+.. |Build and release package| image:: https://github.com/gwtransport/pipetransport/actions/workflows/release.yml/badge.svg?branch=main
+   :target: https://github.com/gwtransport/pipetransport/actions/workflows/release.yml
+   :width: 222
+   :height: 20
+.. |Testing of examples| image:: https://github.com/gwtransport/pipetransport/actions/workflows/examples_testing.yml/badge.svg?branch=main
+   :target: https://github.com/gwtransport/pipetransport/actions/workflows/examples_testing.yml
+   :width: 189
+   :height: 20
+.. |PyPI - Python Version| image:: https://img.shields.io/pypi/pyversions/pipetransport.svg?logo=python&label=Python&logoColor=gold
+   :target: https://pypi.org/project/pipetransport/
+   :width: 215
+   :height: 20
+.. |PyPI - Version| image:: https://img.shields.io/pypi/v/pipetransport.svg?logo=pypi&label=PyPI&logoColor=gold
+   :target: https://pypi.org/project/pipetransport/
+   :width: 105
+   :height: 20
+.. |GitHub commits since latest release| image:: https://img.shields.io/github/commits-since/gwtransport/pipetransport/latest?logo=github&logoColor=lightgrey
+   :target: https://github.com/gwtransport/pipetransport/compare/
+   :width: 163
+   :height: 20

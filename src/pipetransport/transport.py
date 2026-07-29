@@ -7,7 +7,7 @@ delivered at an endmember. Both public functions are two readings of the same li
 after first-order decay: :func:`source_to_endmember` applies it, :func:`endmember_to_source`
 inverts it. The operator is exact for demands that vary arbitrarily and independently over
 time -- the flow split at every junction is recomputed per time step, never assumed constant.
-See :mod:`pipetransport._transfer` for the construction.
+The construction lives in the private ``pipetransport._transfer`` module.
 
 Both directions take the endmember demand as ``flow`` and derive every internal segment flow
 from mass conservation, so the only hydraulic input is what a distribution utility actually

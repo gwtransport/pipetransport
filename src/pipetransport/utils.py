@@ -269,9 +269,9 @@ def cumulative_flow_volume(
     dt_days : array-like
         Bin widths in days, length n.
     strictly_monotone : bool, optional
-        When ``True``, separate the plateaus left by zero-flow bins with
-        :func:`_make_strictly_monotone` so the result can be inverted from volume back to
-        time. Only supported for 1D ``flow``. Default is ``False``.
+        When ``True``, separate the plateaus left by zero-flow bins with a few-ulp bump so the
+        result can be inverted from volume back to time; without it that inverse is
+        multi-valued. Only supported for 1D ``flow``. Default is ``False``.
 
     Returns
     -------
