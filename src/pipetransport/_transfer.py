@@ -119,9 +119,7 @@ class PathTransfer(NamedTuple):
     valid_in: npt.NDArray[np.bool_]
 
 
-def _surviving_fraction(
-    phi_lo: npt.NDArray[np.floating], phi_hi: npt.NDArray[np.floating]
-) -> npt.NDArray[np.floating]:
+def _surviving_fraction(phi_lo: npt.NDArray[np.floating], phi_hi: npt.NDArray[np.floating]) -> npt.NDArray[np.floating]:
     """Label-averaged surviving fraction over a cell whose decay exponent runs from ``phi_lo`` to ``phi_hi``.
 
     Evaluates ``(e^-a - e^-b) / (b - a)`` in the form ``e^-min * (1 - e^-|b-a|) / |b-a|``, which
@@ -187,9 +185,9 @@ def path_transfer(
 
     # Per-segment cumulative volume. Plateaus from a closed valve make the volume-to-time
     # inversion multi-valued, so they are separated before the maps below invert them.
-    segment_cumulative = np.stack(
-        [_make_strictly_monotone(cumulative_flow_volume(path_flow[i], dt_days)) for i in range(n_path)]
-    ).reshape(n_path, n_cin + 1)
+    segment_cumulative = np.stack([
+        _make_strictly_monotone(cumulative_flow_volume(path_flow[i], dt_days)) for i in range(n_path)
+    ]).reshape(n_path, n_cin + 1)
     # Label axis: cumulative throughflow past the reporting node. Only ever read forward
     # (time to label), so its plateaus are meaningful and stay untouched.
     node_cumulative = cumulative_flow_volume(node_flow, dt_days)
@@ -236,7 +234,7 @@ def path_transfer(
     decay_exponent = np.zeros_like(grid)
     for segment in range(n_path):
         previous, arrival = arrival, travel(arrival, segment, downstream=True)
-        decay_exponent = decay_exponent + path_decay[segment] * (arrival - previous)
+        decay_exponent += path_decay[segment] * (arrival - previous)
     travel_time = arrival - grid
     label = np.interp(arrival, tedges_days, node_cumulative, left=np.nan, right=np.nan)
 
@@ -283,17 +281,23 @@ def path_transfer(
     col_stop = np.where(populated, cin_bin[safe_hi], 0) if n_cell else np.zeros(n_cout, np.intp)
     full_band = int(np.max(col_stop - col_start)) + 1 if n_cell else 1
 
+    # Every cell contribution is a share of its output bin's label span: that division is what
+    # turns the label-uniform integral into the flow-weighted bin average.
+    span = np.where(cout_label_width > 0.0, cout_label_width, 1.0)
     slot = cout_bin * full_band + (cin_bin - col_start[cout_bin])
-    band_vals = np.bincount(slot, weights=survived, minlength=n_cout * full_band).reshape(n_cout, full_band)
-    coverage = np.bincount(cout_bin, weights=label_width, minlength=n_cout) / np.where(
-        cout_label_width > 0.0, cout_label_width, 1.0
+    band_vals = (
+        np
+        .bincount(slot, weights=survived / span[cout_bin], minlength=n_cout * full_band)
+        .astype(float, copy=False)
+        .reshape(n_cout, full_band)
     )
-    out_travel = np.bincount(cout_bin, weights=carried_time, minlength=n_cout)
+    coverage = np.bincount(cout_bin, weights=label_width, minlength=n_cout) / span
+    out_travel = np.bincount(cout_bin, weights=carried_time, minlength=n_cout) / span
 
     valid_out = row_supported & (coverage >= 1.0 - _COVERAGE_TOLERANCE)
     band_vals[~valid_out] = 0.0
     residence_time_out = np.full(n_cout, np.nan)
-    residence_time_out[valid_out] = out_travel[valid_out] / cout_label_width[valid_out]
+    residence_time_out[valid_out] = out_travel[valid_out]
     return PathTransfer(band_vals, col_start, valid_out, residence_time_out, residence_time_in, valid_in)
 
 

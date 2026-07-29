@@ -126,9 +126,9 @@ class PipeNetwork:
                 raise ValueError(msg)
             _validate_positive(segments["length"], name="segment length")
             _validate_positive(segments["diameter"], name="segment diameter")
-            segments["volume"] = np.pi / 4.0 * segments["diameter"].to_numpy(float) ** 2 * segments[
-                "length"
-            ].to_numpy(float)
+            segments["volume"] = (
+                np.pi / 4.0 * segments["diameter"].to_numpy(float) ** 2 * segments["length"].to_numpy(float)
+            )
 
         self.segments = segments
         self.source = source
@@ -186,9 +186,9 @@ class PipeNetwork:
         # paths avoids a second graph traversal: endmember e sits below node n exactly when n's
         # path is a prefix of e's path.
         endmember_paths = [paths[e] for e in self.endmembers]
-        self._below_node = np.array(
-            [[path[: len(paths[node])] == paths[node] for path in endmember_paths] for node in self.nodes]
-        )
+        self._below_node = np.array([
+            [path[: len(paths[node])] == paths[node] for path in endmember_paths] for node in self.nodes
+        ])
         # A segment carries whatever its downstream node carries.
         node_row = {node: i for i, node in enumerate(self.nodes)}
         self._below_segment = self._below_node[[node_row[node] for node in downstream]]
@@ -234,19 +234,26 @@ class PipeNetwork:
         >>> import pandas as pd
         >>> from pipetransport.examples import example_network
         >>> network = example_network()
-        >>> demand = pd.DataFrame({"T1": [240.0, 250.0], "T2": [360.0, 350.0],
-        ...                        "T3": [120.0, 130.0], "T4": [80.0, 70.0]})
+        >>> demand = pd.DataFrame({
+        ...     "T1": [240.0, 250.0],
+        ...     "T2": [360.0, 350.0],
+        ...     "T3": [120.0, 130.0],
+        ...     "T4": [80.0, 70.0],
+        ... })
         >>> network.flow_array(demand).shape
         (4, 2)
         """
+        named: dict | None = None
         if isinstance(flow, pd.DataFrame):
-            flow = {str(column): flow[column].to_numpy(dtype=float) for column in flow.columns}
-        if isinstance(flow, dict):
-            missing = [e for e in self.endmembers if e not in flow]
+            named = {str(column): flow[column].to_numpy(dtype=float) for column in flow.columns}
+        elif isinstance(flow, dict):
+            named = {str(key): value for key, value in flow.items()}
+        if named is not None:
+            missing = [e for e in self.endmembers if e not in named]
             if missing:
                 msg = f"flow is missing endmember(s): {missing}"
                 raise ValueError(msg)
-            array = np.stack([np.asarray(flow[e], dtype=float) for e in self.endmembers])
+            array = np.stack([np.asarray(named[e], dtype=float) for e in self.endmembers])
         else:
             array = np.asarray(flow, dtype=float)
             if array.ndim != 2 or array.shape[0] != len(self.endmembers):  # noqa: PLR2004

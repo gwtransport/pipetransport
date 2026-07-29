@@ -101,7 +101,9 @@ def residence_time_to_log_removal(
     Examples
     --------
     >>> from pipetransport.logremoval import residence_time_to_log_removal
-    >>> residence_time_to_log_removal(residence_times=[0.5, 1.0, 2.0], log10_decay_rate=0.2)
+    >>> residence_time_to_log_removal(
+    ...     residence_times=[0.5, 1.0, 2.0], log10_decay_rate=0.2
+    ... )
     array([0.1, 0.2, 0.4])
     """
     return log10_decay_rate * np.asarray(residence_times, dtype=float)
@@ -212,8 +214,8 @@ def fraction_remaining_to_log_removal(fraction_remaining: npt.ArrayLike) -> npt.
     Examples
     --------
     >>> from pipetransport.logremoval import fraction_remaining_to_log_removal
-    >>> fraction_remaining_to_log_removal([1.0, 0.1, 0.01])
-    array([0., 1., 2.])
+    >>> fraction_remaining_to_log_removal([0.1, 0.01, 0.001])
+    array([1., 2., 3.])
     """
     fraction_remaining = np.asarray(fraction_remaining, dtype=float)
     _validate_positive(fraction_remaining, name="fraction_remaining")
@@ -261,9 +263,16 @@ def parallel_mean(
 
     >>> import numpy as np
     >>> from pipetransport.logremoval import parallel_mean
-    >>> float(round(parallel_mean(log_removals=np.array([3.0, 1.0]),
-    ...                           flow_fractions=np.array([0.7, 0.3])), 6))
-    0.520202
+    >>> float(
+    ...     round(
+    ...         parallel_mean(
+    ...             log_removals=np.array([3.0, 1.0]),
+    ...             flow_fractions=np.array([0.7, 0.3]),
+    ...         ),
+    ...         6,
+    ...     )
+    ... )
+    1.512862
     """
     log_removals = np.asarray(log_removals, dtype=float)
     remaining = 10.0 ** (-log_removals)
@@ -331,7 +340,9 @@ def segment_decay_rate(
     >>> from pipetransport.examples import example_network
     >>> from pipetransport.logremoval import segment_decay_rate
     >>> network = example_network()
-    >>> rates = segment_decay_rate(network=network, bulk_decay_rate=0.3, wall_decay_rate=0.02)
+    >>> rates = segment_decay_rate(
+    ...     network=network, bulk_decay_rate=0.3, wall_decay_rate=0.02
+    ... )
     >>> float(rates["Plant-A"].round(3)), float(rates["C-T4"].round(3))
     (0.5, 1.1)
     """

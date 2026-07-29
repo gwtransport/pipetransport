@@ -3,8 +3,8 @@ A ready-made distribution network and demand pattern for documentation and tests
 
 The example is a treatment plant feeding a 400 mm trunk main that splits into two district
 mains, each serving two monitoring points. It is deliberately unbalanced: T4 sits at the end
-of a 2.5 km, 100 mm branch that carries a tenth of the production, so it holds the *least*
-water of any path yet delivers by far the *oldest* water. That contrast is what makes the
+of a 2.5 km, 100 mm branch that carries only a tenth of the production, so its path holds
+*less* water than T1's yet delivers by far the *oldest* water. That contrast is what makes the
 network worth modelling.
 
 The demand pattern is deliberately **not** proportional. Every endmember peaks at a different
@@ -48,7 +48,7 @@ def example_network() -> PipeNetwork:
     Returns
     -------
     PipeNetwork
-        A tree holding 1114 m³ of water across seven segments, with endmembers
+        A tree holding 473 m³ of water across seven segments, with endmembers
         ``("T1", "T2", "T3", "T4")``.
 
     See Also
@@ -61,7 +61,7 @@ def example_network() -> PipeNetwork:
     >>> from pipetransport.examples import example_network
     >>> network = example_network()
     >>> network
-    PipeNetwork(source='Plant', segments=7, endmembers=4, volume=1113.9 m3)
+    PipeNetwork(source='Plant', segments=7, endmembers=4, volume=473.2 m3)
     >>> network.paths["T4"]
     ('Plant-A', 'A-C', 'C-T4')
     """
@@ -106,8 +106,9 @@ def example_demand(*, tedges: pd.DatetimeIndex, network: PipeNetwork) -> pd.Data
     >>> import pandas as pd
     >>> from pipetransport.examples import example_network, example_demand
     >>> network = example_network()
-    >>> demand = example_demand(tedges=pd.date_range("2025-06-01", periods=25, freq="h"),
-    ...                         network=network)
+    >>> demand = example_demand(
+    ...     tedges=pd.date_range("2025-06-01", periods=25, freq="h"), network=network
+    ... )
     >>> list(demand.columns)
     ['T1', 'T2', 'T3', 'T4']
 

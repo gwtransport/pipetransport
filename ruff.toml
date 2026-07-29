@@ -80,6 +80,9 @@ convention = "numpy"
 "src/pipetransport/residence_time.py" = [
     "DOC502",  # Public entry points document ValueError; the raises happen inside the validation helpers
 ]
+"src/pipetransport/logremoval.py" = [
+    "DOC502",  # Public entry points document ValueError; the raises happen inside the validation helpers
+]
 "src/pipetransport/plot.py" = [
     "PLR0913",  # Plot helpers legitimately take many styling keywords
 ]

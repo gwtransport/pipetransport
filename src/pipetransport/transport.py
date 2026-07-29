@@ -271,11 +271,19 @@ def endmember_to_source(
     >>> cin = 2.0 + np.sin(2 * np.pi * hours / 48.0)
     >>>
     >>> measured = source_to_endmember(
-    ...     cin=cin, flow=demand, tedges=tedges, cout_tedges=tedges, network=network,
+    ...     cin=cin,
+    ...     flow=demand,
+    ...     tedges=tedges,
+    ...     cout_tedges=tedges,
+    ...     network=network,
     ...     nodes=["T1", "T4"],
     ... )
     >>> recovered = endmember_to_source(
-    ...     cout=measured, flow=demand, tedges=tedges, cout_tedges=tedges, network=network,
+    ...     cout=measured,
+    ...     flow=demand,
+    ...     tedges=tedges,
+    ...     cout_tedges=tedges,
+    ...     network=network,
     ...     nodes=["T1", "T4"],
     ... )
     >>> inner = slice(48, -48)
@@ -294,14 +302,17 @@ def endmember_to_source(
     )
     cout_tedges = pd.DatetimeIndex(cout_tedges)
 
+    named: dict | None = None
     if isinstance(cout, pd.DataFrame):
-        cout = {str(column): cout[column].to_numpy(dtype=float) for column in cout.columns}
-    if isinstance(cout, dict):
-        missing = [node for node in report_nodes if node not in cout]
+        named = {str(column): cout[column].to_numpy(dtype=float) for column in cout.columns}
+    elif isinstance(cout, dict):
+        named = {str(key): value for key, value in cout.items()}
+    if named is not None:
+        missing = [node for node in report_nodes if node not in named]
         if missing:
             msg = f"cout is missing node(s): {missing}"
             raise ValueError(msg)
-        observed = np.stack([np.asarray(cout[node], dtype=float) for node in report_nodes])
+        observed = np.stack([np.asarray(named[node], dtype=float) for node in report_nodes])
     else:
         observed = np.atleast_2d(np.asarray(cout, dtype=float))
     if observed.shape[0] != len(report_nodes):
@@ -313,9 +324,9 @@ def endmember_to_source(
     # the bands are simply concatenated after padding to the widest band; a node whose output
     # bin the record does not constrain contributes no equation.
     full_band = max(transfer.band_vals.shape[1] for transfer in transfers)
-    band_vals = np.concatenate(
-        [np.pad(transfer.band_vals, ((0, 0), (0, full_band - transfer.band_vals.shape[1]))) for transfer in transfers]
-    )
+    band_vals = np.concatenate([
+        np.pad(transfer.band_vals, ((0, 0), (0, full_band - transfer.band_vals.shape[1]))) for transfer in transfers
+    ])
     col_start = np.concatenate([transfer.col_start for transfer in transfers])
     rhs = np.where(np.concatenate([transfer.valid_out for transfer in transfers]), observed.ravel(), np.nan)
 
