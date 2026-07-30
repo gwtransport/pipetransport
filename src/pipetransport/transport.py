@@ -157,7 +157,7 @@ def source_to_endmember(
     _validate_tedges(tedges, cin, tedges_name="tedges", values_name="cin")
     _validate_no_nan(cin, name="cin")
 
-    report_nodes, transfers, n_pad = network_transfer(
+    _, transfer, n_pad = network_transfer(
         network=network,
         flow=flow,
         tedges=tedges,
@@ -170,11 +170,9 @@ def source_to_endmember(
     # The warm start extends the record backwards at the first observed quality.
     cin = np.concatenate([np.full(n_pad, cin[0]), cin])
 
-    out = np.empty((len(report_nodes), len(cout_tedges) - 1))
-    for i, transfer in enumerate(transfers):
-        columns = np.clip(transfer.col_start[:, None] + np.arange(transfer.band_vals.shape[1]), 0, len(cin) - 1)
-        out[i] = np.einsum("kb,kb->k", transfer.band_vals, cin[columns])
-        out[i, ~transfer.valid_out] = np.nan
+    columns = np.clip(transfer.col_start[..., None] + np.arange(transfer.band_vals.shape[-1]), 0, len(cin) - 1)
+    out = np.einsum("nkb,nkb->nk", transfer.band_vals, cin[columns])
+    out[~transfer.valid_out] = np.nan
     return out
 
 
@@ -290,7 +288,7 @@ def endmember_to_source(
     >>> bool(np.nanmax(np.abs(recovered[inner] - cin[inner])) < 1e-6)
     True
     """
-    report_nodes, transfers, n_pad = network_transfer(
+    report_nodes, transfer, n_pad = network_transfer(
         network=network,
         flow=flow,
         tedges=tedges,
@@ -320,15 +318,12 @@ def endmember_to_source(
         raise ValueError(msg)
     _validate_tedges(cout_tedges, observed, tedges_name="cout_tedges", values_name="cout")
 
-    # Stack the per-node operators into one banded system. Rows may appear in any order, so
-    # the bands are simply concatenated after padding to the widest band; a node whose output
-    # bin the record does not constrain contributes no equation.
-    full_band = max(transfer.band_vals.shape[1] for transfer in transfers)
-    band_vals = np.concatenate([
-        np.pad(transfer.band_vals, ((0, 0), (0, full_band - transfer.band_vals.shape[1]))) for transfer in transfers
-    ])
-    col_start = np.concatenate([transfer.col_start for transfer in transfers])
-    rhs = np.where(np.concatenate([transfer.valid_out for transfer in transfers]), observed.ravel(), np.nan)
+    # Stack the per-node operators into one banded system. The bands already share one
+    # width, so stacking is a plain reshape; a node whose output bin the record does not
+    # constrain contributes no equation.
+    band_vals = transfer.band_vals.reshape(-1, transfer.band_vals.shape[-1])
+    col_start = transfer.col_start.ravel()
+    rhs = np.where(transfer.valid_out.ravel(), observed.ravel(), np.nan)
 
     n_source = len(pd.DatetimeIndex(tedges)) - 1
     recovered = solve_inverse_transport_banded(

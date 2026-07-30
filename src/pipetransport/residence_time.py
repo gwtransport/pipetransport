@@ -27,12 +27,16 @@ See the ./LICENSE file or go to https://github.com/gwtransport/pipetransport/blo
 
 from __future__ import annotations
 
-import numpy as np
-import numpy.typing as npt
+from typing import TYPE_CHECKING
+
 import pandas as pd
 
 from pipetransport._transfer import network_transfer
 from pipetransport.network import PipeNetwork  # noqa: TC001 -- runtime dependency of the signature
+
+if TYPE_CHECKING:
+    import numpy as np
+    import numpy.typing as npt
 
 _DIRECTIONS = ("endmember_to_source", "source_to_endmember")
 
@@ -134,7 +138,7 @@ def full(
         msg = f"direction must be one of {_DIRECTIONS}; got {direction!r}"
         raise ValueError(msg)
     tedges = pd.DatetimeIndex(tedges)
-    _, transfers, n_pad = network_transfer(
+    _, transfer, n_pad = network_transfer(
         network=network,
         flow=flow,
         tedges=tedges,
@@ -145,7 +149,7 @@ def full(
         spinup=spinup,
     )
     if direction == "endmember_to_source":
-        return np.stack([transfer.residence_time_out for transfer in transfers])
+        return transfer.residence_time_out
     # The warm-start prefix is an assumed history, not a result; drop it so the rows align
     # with the user-provided tedges.
-    return np.stack([transfer.residence_time_in[n_pad:] for transfer in transfers])
+    return transfer.residence_time_in[:, n_pad:]

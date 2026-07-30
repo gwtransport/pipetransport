@@ -333,6 +333,23 @@ class TestCumulativeFlowVolume:
         assert volume[0] == 0.0
         assert np.all(np.diff(volume) > 0.0)
 
+    def test_strictly_monotone_batches_rows_bit_for_bit(self):
+        # Rows with plateaus, without, and all-zero, monotonized in one 2-D call, must equal
+        # the row-by-row 1-D calls exactly: the batched transfer operator relies on it.
+        flow = np.array([
+            [100.0, 0.0, 0.0, 50.0, 0.0, 80.0],
+            [100.0, 50.0, 25.0, 10.0, 5.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ])
+        dt_days = np.full(6, 0.5)
+        batched = cumulative_flow_volume(flow, dt_days, strictly_monotone=True)
+
+        assert np.all(np.diff(batched, axis=-1) > 0.0)
+        for row in range(flow.shape[0]):
+            np.testing.assert_array_equal(
+                batched[row], cumulative_flow_volume(flow[row], dt_days, strictly_monotone=True)
+            )
+
 
 class TestSolveInverseTransportBanded:
     def test_recovers_the_exact_input_from_noiseless_observations(self):

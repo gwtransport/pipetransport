@@ -200,9 +200,10 @@ def tedges_to_days(tedges: pd.DatetimeIndex, *, ref: pd.Timestamp | None = None)
 def _make_strictly_monotone(arr: npt.ArrayLike) -> npt.NDArray[np.floating]:
     """Bump consecutive duplicates so a non-decreasing array becomes strictly monotone.
 
-    Returns the input unchanged when it holds no consecutive duplicates. Otherwise each
-    duplicate is bumped by ``k * step``, with ``k`` its 1-based position inside the duplicate
-    run and ``step = min(16 * ulp(max(arr)), gap / (run_len + 1))``. The cap keeps the largest
+    Operates along the last axis; leading axes are independent rows. Returns the input
+    unchanged when it holds no consecutive duplicates. Otherwise each duplicate is bumped by
+    ``k * step``, with ``k`` its 1-based position inside the duplicate run and
+    ``step = min(16 * ulp(max(row)), gap / (run_len + 1))``. The cap keeps the largest
     bump strictly below the next genuine value above the plateau; a gap narrower than the run
     length in ulps is unrepresentable and cannot be separated.
 
@@ -216,12 +217,13 @@ def _make_strictly_monotone(arr: npt.ArrayLike) -> npt.NDArray[np.floating]:
     Parameters
     ----------
     arr : array-like
-        1D non-decreasing array, e.g. a cumulative volume holding plateaus from zero-flow bins.
+        Array non-decreasing along its last axis, e.g. cumulative volumes holding plateaus
+        from zero-flow bins.
 
     Returns
     -------
     ndarray
-        Strictly monotone array of the same length.
+        Array of the same shape, strictly monotone along the last axis.
 
     Notes
     -----
@@ -230,23 +232,24 @@ def _make_strictly_monotone(arr: npt.ArrayLike) -> npt.NDArray[np.floating]:
     of the two limits, biasing integrals over bins that span the kink.
     """
     arr = np.asarray(arr, dtype=float)
-    diffs = np.diff(arr)
+    diffs = np.diff(arr, axis=-1)
     if not np.any(diffs == 0):
         return arr
-    ulp_max = np.nextafter(arr.max(), np.inf) - arr.max()
-    n = len(arr)
+    row_max = arr.max(axis=-1, keepdims=True)
+    ulp_max = np.nextafter(row_max, np.inf) - row_max
+    n = arr.shape[-1]
     idx = np.arange(n)
-    is_dup = np.concatenate(([False], diffs == 0))
+    is_dup = np.concatenate([np.zeros((*arr.shape[:-1], 1), dtype=bool), diffs == 0], axis=-1)
     # 1-based position of each duplicate within its consecutive run.
-    last_nondup = np.maximum.accumulate(np.where(is_dup, -1, idx))
+    last_nondup = np.maximum.accumulate(np.where(is_dup, -1, idx), axis=-1)
     cumcount = np.where(is_dup, idx - last_nondup, 0)
 
     # Per-run headroom: each bumped value must stay strictly below the next genuine value above
     # the plateau, otherwise a long run can overshoot a closely-spaced successor. ``n`` marks a
     # run reaching the array end, where there is no successor and hence no overshoot risk.
-    next_nondup_idx = np.minimum.accumulate(np.where(is_dup, n, idx)[::-1])[::-1]
+    next_nondup_idx = np.minimum.accumulate(np.where(is_dup, n, idx)[..., ::-1], axis=-1)[..., ::-1]
     has_successor = next_nondup_idx < n
-    gap_to_next = arr[np.clip(next_nondup_idx, 0, n - 1)] - arr[idx]
+    gap_to_next = np.take_along_axis(arr, np.clip(next_nondup_idx, 0, n - 1), axis=-1) - arr
     run_len = next_nondup_idx - last_nondup - 1
     full_step = _DUP_BUMP_ULPS * ulp_max
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -271,7 +274,7 @@ def cumulative_flow_volume(
     strictly_monotone : bool, optional
         When ``True``, separate the plateaus left by zero-flow bins with a few-ulp bump so the
         result can be inverted from volume back to time; without it that inverse is
-        multi-valued. Only supported for 1D ``flow``. Default is ``False``.
+        multi-valued. Default is ``False``.
 
     Returns
     -------
@@ -365,10 +368,10 @@ def solve_inverse_transport_banded(
     cols_clipped = np.clip(cols, 0, n_output - 1)
 
     # Column sums and Wᵀ observed (the reverse-target numerator) by scattering the band.
-    col_sum = np.zeros(n_output)
-    wt_observed = np.zeros(n_output)
-    np.add.at(col_sum, cols_clipped[in_range], band_vals[in_range])
-    np.add.at(wt_observed, cols_clipped[in_range], (band_vals * observed[:, None])[in_range])
+    col_sum = np.bincount(cols_clipped[in_range], weights=band_vals[in_range], minlength=n_output)
+    wt_observed = np.bincount(
+        cols_clipped[in_range], weights=(band_vals * observed[:, None])[in_range], minlength=n_output
+    )
 
     col_active = col_sum > 0
     if not np.any(col_active):
@@ -383,11 +386,14 @@ def solve_inverse_transport_banded(
     # contributes band_vals[k, b] * band_vals[k, b + d] to column j = col_start[k] + b. Only
     # pairs whose *upper* column stays inside the output range are scattered, which also
     # implies the lower one does. Peak memory is O(n_obs * full_band), never the dense W.
-    ab = np.zeros((full_band, n_output))
+    # The loop runs over band diagonals, not data: each iteration is one vectorized scatter.
+    ab = np.empty((full_band, n_output))
     for d in range(full_band):
         pair_cols = cols_clipped[:, : full_band - d]
         keep = cols[:, d:] < n_output
-        np.add.at(ab[d], pair_cols[keep], (band_vals[:, : full_band - d] * band_vals[:, d:])[keep])
+        ab[d] = np.bincount(
+            pair_cols[keep], weights=(band_vals[:, : full_band - d] * band_vals[:, d:])[keep], minlength=n_output
+        )
 
     lam = regularization_strength
     d_reg = lam * col_active
@@ -412,8 +418,9 @@ def solve_inverse_transport_banded(
         gathered = x[cols_clipped]
         gathered[~in_range] = 0.0
         residual = observed - (band_vals * gathered).sum(axis=1)
-        gradient = np.zeros(n_output)
-        np.add.at(gradient, cols_clipped[in_range], (band_vals * residual[:, None])[in_range])
+        gradient = np.bincount(
+            cols_clipped[in_range], weights=(band_vals * residual[:, None])[in_range], minlength=n_output
+        )
         gradient += d_reg * (x_target - x)
         gradient[dead] = 0.0
         x += cho_solve_banded((factor, True), gradient)
