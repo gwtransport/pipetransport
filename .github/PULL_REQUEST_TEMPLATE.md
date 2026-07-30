@@ -8,4 +8,4 @@
 
 ## Contributor License Agreement
 
-- [ ] I have read the [CLA](https://github.com/pipetransport/pipetransport/blob/main/CLA.md) and I agree to its terms for this and all future contributions I make to pipetransport.
+- [ ] I have read the [CLA](https://github.com/gwtransport/pipetransport/blob/main/CLA.md) and I agree to its terms for this and all future contributions I make to pipetransport.
