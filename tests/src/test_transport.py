@@ -148,6 +148,55 @@ def test_retardation_factor_scales_the_travel_time(two_branch, hourly_tedges, co
             np.testing.assert_allclose(cout[i], _step_ramp(n_bins, step_bin, tau_hours), rtol=0.0, atol=1e-12)
 
 
+@pytest.mark.parametrize("retardation", [1.0, 1.5, 3.0])
+def test_decay_acts_over_the_retarded_transit_not_the_water_transit(
+    two_branch, hourly_tedges, constant_demand, analytic_travel_time, retardation
+):
+    """Decay and retardation compose as ``exp(-k R tau_water)``, both phases degrading alike.
+
+    Pinning the convention, not just the arithmetic: the exponent picks up the factor ``R``,
+    which is the choice for a compound whose adsorbed and dissolved phases decay at the same
+    rate (Bear & Cheng 2010, eq. 7.4.7, radioactive-decay term), and the one
+    :mod:`gwtransport` makes by feeding a retarded residence time to its log-removal. Decay
+    of the dissolved phase only would cancel the ``R`` and give ``exp(-k tau_water)``; the two
+    differ by a factor of ``R`` in the exponent and nothing else in the suite tells them apart.
+    """
+    demand = constant_demand(two_branch, hourly_tedges)
+    n_bins = len(hourly_tedges) - 1
+    decay_rate = 1.25
+
+    cout = source_to_endmember(
+        cin=np.ones(n_bins),
+        flow=demand,
+        tedges=hourly_tedges,
+        cout_tedges=hourly_tedges,
+        network=two_branch,
+        decay_rate=decay_rate,
+        retardation_factor=retardation,
+    )
+
+    for i, node in enumerate(two_branch.endmembers):
+        tau_water = analytic_travel_time(two_branch, demand, node)
+        expected = np.exp(-decay_rate * retardation * tau_water)
+        np.testing.assert_allclose(cout[i], expected, rtol=1e-12)
+        # The aqueous-only reading is a genuinely different number whenever R > 1, and it is
+        # what passing decay_rate / R recovers.
+        if retardation > 1.0:
+            assert abs(expected - np.exp(-decay_rate * tau_water)) > 1e-3
+    scaled = source_to_endmember(
+        cin=np.ones(n_bins),
+        flow=demand,
+        tedges=hourly_tedges,
+        cout_tedges=hourly_tedges,
+        network=two_branch,
+        decay_rate=decay_rate / retardation,
+        retardation_factor=retardation,
+    )
+    for i, node in enumerate(two_branch.endmembers):
+        aqueous_only = np.exp(-decay_rate * analytic_travel_time(two_branch, demand, node))
+        np.testing.assert_allclose(scaled[i], aqueous_only, rtol=1e-12)
+
+
 # ============================================================================
 # Linearity
 # ============================================================================

@@ -239,6 +239,18 @@ def paths_transfer(
     -------
     NetworkTransfer
         Banded operators, coverage masks and travel times; see :class:`NetworkTransfer`.
+
+    Notes
+    -----
+    Travel time, decay exponent and midpoint arrival are sampled at the quarter points of each
+    cell rather than at its boundaries. A cell boundary may sit on a zero-flow plateau of a
+    segment's cumulative volume, where the volume-to-time inverse is multi-valued and the
+    16-ulp plateau separation of :func:`~pipetransport.utils._make_strictly_monotone` scales a
+    one-ulp round trip up to a finite fraction of the stagnation. Interior samples are free of
+    that ambiguity, and all three quantities are affine across a cell, so the pair at ``1/4``
+    and ``3/4`` reproduces them exactly: the mean is the cell mean, and
+    ``1.5 * phi_lo_sample - 0.5 * phi_hi_sample`` extrapolates to the boundary exponents that
+    :func:`_surviving_fraction` integrates between.
     """
     n_cin = len(tedges_days) - 1
     n_cout = len(cout_tedges_days) - 1
@@ -304,15 +316,23 @@ def paths_transfer(
     grid = np.concatenate([pts, tedges_rows], axis=1)
     grid = np.sort(np.clip(np.where(np.isfinite(grid), grid, tedges_days[-1]), tedges_days[0], tedges_days[-1]), axis=1)
 
-    # Forward sweep: arrival time at every node of the path, then the decay exponent, the
-    # travel time and the label of each grid parcel.
-    arrival = grid
-    decay_exponent = np.zeros_like(grid)
+    # Forward sweep over the cell boundaries and the quarter points inside each cell. The
+    # boundaries carry the label; the travel time, the decay exponent and the midpoint arrival
+    # are read off the interior samples (see Notes).
+    n_edge = grid.shape[1]
+    cell_width = np.diff(grid, axis=1)
+    samples = np.concatenate([grid, grid[:, :-1] + 0.25 * cell_width, grid[:, :-1] + 0.75 * cell_width], axis=1)
+    arrival = samples
+    decay_exponent = np.zeros_like(samples)
     for depth in range(max_depth):
         previous, arrival = arrival, travel(arrival, depth, downstream=True)
         decay_exponent += segment_decay[paths_idx[:, depth], None] * (arrival - previous)
-    travel_time = arrival - grid
-    label = _interp_rows(arrival, tedges_days, node_cumulative)
+    quarter_arrival = arrival[:, n_edge:].reshape(n_nodes, 2, -1)
+    quarter_phi = decay_exponent[:, n_edge:].reshape(n_nodes, 2, -1)
+    cell_travel_time = (quarter_arrival - samples[:, n_edge:].reshape(n_nodes, 2, -1)).mean(axis=1)
+    phi_lo = 1.5 * quarter_phi[:, 0] - 0.5 * quarter_phi[:, 1]
+    phi_hi = 1.5 * quarter_phi[:, 1] - 0.5 * quarter_phi[:, 0]
+    label = _interp_rows(arrival[:, :n_edge], tedges_days, node_cumulative)
 
     # Output bins: label span and the two conditions that do not depend on the cells. The
     # edges are clamped into the record exactly as np.interp clamps them.
@@ -338,7 +358,7 @@ def paths_transfer(
     flat_in = (node_offset * n_cin + cin_bin).ravel()
     in_slots = n_nodes * n_cin
     in_volume = np.bincount(flat_in, weights=label_width.ravel(), minlength=in_slots).reshape(n_nodes, n_cin)
-    carried_in = label_width * 0.5 * np.nan_to_num(travel_time[:, :-1] + travel_time[:, 1:])
+    carried_in = label_width * np.nan_to_num(cell_travel_time)
     in_travel = np.bincount(flat_in, weights=carried_in.ravel(), minlength=in_slots).reshape(n_nodes, n_cin)
     broken = np.bincount(flat_in, weights=(~cell_ok).ravel().astype(float), minlength=in_slots).reshape(n_nodes, n_cin)
     valid_in = (broken == 0.0) & (in_volume > 0.0)
@@ -347,7 +367,7 @@ def paths_transfer(
     # Output-bin membership is read off the arrival time of the cell midpoint; cells arriving
     # before the output range, after it, or outside the record drain into the two dustbin
     # slots wrapped around each node's real bins and are sliced away below.
-    arrival_mid = 0.5 * (arrival[:, :-1] + arrival[:, 1:])
+    arrival_mid = quarter_arrival.mean(axis=1)
     cout_bin = np.searchsorted(cout_tedges_days, arrival_mid, side="right") - 1
     flat_cout = (node_offset * (n_cout + 2) + cout_bin + 1).ravel()
     out_slots = n_nodes * (n_cout + 2)
@@ -373,10 +393,8 @@ def paths_transfer(
     # what turns the label-uniform integral into the flow-weighted bin average. Cells the
     # label does not reach have zero width; their NaN decay exponents and travel times are
     # masked out rather than multiplied by it.
-    survived = np.where(
-        label_width > 0.0, label_width * _surviving_fraction(decay_exponent[:, :-1], decay_exponent[:, 1:]), 0.0
-    )
-    carried_out = np.where(label_width > 0.0, label_width * 0.5 * (travel_time[:, :-1] + travel_time[:, 1:]), 0.0)
+    survived = np.where(label_width > 0.0, label_width * _surviving_fraction(phi_lo, phi_hi), 0.0)
+    carried_out = np.where(label_width > 0.0, label_width * cell_travel_time, 0.0)
     span = np.where(cout_label_width > 0.0, cout_label_width, 1.0)
     span_all = np.ones((n_nodes, n_cout + 2))
     span_all[:, 1:-1] = span
@@ -496,11 +514,13 @@ def network_transfer(
         paths_idx[active] = np.concatenate(paths)
 
     # Warm-start length: the longest source-to-node travel time at the leading flow rate. A
-    # stagnant segment makes its ratio infinite, which resolve_spinup reads as "no warm
-    # start"; np.where rather than multiplying by `active`, because inf * 0 is NaN.
+    # stagnant segment makes its own path's warm start infinite; the max runs over the finite
+    # paths so that one closed tap leaves the other nodes their padding, and an empty max is
+    # "no warm start". np.where rather than multiplying by `active`, because inf * 0 is NaN.
     with np.errstate(divide="ignore"):
         ratio = volume / network.segment_flow(flow=demand)[:, 0]
-    warm_start_days = float(np.max(np.sum(np.where(active, ratio[paths_idx], 0.0), axis=1), initial=0.0))
+    per_path = np.sum(np.where(active, ratio[paths_idx], 0.0), axis=1)
+    warm_start_days = float(np.max(per_path[np.isfinite(per_path)], initial=0.0))
 
     tedges, demand, n_pad = resolve_spinup(spinup, tedges=tedges, flow=demand, warm_start_days=warm_start_days)
     transfer = paths_transfer(

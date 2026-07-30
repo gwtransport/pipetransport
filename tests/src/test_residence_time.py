@@ -315,6 +315,96 @@ def test_diurnal_demand_leaves_a_jensen_gap(network, hourly_tedges, diurnal_dema
 
 
 # ============================================================================
+# Stagnation
+# ============================================================================
+
+
+def _shutdown_demand(n_bins, rate, start, duration):
+    """Constant demand at ``rate`` with ``duration`` bins closed from ``start``, shaped for one endmember."""
+    flow = np.full(n_bins, rate)
+    flow[start : start + duration] = 0.0
+    return flow[None, :]
+
+
+# Rates and shutdown positions are swept rather than fixed: whether a plateau boundary lands
+# on the exact float that exposes the multi-valued inverse depends on where the cumulative
+# volume happens to tick, so a single configuration is a weak guard for a claim that holds
+# for every one of them.
+_SHUTDOWN_RATES = [218.0, 250.0, 431.0, 500.0]
+_SHUTDOWN_STARTS = [36, 54, 66, 108]
+
+
+@pytest.mark.parametrize("start", _SHUTDOWN_STARTS)
+def test_age_before_a_shutdown_is_the_steady_travel_time(single_pipe, hourly_tedges, start):
+    """A future shutdown cannot reach back in time: the age delivered before it is exactly V / Q.
+
+    Every parcel delivered before the stagnation both departs and arrives while the flow is
+    constant, so its age is the steady ``V / Q`` whatever the valve does later. This pins the
+    arrival map *at* the plateau boundary, where inverting the cumulative volume is
+    multi-valued: an arrival that lands inside the plateau instead of at its start biases the
+    bins delivered just before the shutdown, and no other test in the suite reads that
+    boundary -- the brute-force oracle requires strictly positive flow.
+    """
+    n_bins = len(hourly_tedges) - 1
+    for rate in _SHUTDOWN_RATES:
+        demand = _shutdown_demand(n_bins, rate, start, duration=24)
+
+        age = full(flow=demand, tedges=hourly_tedges, network=single_pipe, spinup=None)[0]
+
+        before = age[:start]
+        answered = np.isfinite(before)
+        # Without a warm start the only unanswered bins are the leading ones the travel time
+        # reaches back past, exactly as in the strict-validity test above.
+        n_missing = int(np.ceil(100.0 / rate * 24.0))
+        np.testing.assert_array_equal(answered, np.arange(start) >= n_missing, err_msg=f"rate={rate}")
+        np.testing.assert_allclose(before[answered], 100.0 / rate, rtol=1e-12, err_msg=f"rate={rate}")
+
+
+@pytest.mark.parametrize("start", _SHUTDOWN_STARTS)
+def test_residual_before_a_shutdown_is_the_steady_exponential(single_pipe, hourly_tedges, start):
+    """The decay exponent reads the same arrival map, so the residual is exactly exp(-k V / Q)."""
+    n_bins = len(hourly_tedges) - 1
+    decay_rate = 1.0
+    for rate in _SHUTDOWN_RATES:
+        demand = _shutdown_demand(n_bins, rate, start, duration=24)
+
+        cout = source_to_endmember(
+            cin=np.ones(n_bins),
+            flow=demand,
+            tedges=hourly_tedges,
+            cout_tedges=hourly_tedges,
+            network=single_pipe,
+            decay_rate=decay_rate,
+            spinup=None,
+        )[0]
+
+        before = cout[:start]
+        answered = np.isfinite(before)
+        np.testing.assert_allclose(
+            before[answered], np.exp(-decay_rate * 100.0 / rate), rtol=1e-12, err_msg=f"rate={rate}"
+        )
+
+
+def test_a_stagnant_branch_does_not_suppress_the_warm_start_of_its_siblings(network, hourly_tedges, constant_demand):
+    """The warm-start length is a per-path quantity; one closed tap must not void the other rows.
+
+    A zero leading demand makes that path's warm start infinite. Taking the maximum over the
+    requested paths without dropping it would report "no warm start" for *every* node, so which
+    nodes a caller asks for would silently change the answers of the others.
+    """
+    demand = constant_demand(network, hourly_tedges)
+    demand[network.endmembers.index("T4"), 0] = 0.0  # T4 starts behind a closed tap
+
+    alone = full(flow=demand, tedges=hourly_tedges, network=network, nodes=["T1"])[0]
+    together = full(flow=demand, tedges=hourly_tedges, network=network, nodes=["T1", "T4"])
+
+    assert np.all(np.isfinite(alone))
+    np.testing.assert_allclose(together[0], alone, rtol=1e-12)
+    # T4 itself still has no throughflow to average over while its tap is shut.
+    assert np.isnan(together[1]).any()
+
+
+# ============================================================================
 # API behaviour
 # ============================================================================
 
