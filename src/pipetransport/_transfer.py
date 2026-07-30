@@ -383,9 +383,12 @@ def paths_transfer(
     # Dustbin cells may spread beyond the band; the clip keeps their scatter inside their own
     # (sliced-away) rows.
     slot = flat_cout * full_band + np.clip(cin_flat - col_start_all[flat_cout], 0, full_band - 1)
-    band_vals = np.bincount(
-        slot, weights=survived.ravel() / span_all.ravel()[flat_cout], minlength=out_slots * full_band
-    ).reshape(n_nodes, n_cout + 2, full_band)[:, 1:-1]
+    band_vals = (
+        np
+        .bincount(slot, weights=survived.ravel() / span_all.ravel()[flat_cout], minlength=out_slots * full_band)
+        .astype(float, copy=False)
+        .reshape(n_nodes, n_cout + 2, full_band)[:, 1:-1]
+    )
     coverage = (
         np.bincount(flat_cout, weights=label_width.ravel(), minlength=out_slots).reshape(n_nodes, n_cout + 2)[:, 1:-1]
         / span
