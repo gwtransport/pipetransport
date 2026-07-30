@@ -118,6 +118,18 @@ def source_to_endmember(
     pipetransport.logremoval.segment_decay_rate : Per-pipe chlorine decay from bulk and wall reaction.
     :ref:`concept-label-coordinate` : Why the output average is exactly flow-weighted.
 
+    Notes
+    -----
+    ``decay_rate`` and ``retardation_factor`` combine as
+    ``exp(-decay_rate * retardation_factor * t_water)``, with ``t_water`` the residence time of
+    the water: the rate applies over the whole retarded transit, so the adsorbed and dissolved
+    phases decay alike. This matches :mod:`gwtransport`, which feeds a retarded residence time
+    to its log-removal, and is the convention of radioactive decay (Bear and Cheng, 2010,
+    eq. 7.4.7). A compound that degrades only while dissolved decays as
+    ``exp(-decay_rate * t_water)`` instead -- the retardation cancels, since the compound is
+    adsorbed ``1 - 1 / retardation_factor`` of the time but travels ``retardation_factor``
+    times longer -- which is what passing ``decay_rate / retardation_factor`` reproduces.
+
     Examples
     --------
     >>> import numpy as np
