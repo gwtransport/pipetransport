@@ -44,11 +44,20 @@ The refined cell grid
 ---------------------
 
 ``A`` is piecewise linear in ``s``, but its breakpoints are not only at ``tedges``: a parcel
-also kinks when it crosses a flow change *inside* any pipe it is still travelling through. The
-grid is therefore refined with the source-time preimage of ``tedges`` taken at every node of
-the path, plus the preimage of ``cout_tedges``. On the resulting cells every arrival time,
-every segment travel time and the label ``g`` are exactly linear in ``s``, and each cell falls
-inside exactly one input bin and one output bin. The operator is then a single scatter-add.
+also kinks when it crosses a flow change *inside* any pipe it is still travelling through. One
+backward sweep along the path therefore collects the source-time preimage of ``tedges`` taken
+at every node of the path, together with the preimage of ``cout_tedges``. On the resulting
+cells every arrival time, every segment travel time and the label ``g`` are exactly linear in
+``s``, and each cell falls inside exactly one input bin and one output bin -- so output-bin
+membership is read off the arrival time of the cell midpoint. The operator is then a single
+scatter-add.
+
+All reporting nodes are built in one batched pass: the grids of every path live in the rows of
+one matrix, kept the same width by tolerating duplicate points as zero-width cells instead of
+deduplicating, and cells that leave the record or miss the output range drain into per-node
+dustbin slots that are sliced away after the scatter-add. The Python loops that remain are the
+composition of the segment maps along the path and the row-wise delegation to ``np.interp``,
+whose fused C pass no combination of broadcast primitives matches.
 
 Decay
 -----
@@ -74,7 +83,7 @@ import numpy.typing as npt
 import pandas as pd
 
 from pipetransport._validation import _validate_non_negative, _validate_retardation_factor, _validate_tedges
-from pipetransport.utils import _make_strictly_monotone, cumulative_flow_volume, tedges_to_days
+from pipetransport.utils import cumulative_flow_volume, tedges_to_days
 
 if TYPE_CHECKING:
     from pipetransport.network import PipeNetwork
@@ -91,30 +100,35 @@ _COVERAGE_TOLERANCE = 1e-8
 _ROUNDTRIP_ULPS = 64.0
 
 
-class PathTransfer(NamedTuple):
-    """Everything the public modules read off one source-to-node path.
+class NetworkTransfer(NamedTuple):
+    """Everything the public modules read off the source-to-node paths, stacked over nodes.
+
+    The leading axis of every field runs over the resolved reporting nodes, in output order.
+    ``full_band`` is shared across nodes: narrower bands carry trailing zero slots, which
+    contribute nothing in either direction.
 
     Attributes
     ----------
     band_vals : ndarray
-        Forward weights of shape ``(n_cout, full_band)``: row ``j`` sits at input columns
-        ``[col_start[j], col_start[j] + full_band)``. Rows sum to 1 without decay and to the
-        surviving fraction with it. Rows failing :attr:`valid_out` are zero.
+        Forward weights of shape ``(n_nodes, n_cout, full_band)``: row ``j`` of node ``n``
+        sits at input columns ``[col_start[n, j], col_start[n, j] + full_band)``. Rows sum to
+        1 without decay and to the surviving fraction with it. Rows failing :attr:`valid_out`
+        are zero.
     col_start : ndarray of int
-        First input-bin column of each output row's band, shape ``(n_cout,)``.
+        First input-bin column of each output row's band, shape ``(n_nodes, n_cout)``.
     valid_out : ndarray of bool
         Output bins whose label interval is fully covered by in-record parcels and carries
-        throughflow, shape ``(n_cout,)``.
+        throughflow, shape ``(n_nodes, n_cout)``.
     residence_time_out : ndarray
         Flow-weighted mean travel time [days] of the water delivered in each output bin,
-        shape ``(n_cout,)``. NaN where :attr:`valid_out` is False.
+        shape ``(n_nodes, n_cout)``. NaN where :attr:`valid_out` is False.
     residence_time_in : ndarray
         Volume-weighted mean travel time [days] until arrival, for the water that leaves the
-        source in each input bin and is destined for this node, shape ``(n_cin,)``. NaN where
-        :attr:`valid_in` is False.
+        source in each input bin and is destined for each node, shape ``(n_nodes, n_cin)``.
+        NaN where :attr:`valid_in` is False.
     valid_in : ndarray of bool
         Input bins whose node-destined water all reaches the node inside the record,
-        shape ``(n_cin,)``.
+        shape ``(n_nodes, n_cin)``.
     """
 
     band_vals: npt.NDArray[np.floating]
@@ -149,16 +163,53 @@ def _surviving_fraction(phi_lo: npt.NDArray[np.floating], phi_hi: npt.NDArray[np
     return np.exp(-np.minimum(phi_lo, phi_hi)) * ramp
 
 
-def path_transfer(
+def _interp_rows(
+    x: npt.NDArray[np.floating],
+    xp: npt.NDArray[np.floating],
+    fp: npt.NDArray[np.floating],
+) -> npt.NDArray[np.floating]:
+    """Row-wise ``np.interp(x, xp, fp, left=np.nan, right=np.nan)`` for batched maps.
+
+    numpy exposes no batched interpolation, and composing one from broadcast primitives
+    costs a full array pass per search, gather and blend step -- several times slower than
+    :func:`numpy.interp`, which fuses them into a single C pass. So the rows delegate to
+    ``np.interp`` one by one: each iteration is one fused C call, and the row count is the
+    number of reporting nodes, not a data axis.
+
+    Parameters
+    ----------
+    x : ndarray
+        Queries of shape ``(n, m)``. Non-finite entries come back NaN.
+    xp : ndarray
+        Reference x, strictly increasing along the last axis: shared shape ``(k,)`` or
+        per-row shape ``(n, k)``.
+    fp : ndarray
+        Reference y, per-row ``(n, k)`` or shared ``(k,)`` -- whichever ``xp`` is not.
+
+    Returns
+    -------
+    ndarray
+        Interpolated values of shape ``(n, m)``; NaN outside ``[xp[..., 0], xp[..., -1]]``.
+    """
+    shared_xp = xp.ndim == 1
+    out = np.empty(x.shape)
+    for i, queries in enumerate(x):
+        out[i] = np.interp(queries, xp if shared_xp else xp[i], fp[i] if shared_xp else fp, left=np.nan, right=np.nan)
+    return out
+
+
+def paths_transfer(
     *,
     tedges_days: npt.NDArray[np.floating],
     cout_tedges_days: npt.NDArray[np.floating],
-    path_volume: npt.NDArray[np.floating],
-    path_flow: npt.NDArray[np.floating],
-    path_decay: npt.NDArray[np.floating],
+    segment_volume: npt.NDArray[np.floating],
+    segment_flow: npt.NDArray[np.floating],
+    segment_decay: npt.NDArray[np.floating],
     node_flow: npt.NDArray[np.floating],
-) -> PathTransfer:
-    """Build the exact transfer operator and travel times of one source-to-node path.
+    paths_idx: npt.NDArray[np.intp],
+    active: npt.NDArray[np.bool_],
+) -> NetworkTransfer:
+    """Build the exact transfer operators and travel times of every source-to-node path.
 
     Parameters
     ----------
@@ -167,48 +218,51 @@ def path_transfer(
     cout_tedges_days : ndarray
         Output bin edges in days on the same origin, strictly increasing, length
         ``n_cout + 1``.
-    path_volume : ndarray
-        Water volume [m³] of each segment on the path, ordered from the source outward and
-        already multiplied by the retardation factor. Length ``m`` (0 when the reporting node
-        *is* the source).
-    path_flow : ndarray
-        Throughflow [m³/day] of those segments, shape ``(m, n_cin)``.
-    path_decay : ndarray
-        First-order decay rate [1/day] of those segments, length ``m``.
+    segment_volume : ndarray
+        Water volume [m³] of every segment of the network, already multiplied by the
+        retardation factor. Length ``n_seg``.
+    segment_flow : ndarray
+        Throughflow [m³/day] of those segments, shape ``(n_seg, n_cin)``.
+    segment_decay : ndarray
+        First-order decay rate [1/day] of those segments, length ``n_seg``.
     node_flow : ndarray
-        Throughflow [m³/day] past the reporting node, length ``n_cin``. This is the weight of
-        the output bin average and the differential of the label coordinate.
+        Throughflow [m³/day] past each reporting node, shape ``(n_nodes, n_cin)``. This is
+        the weight of the output bin average and the differential of the label coordinate.
+    paths_idx : ndarray of int
+        Segment row of each path step, shape ``(n_nodes, max_depth)``, ordered from the
+        source outward. Slots beyond a path's depth are ignored.
+    active : ndarray of bool
+        Which slots of ``paths_idx`` are real path steps, shape ``(n_nodes, max_depth)``. A
+        node reporting at the source itself is a row of ``False``.
 
     Returns
     -------
-    PathTransfer
-        Banded operator, coverage mask and travel times; see :class:`PathTransfer`.
+    NetworkTransfer
+        Banded operators, coverage masks and travel times; see :class:`NetworkTransfer`.
     """
     n_cin = len(tedges_days) - 1
     n_cout = len(cout_tedges_days) - 1
-    n_path = len(path_volume)
+    n_nodes, max_depth = paths_idx.shape
     dt_days = np.diff(tedges_days)
 
-    # Per-segment cumulative volume. Plateaus from a closed valve make the volume-to-time
-    # inversion multi-valued, so they are separated before the maps below invert them.
-    # np.array rather than np.stack: reporting at the source itself is a zero-segment path, and
-    # the empty list it produces has to reshape to (0, n_cin + 1) instead of raising.
-    segment_cumulative = np.array([
-        _make_strictly_monotone(cumulative_flow_volume(path_flow[i], dt_days)) for i in range(n_path)
-    ]).reshape(n_path, n_cin + 1)
-    # Label axis: cumulative throughflow past the reporting node. Only ever read forward
+    # Per-segment cumulative volume, once per segment however many paths share it. Plateaus
+    # from a closed valve make the volume-to-time inversion multi-valued, so they are
+    # separated before the maps below invert them.
+    segment_cumulative = cumulative_flow_volume(segment_flow, dt_days, strictly_monotone=True)
+    # Label axis: cumulative throughflow past each reporting node. Only ever read forward
     # (time to label), so its plateaus are meaningful and stay untouched.
     node_cumulative = cumulative_flow_volume(node_flow, dt_days)
 
-    def travel(times: npt.NDArray[np.floating], segment: int, *, downstream: bool) -> npt.NDArray[np.floating]:
-        """Map times across one segment, downstream (entry to exit) or back upstream.
+    def travel(times: npt.NDArray[np.floating], depth: int, *, downstream: bool) -> npt.NDArray[np.floating]:
+        """Map times across every path's ``depth``-th segment, downstream or back upstream.
 
         Parameters
         ----------
         times : ndarray
-            Times in days at the segment's entry (``downstream=True``) or exit face.
-        segment : int
-            Position of the segment on the path, counted from the source.
+            Times in days of shape ``(n_nodes, m)`` at the segment's entry
+            (``downstream=True``) or exit face.
+        depth : int
+            Position of the segment on each path, counted from the source.
         downstream : bool
             Direction of the map.
 
@@ -216,106 +270,139 @@ def path_transfer(
         -------
         ndarray
             Times in days at the other face; NaN where the parcel falls outside the record.
+            Rows whose path is shorter than ``depth`` pass through unchanged.
         """
-        cumulative = segment_cumulative[segment]
-        displaced = np.interp(times, tedges_days, cumulative, left=np.nan, right=np.nan)
-        target = displaced + path_volume[segment] if downstream else displaced - path_volume[segment]
+        cumulative = segment_cumulative[paths_idx[:, depth]]
+        volume = segment_volume[paths_idx[:, depth], None]
+        target = _interp_rows(times, tedges_days, cumulative)
+        target = np.add(target, volume, out=target) if downstream else np.subtract(target, volume, out=target)
         # Mapping a time back upstream and forward again is not bit-exact -- each composition
         # step costs about an ulp of the cumulative volume, and the plateau separation above
-        # spends up to 16 more. A bare right=np.nan would read that miss as "the parcel left the
-        # record" and void the last output bin, so a target within _ROUNDTRIP_ULPS of the range
-        # is snapped into it. A genuine excursion is still NaN, and NaN input stays NaN.
-        low, high = cumulative[0], cumulative[-1]
-        slack = _ROUNDTRIP_ULPS * np.spacing(max(abs(low), abs(high)))
+        # spends up to 16 more. A bare out-of-range NaN would read that miss as "the parcel
+        # left the record" and void the last output bin, so a target within _ROUNDTRIP_ULPS of
+        # the range is snapped into it. A genuine excursion is still NaN, and NaN input stays
+        # NaN.
+        low, high = cumulative[:, :1], cumulative[:, -1:]
+        slack = _ROUNDTRIP_ULPS * np.spacing(np.maximum(np.abs(low), np.abs(high)))
         with np.errstate(invalid="ignore"):
-            inside = (target >= low - slack) & (target <= high + slack)
-        return np.where(inside, np.interp(np.clip(target, low, high), cumulative, tedges_days), np.nan)
+            outside = (target < low - slack) | (target > high + slack)
+        mapped = _interp_rows(np.clip(target, low, high), cumulative, tedges_days)
+        np.copyto(mapped, np.nan, where=outside)
+        return np.where(active[:, depth, None], mapped, times)
 
-    # Refined source-time grid. Walking the path inwards and re-seeding with tedges at every
-    # node collects, in source time, every parcel that crosses a flow change anywhere along
-    # its journey -- the complete set of kinks of the arrival maps. The preimage of the output
-    # edges is added so each cell also lands inside a single output bin.
-    kinks = tedges_days
-    for segment in range(n_path - 1, -1, -1):
-        kinks = travel(np.union1d(kinks, tedges_days), segment, downstream=False)
-        kinks = kinks[np.isfinite(kinks)]
-    cout_preimage = cout_tedges_days
-    for segment in range(n_path - 1, -1, -1):
-        cout_preimage = travel(cout_preimage, segment, downstream=False)
-    grid = np.unique(np.concatenate([kinks, cout_preimage[np.isfinite(cout_preimage)], tedges_days]))
-    grid = grid[(grid >= tedges_days[0]) & (grid <= tedges_days[-1])]
+    # Refined source-time grid, one backward sweep for all nodes. Walking the paths inwards
+    # and re-seeding with tedges at every node collects, in source time, every parcel that
+    # crosses a flow change anywhere along its journey -- the complete set of kinks of the
+    # arrival maps -- and carries the preimage of the output edges along, so each cell also
+    # lands inside a single output bin. Points without an in-record preimage collapse onto
+    # the record's end as zero-width cells, keeping every row the same width; duplicates are
+    # equally harmless, so nothing is pruned.
+    tedges_rows = np.broadcast_to(tedges_days, (n_nodes, n_cin + 1))
+    pts = np.broadcast_to(cout_tedges_days, (n_nodes, n_cout + 1))
+    for depth in range(max_depth - 1, -1, -1):
+        pts = travel(np.concatenate([pts, tedges_rows], axis=1), depth, downstream=False)
+    grid = np.concatenate([pts, tedges_rows], axis=1)
+    grid = np.sort(np.clip(np.where(np.isfinite(grid), grid, tedges_days[-1]), tedges_days[0], tedges_days[-1]), axis=1)
 
     # Forward sweep: arrival time at every node of the path, then the decay exponent, the
     # travel time and the label of each grid parcel.
     arrival = grid
     decay_exponent = np.zeros_like(grid)
-    for segment in range(n_path):
-        previous, arrival = arrival, travel(arrival, segment, downstream=True)
-        decay_exponent += path_decay[segment] * (arrival - previous)
+    for depth in range(max_depth):
+        previous, arrival = arrival, travel(arrival, depth, downstream=True)
+        decay_exponent += segment_decay[paths_idx[:, depth], None] * (arrival - previous)
     travel_time = arrival - grid
-    label = np.interp(arrival, tedges_days, node_cumulative, left=np.nan, right=np.nan)
+    label = _interp_rows(arrival, tedges_days, node_cumulative)
 
-    # Output bins: label span and the two conditions that do not depend on the cells.
+    # Output bins: label span and the two conditions that do not depend on the cells. The
+    # edges are clamped into the record exactly as np.interp clamps them.
     edge_in_record = (cout_tedges_days >= tedges_days[0]) & (cout_tedges_days <= tedges_days[-1])
-    cout_label = np.interp(cout_tedges_days, tedges_days, node_cumulative)
-    cout_label_width = np.diff(cout_label)
+    cout_label = _interp_rows(
+        np.broadcast_to(np.clip(cout_tedges_days, tedges_days[0], tedges_days[-1]), (n_nodes, n_cout + 1)),
+        tedges_days,
+        node_cumulative,
+    )
+    cout_label_width = np.diff(cout_label, axis=1)
     row_supported = edge_in_record[:-1] & edge_in_record[1:] & (cout_label_width > 0.0)
 
     # Cells. Each spans one grid interval; both its boundaries must reach the node inside the
     # record for it to carry information.
-    cell_ok = np.isfinite(label[:-1]) & np.isfinite(label[1:])
-    midpoint = 0.5 * (grid[:-1] + grid[1:])
+    cell_ok = np.isfinite(label[:, :-1]) & np.isfinite(label[:, 1:])
+    midpoint = 0.5 * (grid[:, :-1] + grid[:, 1:])
     cin_bin = np.clip(np.searchsorted(tedges_days, midpoint, side="right") - 1, 0, n_cin - 1)
+    label_width = np.where(cell_ok, label[:, 1:] - label[:, :-1], 0.0)
 
-    # An input bin is constrained only if every parcel leaving in it arrives inside the record.
-    label_width = np.where(cell_ok, label[1:] - label[:-1], 0.0)
-    in_volume = np.bincount(cin_bin, weights=label_width, minlength=n_cin)
-    in_travel = np.bincount(
-        cin_bin, weights=label_width * 0.5 * np.nan_to_num(travel_time[:-1] + travel_time[1:]), minlength=n_cin
-    )
-    valid_in = (np.bincount(cin_bin[~cell_ok], minlength=n_cin) == 0) & (in_volume > 0.0)
-    residence_time_in = np.full(n_cin, np.nan)
-    residence_time_in[valid_in] = in_travel[valid_in] / in_volume[valid_in]
+    # An input bin is constrained only if every parcel leaving in it arrives inside the
+    # record. Every scatter-add below runs on indices flattened with a per-node offset.
+    node_offset = np.arange(n_nodes)[:, None]
+    flat_in = (node_offset * n_cin + cin_bin).ravel()
+    in_slots = n_nodes * n_cin
+    in_volume = np.bincount(flat_in, weights=label_width.ravel(), minlength=in_slots).reshape(n_nodes, n_cin)
+    carried_in = label_width * 0.5 * np.nan_to_num(travel_time[:, :-1] + travel_time[:, 1:])
+    in_travel = np.bincount(flat_in, weights=carried_in.ravel(), minlength=in_slots).reshape(n_nodes, n_cin)
+    broken = np.bincount(flat_in, weights=(~cell_ok).ravel().astype(float), minlength=in_slots).reshape(n_nodes, n_cin)
+    valid_in = (broken == 0.0) & (in_volume > 0.0)
+    residence_time_in = np.where(valid_in, in_travel / np.where(valid_in, in_volume, 1.0), np.nan)
 
-    keep = cell_ok & (label[1:] > label[:-1])
-    cin_bin, label_width = cin_bin[keep], label_width[keep]
-    label_mid = 0.5 * (label[:-1] + label[1:])[keep]
-    cout_bin = np.searchsorted(cout_label, label_mid, side="right") - 1
-    inside = (cout_bin >= 0) & (cout_bin < n_cout)
-    cin_bin, label_width, cout_bin = cin_bin[inside], label_width[inside], cout_bin[inside]
-    survived = label_width * _surviving_fraction(decay_exponent[:-1][keep][inside], decay_exponent[1:][keep][inside])
-    carried_time = label_width * 0.5 * (travel_time[:-1][keep][inside] + travel_time[1:][keep][inside])
+    # Output-bin membership is read off the arrival time of the cell midpoint; cells arriving
+    # before the output range, after it, or outside the record drain into the two dustbin
+    # slots wrapped around each node's real bins and are sliced away below.
+    arrival_mid = 0.5 * (arrival[:, :-1] + arrival[:, 1:])
+    cout_bin = np.searchsorted(cout_tedges_days, arrival_mid, side="right") - 1
+    flat_cout = (node_offset * (n_cout + 2) + cout_bin + 1).ravel()
+    out_slots = n_nodes * (n_cout + 2)
 
-    # Cells are ordered by source time and both the label and the input-bin index increase
-    # with it, so the cells of one output row are a contiguous, non-decreasing run: the band
-    # bounds are read off the run's first and last cell instead of a scatter-minimum.
-    n_cell = cout_bin.size
-    run_lo = np.searchsorted(cout_bin, np.arange(n_cout), side="left")
-    run_hi = np.searchsorted(cout_bin, np.arange(n_cout), side="right")
+    # Cells are ordered by source time, and arrival, label and the input-bin index all
+    # increase with it, so the cells of one output slot are a contiguous, non-decreasing run
+    # -- globally, since the node offsets dominate. The band bounds are read off each run's
+    # first and last cell instead of a scatter-minimum.
+    n_cell = flat_cout.size
+    run_lo = np.searchsorted(flat_cout, np.arange(out_slots), side="left")
+    run_hi = np.searchsorted(flat_cout, np.arange(out_slots), side="right")
     populated = run_hi > run_lo
     safe_lo, safe_hi = np.clip(run_lo, 0, max(n_cell - 1, 0)), np.clip(run_hi - 1, 0, max(n_cell - 1, 0))
-    col_start = np.where(populated, cin_bin[safe_lo], 0).astype(np.intp) if n_cell else np.zeros(n_cout, np.intp)
-    col_stop = np.where(populated, cin_bin[safe_hi], 0) if n_cell else np.zeros(n_cout, np.intp)
-    full_band = int(np.max(col_stop - col_start)) + 1 if n_cell else 1
+    cin_flat = cin_bin.ravel()
+    col_start_all = np.where(populated, cin_flat[safe_lo], 0).astype(np.intp)
+    col_stop_all = np.where(populated, cin_flat[safe_hi], 0)
+    # The band width is shared across nodes and read off the real slots only: a dustbin run
+    # may span the whole input range.
+    spread = (col_stop_all - col_start_all).reshape(n_nodes, n_cout + 2)[:, 1:-1]
+    full_band = int(spread.max(initial=0)) + 1
 
-    # Every cell contribution is a share of its output bin's label span: that division is what
-    # turns the label-uniform integral into the flow-weighted bin average.
+    # Every cell contribution is a share of its output bin's label span: that division is
+    # what turns the label-uniform integral into the flow-weighted bin average. Cells the
+    # label does not reach have zero width; their NaN decay exponents and travel times are
+    # masked out rather than multiplied by it.
+    survived = np.where(
+        label_width > 0.0, label_width * _surviving_fraction(decay_exponent[:, :-1], decay_exponent[:, 1:]), 0.0
+    )
+    carried_out = np.where(label_width > 0.0, label_width * 0.5 * (travel_time[:, :-1] + travel_time[:, 1:]), 0.0)
     span = np.where(cout_label_width > 0.0, cout_label_width, 1.0)
-    slot = cout_bin * full_band + (cin_bin - col_start[cout_bin])
+    span_all = np.ones((n_nodes, n_cout + 2))
+    span_all[:, 1:-1] = span
+    # Dustbin cells may spread beyond the band; the clip keeps their scatter inside their own
+    # (sliced-away) rows.
+    slot = flat_cout * full_band + np.clip(cin_flat - col_start_all[flat_cout], 0, full_band - 1)
     band_vals = (
         np
-        .bincount(slot, weights=survived / span[cout_bin], minlength=n_cout * full_band)
+        .bincount(slot, weights=survived.ravel() / span_all.ravel()[flat_cout], minlength=out_slots * full_band)
         .astype(float, copy=False)
-        .reshape(n_cout, full_band)
+        .reshape(n_nodes, n_cout + 2, full_band)[:, 1:-1]
     )
-    coverage = np.bincount(cout_bin, weights=label_width, minlength=n_cout) / span
-    out_travel = np.bincount(cout_bin, weights=carried_time, minlength=n_cout) / span
+    coverage = (
+        np.bincount(flat_cout, weights=label_width.ravel(), minlength=out_slots).reshape(n_nodes, n_cout + 2)[:, 1:-1]
+        / span
+    )
+    out_travel = (
+        np.bincount(flat_cout, weights=carried_out.ravel(), minlength=out_slots).reshape(n_nodes, n_cout + 2)[:, 1:-1]
+        / span
+    )
 
     valid_out = row_supported & (coverage >= 1.0 - _COVERAGE_TOLERANCE)
     band_vals[~valid_out] = 0.0
-    residence_time_out = np.full(n_cout, np.nan)
-    residence_time_out[valid_out] = out_travel[valid_out]
-    return PathTransfer(band_vals, col_start, valid_out, residence_time_out, residence_time_in, valid_in)
+    col_start = col_start_all.reshape(n_nodes, n_cout + 2)[:, 1:-1]
+    residence_time_out = np.where(valid_out, out_travel, np.nan)
+    return NetworkTransfer(band_vals, col_start, valid_out, residence_time_out, residence_time_in, valid_in)
 
 
 def network_transfer(
@@ -328,12 +415,12 @@ def network_transfer(
     decay_rate: float | pd.Series,
     retardation_factor: float,
     spinup: str | None,
-) -> tuple[tuple[str, ...], list[PathTransfer], int]:
-    """Resolve the shared inputs of every public entry point and build one operator per node.
+) -> tuple[tuple[str, ...], NetworkTransfer, int]:
+    """Resolve the shared inputs of every public entry point and build the node operators.
 
     Validates the time axes and physical parameters, converts the endmember demand into
-    segment and node throughflow, applies the spin-up policy, and calls :func:`path_transfer`
-    once per reporting node.
+    segment and node throughflow, applies the spin-up policy, and builds the operators of
+    every reporting node in one batched :func:`paths_transfer` pass.
 
     Parameters
     ----------
@@ -359,8 +446,8 @@ def network_transfer(
     -------
     nodes : tuple of str
         The resolved reporting nodes, in output order.
-    transfers : list of PathTransfer
-        One operator per reporting node, built on the padded input grid.
+    transfer : NetworkTransfer
+        The stacked operators of every reporting node, built on the padded input grid.
     n_pad : int
         Number of warm-start bins prepended to ``tedges``.
 
@@ -398,33 +485,35 @@ def network_transfer(
         msg = f"unknown node(s): {unknown}; network nodes are {list(network.nodes)}"
         raise ValueError(msg)
     volume = retardation_factor * network.segments["volume"].to_numpy(dtype=float)
-    row_of = {name: i for i, name in enumerate(network.segments.index)}
-    paths = [[row_of[segment] for segment in network.paths[node]] for node in requested]
+    # Padded per-node path matrix: row n holds the segment rows of node n's path, source
+    # outward; `active` marks the real slots.
+    paths = [network.segments.index.get_indexer(list(network.paths[node])) for node in requested]
+    lengths = np.array([path.size for path in paths], dtype=np.intp)
+    max_depth = int(lengths.max(initial=0))
+    active = np.arange(max_depth) < lengths[:, None]
+    paths_idx = np.zeros((len(requested), max_depth), dtype=np.intp)
+    if max_depth:
+        paths_idx[active] = np.concatenate(paths)
 
     # Warm-start length: the longest source-to-node travel time at the leading flow rate. A
-    # stagnant leading segment makes it infinite, which resolve_spinup reads as "no warm start".
-    with np.errstate(divide="ignore", invalid="ignore"):
-        leading = network.segment_flow(flow=demand)[:, 0]
-        warm_start_days = max((np.sum(volume[path] / leading[path]) for path in paths), default=0.0)
+    # stagnant segment makes its ratio infinite, which resolve_spinup reads as "no warm
+    # start"; np.where rather than multiplying by `active`, because inf * 0 is NaN.
+    with np.errstate(divide="ignore"):
+        ratio = volume / network.segment_flow(flow=demand)[:, 0]
+    warm_start_days = float(np.max(np.sum(np.where(active, ratio[paths_idx], 0.0), axis=1), initial=0.0))
 
-    tedges, demand, n_pad = resolve_spinup(spinup, tedges=tedges, flow=demand, warm_start_days=float(warm_start_days))
-    segment_flow = network.segment_flow(flow=demand)
-    node_flow = network.node_flow(flow=demand, nodes=requested)
-    tedges_days = tedges_to_days(tedges)
-    cout_tedges_days = tedges_to_days(cout_tedges, ref=tedges[0])
-
-    transfers = [
-        path_transfer(
-            tedges_days=tedges_days,
-            cout_tedges_days=cout_tedges_days,
-            path_volume=volume[path],
-            path_flow=segment_flow[path],
-            path_decay=decay[path],
-            node_flow=node_flow[i],
-        )
-        for i, path in enumerate(paths)
-    ]
-    return requested, transfers, n_pad
+    tedges, demand, n_pad = resolve_spinup(spinup, tedges=tedges, flow=demand, warm_start_days=warm_start_days)
+    transfer = paths_transfer(
+        tedges_days=tedges_to_days(tedges),
+        cout_tedges_days=tedges_to_days(cout_tedges, ref=tedges[0]),
+        segment_volume=volume,
+        segment_flow=network.segment_flow(flow=demand),
+        segment_decay=decay,
+        node_flow=network.node_flow(flow=demand, nodes=requested),
+        paths_idx=paths_idx,
+        active=active,
+    )
+    return requested, transfer, n_pad
 
 
 def resolve_spinup(

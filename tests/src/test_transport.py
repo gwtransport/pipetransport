@@ -178,6 +178,37 @@ def test_transport_is_linear_in_the_source_signal(network, hourly_tedges, diurna
     np.testing.assert_allclose(combined, a * out1 + b * out2, rtol=0.0, atol=1e-13)
 
 
+def test_batched_nodes_equal_single_node_calls(network, hourly_tedges, diurnal_demand):
+    """One call reporting at every node equals the per-node calls, NaN masks bit for bit.
+
+    The operators of all nodes are built in one batched pass; each row must be numerically
+    independent of which other nodes are requested. The operator entries are bit-identical
+    across call shapes; applying them sums over a band width shared across the requested
+    nodes, which may reassociate the dot product by an ulp -- hence exact masks and an
+    ulp-level value tolerance. ``spinup=None`` keeps the input grid identical across calls
+    (the warm-start length depends on the requested node set).
+    """
+    demand = diurnal_demand(network, hourly_tedges)
+    nodes = list(network.nodes[1:])
+    rng = np.random.default_rng(7)
+    cin = rng.uniform(0.0, 2.0, len(hourly_tedges) - 1)
+    shared = {
+        "flow": demand,
+        "tedges": hourly_tedges,
+        "cout_tedges": pd.date_range("2025-06-01 00:20", periods=41, freq="5h"),
+        "network": network,
+        "decay_rate": 0.2,
+        "spinup": None,
+    }
+
+    batched = source_to_endmember(cin=cin, nodes=nodes, **shared)
+
+    for i, node in enumerate(nodes):
+        single = source_to_endmember(cin=cin, nodes=[node], **shared)
+        assert np.array_equal(np.isnan(batched[i]), np.isnan(single[0]))
+        np.testing.assert_allclose(batched[i], single[0], rtol=1e-14, atol=0.0)
+
+
 # ============================================================================
 # First-order decay
 # ============================================================================
