@@ -38,6 +38,14 @@ logremoval
    :undoc-members:
    :show-inheritance:
 
+heat
+====
+
+.. automodule:: pipetransport.heat
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
 plot
 ====
 

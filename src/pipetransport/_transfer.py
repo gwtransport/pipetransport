@@ -70,6 +70,29 @@ so the surviving fraction integrates in closed form:
 ``(1/du) \int e^{-phi} du = e^{-min(phi)} (1 - e^{-|dphi|}) / |dphi|``. The zero-decay limit of
 that expression is exactly ``1``, so there is no separate conservative code path.
 
+Relaxation targets
+------------------
+
+Relaxation toward a per-segment, time-varying target -- heat exchange with the soil, where
+the temperature "decays" toward the soil temperature instead of toward zero -- makes the
+node value affine rather than linear in the source signal: ``c_node = W @ c_source + b``.
+Within segment ``e`` a parcel obeys ``dT/du = -k_e (T - Tb_e(u))`` with ``Tb_e`` piecewise
+constant on the input bins, and Abel summation of the piecewise integral gives the parcel
+bias as a sum over path segments of
+
+``Tb[B_exit] e^{-phi_down} - Tb[B_entry] e^{-phi_entry} - sum_j dTb[j] e^{-k_e (A_exit - tau_j) - phi_down}``
+
+with ``phi_down`` the exponent from the segment's exit to the node, ``phi_entry`` the one
+from its entry, ``B_entry``/``B_exit`` the input bins holding the entry and exit times, and
+``j`` running over the bin edges crossed inside the segment, half-open ``(A_entry, A_exit]``.
+The weights on the targets are non-negative and sum to ``1 - e^{-phi_total}``, so a constant
+target telescopes exactly and zero rates give zero bias with no separate code path. Every
+term is ``exp`` of a function affine in the departure time, so its label average over a cell
+is the same closed form as the surviving fraction. The target-independent factors are built
+once (:func:`paths_transfer` with ``with_target_terms=True``) and applied to concrete target
+series by :func:`apply_segment_targets`, whose only sequential work is one exponentially
+forgetting scan per segment.
+
 This file is part of pipetransport which is released under AGPL-3.0 license.
 See the ./LICENSE file or go to https://github.com/gwtransport/pipetransport/blob/main/LICENSE for full license details.
 """
@@ -81,6 +104,7 @@ from typing import TYPE_CHECKING, NamedTuple
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
+from scipy.signal import lfilter
 
 from pipetransport._validation import _validate_non_negative, _validate_retardation_factor, _validate_tedges
 from pipetransport.utils import cumulative_flow_volume, tedges_to_days
@@ -98,6 +122,55 @@ _COVERAGE_TOLERANCE = 1e-8
 # per segment on the path) and the 16-ulp plateau separation in _make_strictly_monotone. At
 # 1.4e-14 relative it is far below any physically meaningful volume.
 _ROUNDTRIP_ULPS = 64.0
+
+
+class TargetTerms(NamedTuple):
+    """Target-independent factors of the affine bias, built alongside the operator.
+
+    Everything a per-sweep :func:`apply_segment_targets` call needs, precomputed on the
+    refined cell grid so that applying a new target series costs one scan per segment plus
+    gathers -- the operator is never rebuilt. Cell means of invalid (zero-width) cells are
+    zeroed here, so the apply step is NaN-free by construction.
+
+    Attributes
+    ----------
+    mean_down : ndarray
+        Cell means of ``exp(-phi_down)``, shape ``(max_depth + 1, n_nodes, n_cells)``.
+        Slot ``0`` holds the mean of ``exp(-phi_total)`` (the surviving fraction of the
+        cell); slot ``d + 1`` the mean over the exponent from the exit of the depth-``d``
+        segment to the node. The depth-``d`` bias reads its entry piece from slot ``d`` and
+        its exit piece from slot ``d + 1``.
+    mean_shift : ndarray
+        Cell means of ``exp(-(k_d (A_exit(s) - tau[bin_exit]) + phi_down(s)))``, the
+        factor of the interior-edge sum, shape ``(max_depth, n_nodes, n_cells)``. The
+        exponent is non-negative by the half-open edge convention, so it never overflows.
+    bin_entry, bin_exit : ndarray of intp
+        Input bin holding the segment entry and exit time of each cell's parcels, shape
+        ``(max_depth, n_nodes, n_cells)``; constant over a cell because the grid seeds the
+        input edges at every node.
+    cell_weight : ndarray
+        Label width of each cell over the label span of its output slot, shape
+        ``(n_nodes, n_cells)`` -- the same weight the ``W`` scatter uses.
+    flat_cout : ndarray of intp
+        Flattened output slot of each cell in the dustbin layout, shape
+        ``(n_nodes * n_cells,)``.
+    segment_rate : ndarray
+        The per-segment rates [1/day] the operator was built with, length ``n_seg``.
+    paths_idx : ndarray of intp
+        Segment row of each path step, shape ``(n_nodes, max_depth)``.
+    dt_days : float
+        Uniform input-bin width [days] the scan of :func:`apply_segment_targets` assumes.
+    """
+
+    mean_down: npt.NDArray[np.floating]
+    mean_shift: npt.NDArray[np.floating]
+    bin_entry: npt.NDArray[np.intp]
+    bin_exit: npt.NDArray[np.intp]
+    cell_weight: npt.NDArray[np.floating]
+    flat_cout: npt.NDArray[np.intp]
+    segment_rate: npt.NDArray[np.floating]
+    paths_idx: npt.NDArray[np.intp]
+    dt_days: float
 
 
 class NetworkTransfer(NamedTuple):
@@ -129,6 +202,9 @@ class NetworkTransfer(NamedTuple):
     valid_in : ndarray of bool
         Input bins whose node-destined water all reaches the node inside the record,
         shape ``(n_nodes, n_cin)``.
+    target_terms : TargetTerms or None
+        Target-independent bias factors, present when the operator was built with
+        ``with_target_terms=True``; see :class:`TargetTerms`.
     """
 
     band_vals: npt.NDArray[np.floating]
@@ -137,6 +213,7 @@ class NetworkTransfer(NamedTuple):
     residence_time_out: npt.NDArray[np.floating]
     residence_time_in: npt.NDArray[np.floating]
     valid_in: npt.NDArray[np.bool_]
+    target_terms: TargetTerms | None = None
 
 
 def _surviving_fraction(phi_lo: npt.NDArray[np.floating], phi_hi: npt.NDArray[np.floating]) -> npt.NDArray[np.floating]:
@@ -161,6 +238,28 @@ def _surviving_fraction(phi_lo: npt.NDArray[np.floating], phi_hi: npt.NDArray[np
     with np.errstate(invalid="ignore", divide="ignore"):
         ramp = np.where(spread > 0.0, -np.expm1(-spread) / spread, 1.0)
     return np.exp(-np.minimum(phi_lo, phi_hi)) * ramp
+
+
+def _cell_edges(
+    quarter: npt.NDArray[np.floating],
+) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]:
+    """Extrapolate a cell-affine quantity from its quarter-point samples to its two boundaries.
+
+    Parameters
+    ----------
+    quarter : ndarray
+        Samples at the ``1/4`` and ``3/4`` points of every cell, shape
+        ``(n_nodes, 2, n_cells)``.
+
+    Returns
+    -------
+    lo, hi : ndarray
+        The quantity at the lower and upper cell boundary, shape ``(n_nodes, n_cells)``.
+        Exact whenever the quantity is affine across the cell, which every arrival time and
+        decay exponent is (a flow change inside a cell would have made it a grid point).
+    """
+    lo, hi = quarter[:, 0], quarter[:, 1]
+    return 1.5 * lo - 0.5 * hi, 1.5 * hi - 0.5 * lo
 
 
 def _interp_rows(
@@ -208,6 +307,7 @@ def paths_transfer(
     node_flow: npt.NDArray[np.floating],
     paths_idx: npt.NDArray[np.intp],
     active: npt.NDArray[np.bool_],
+    with_target_terms: bool = False,
 ) -> NetworkTransfer:
     """Build the exact transfer operators and travel times of every source-to-node path.
 
@@ -234,11 +334,21 @@ def paths_transfer(
     active : ndarray of bool
         Which slots of ``paths_idx`` are real path steps, shape ``(n_nodes, max_depth)``. A
         node reporting at the source itself is a row of ``False``.
+    with_target_terms : bool, optional
+        Also build the target-independent factors of the affine relaxation bias (see
+        :class:`TargetTerms`); requires uniform ``tedges_days`` spacing, which the scan of
+        :func:`apply_segment_targets` assumes. The operator itself is identical either
+        way. Default False.
 
     Returns
     -------
     NetworkTransfer
         Banded operators, coverage masks and travel times; see :class:`NetworkTransfer`.
+
+    Raises
+    ------
+    ValueError
+        If ``with_target_terms`` is requested on a non-uniform input grid.
 
     Notes
     -----
@@ -250,12 +360,21 @@ def paths_transfer(
     that ambiguity, and all three quantities are affine across a cell, so the pair at ``1/4``
     and ``3/4`` reproduces them exactly: the mean is the cell mean, and
     ``1.5 * phi_lo_sample - 0.5 * phi_hi_sample`` extrapolates to the boundary exponents that
-    :func:`_surviving_fraction` integrates between.
+    :func:`_surviving_fraction` integrates between. Every exponent the bias factors are built
+    from is affine across a cell for the same reason, so they extrapolate the same way.
     """
     n_cin = len(tedges_days) - 1
     n_cout = len(cout_tedges_days) - 1
     n_nodes, max_depth = paths_idx.shape
     dt_days = np.diff(tedges_days)
+    # The tolerance has to clear the float64 representation of the grid, not just a genuinely
+    # ragged one. Days since the record start grow, their spacing grows with them, and
+    # differencing an exactly uniform hourly grid wobbles by 9e-13 relative after a year and
+    # 1.5e-11 after twenty; a bin width that is a dyadic fraction of a day never wobbles at
+    # all. A grid that is actually non-uniform is out by orders of magnitude more than this.
+    if with_target_terms and not np.allclose(dt_days, dt_days[0], rtol=1e-9, atol=0.0):
+        msg = "target terms require uniformly spaced tedges (the per-segment scan assumes one bin width)"
+        raise ValueError(msg)
 
     # Per-segment cumulative volume, once per segment however many paths share it. Plateaus
     # from a closed valve make the volume-to-time inversion multi-valued, so they are
@@ -318,20 +437,28 @@ def paths_transfer(
 
     # Forward sweep over the cell boundaries and the quarter points inside each cell. The
     # boundaries carry the label; the travel time, the decay exponent and the midpoint arrival
-    # are read off the interior samples (see Notes).
+    # are read off the interior samples (see Notes). The per-depth stages are kept only when
+    # the bias factors are requested -- and only over the interior samples, which is all the
+    # exit-to-node exponents and the entry/exit bins are read off.
     n_edge = grid.shape[1]
     cell_width = np.diff(grid, axis=1)
     samples = np.concatenate([grid, grid[:, :-1] + 0.25 * cell_width, grid[:, :-1] + 0.75 * cell_width], axis=1)
     arrival = samples
     decay_exponent = np.zeros_like(samples)
+    stage_arrival: list[npt.NDArray[np.floating]] = [samples[:, n_edge:]]
+    stage_phi: list[npt.NDArray[np.floating]] = [decay_exponent[:, n_edge:]]
     for depth in range(max_depth):
         previous, arrival = arrival, travel(arrival, depth, downstream=True)
         decay_exponent += segment_decay[paths_idx[:, depth], None] * (arrival - previous)
+        if with_target_terms:
+            # `arrival` is a fresh array each depth, so a view suffices; the exponent
+            # accumulates in place, so its stage is copied.
+            stage_arrival.append(arrival[:, n_edge:])
+            stage_phi.append(decay_exponent[:, n_edge:].copy())
     quarter_arrival = arrival[:, n_edge:].reshape(n_nodes, 2, -1)
     quarter_phi = decay_exponent[:, n_edge:].reshape(n_nodes, 2, -1)
     cell_travel_time = (quarter_arrival - samples[:, n_edge:].reshape(n_nodes, 2, -1)).mean(axis=1)
-    phi_lo = 1.5 * quarter_phi[:, 0] - 0.5 * quarter_phi[:, 1]
-    phi_hi = 1.5 * quarter_phi[:, 1] - 0.5 * quarter_phi[:, 0]
+    phi_lo, phi_hi = _cell_edges(quarter_phi)
     label = _interp_rows(arrival[:, :n_edge], tedges_days, node_cumulative)
 
     # Output bins: label span and the two conditions that do not depend on the cells. The
@@ -393,7 +520,8 @@ def paths_transfer(
     # what turns the label-uniform integral into the flow-weighted bin average. Cells the
     # label does not reach have zero width; their NaN decay exponents and travel times are
     # masked out rather than multiplied by it.
-    survived = np.where(label_width > 0.0, label_width * _surviving_fraction(phi_lo, phi_hi), 0.0)
+    cell_survive = _surviving_fraction(phi_lo, phi_hi)
+    survived = np.where(label_width > 0.0, label_width * cell_survive, 0.0)
     carried_out = np.where(label_width > 0.0, label_width * cell_travel_time, 0.0)
     span = np.where(cout_label_width > 0.0, cout_label_width, 1.0)
     span_all = np.ones((n_nodes, n_cout + 2))
@@ -420,7 +548,131 @@ def paths_transfer(
     band_vals[~valid_out] = 0.0
     col_start = col_start_all.reshape(n_nodes, n_cout + 2)[:, 1:-1]
     residence_time_out = np.where(valid_out, out_travel, np.nan)
-    return NetworkTransfer(band_vals, col_start, valid_out, residence_time_out, residence_time_in, valid_in)
+
+    target_terms = None
+    if with_target_terms:
+        # Target-independent bias factors, read off the stored sweep stages at the quarter
+        # points and extrapolated to the cell boundaries exactly as the decay exponent is.
+        # phi_down -- the exponent from a segment's exit to the node -- is the difference of
+        # two accumulator stages and is non-negative, because adding non-negative increments
+        # to an accumulator is monotone in floating point. Cells the label does not reach get
+        # their means zeroed here, so the apply step never touches a NaN. The entry and exit
+        # bins are constant over a cell (the grid seeds tedges at every node), so the cell
+        # midpoint reads them off; an arrival exactly on the record's final edge is
+        # re-labelled to the last real bin by the clip, whose zero-length exit piece makes
+        # that exact.
+        n_cells = grid.shape[1] - 1
+        covered = label_width > 0.0
+        mean_down = np.empty((max_depth + 1, n_nodes, n_cells))
+        mean_shift = np.empty((max_depth, n_nodes, n_cells))
+        bin_entry = np.empty((max_depth, n_nodes, n_cells), dtype=np.intp)
+        bin_exit = np.empty((max_depth, n_nodes, n_cells), dtype=np.intp)
+        mean_down[0] = np.where(covered, cell_survive, 0.0)
+        for depth in range(max_depth):
+            phi_down = quarter_phi - stage_phi[depth + 1].reshape(n_nodes, 2, n_cells)
+            mean_down[depth + 1] = np.where(covered, _surviving_fraction(*_cell_edges(phi_down)), 0.0)
+            entries = stage_arrival[depth].reshape(n_nodes, 2, n_cells)
+            exits = stage_arrival[depth + 1].reshape(n_nodes, 2, n_cells)
+            bin_entry[depth] = np.clip(
+                np.searchsorted(tedges_days, entries.mean(axis=1), side="right") - 1, 0, n_cin - 1
+            )
+            bin_exit[depth] = np.clip(np.searchsorted(tedges_days, exits.mean(axis=1), side="right") - 1, 0, n_cin - 1)
+            # The interior-edge factor, shifted by the exit bin's left edge so the exponent
+            # stays non-negative (up to the operator's roundtrip rounding) however long the
+            # record is.
+            rate = segment_decay[paths_idx[:, depth], None, None]
+            shift = rate * (exits - tedges_days[bin_exit[depth]][:, None, :]) + phi_down
+            mean_shift[depth] = np.where(covered, _surviving_fraction(*_cell_edges(shift)), 0.0)
+        target_terms = TargetTerms(
+            mean_down=mean_down,
+            mean_shift=mean_shift,
+            bin_entry=bin_entry,
+            bin_exit=bin_exit,
+            cell_weight=label_width / span_all.ravel()[flat_cout].reshape(n_nodes, n_cells),
+            flat_cout=flat_cout,
+            segment_rate=segment_decay,
+            paths_idx=paths_idx,
+            dt_days=float(dt_days[0]),
+        )
+    return NetworkTransfer(
+        band_vals, col_start, valid_out, residence_time_out, residence_time_in, valid_in, target_terms
+    )
+
+
+def apply_segment_targets(
+    transfer: NetworkTransfer, segment_target: npt.NDArray[np.floating]
+) -> npt.NDArray[np.floating]:
+    """Apply concrete per-segment relaxation targets to a prebuilt operator's bias factors.
+
+    The affine model is ``c_node = W @ c_source + b``; this computes ``b`` for one target
+    set. The only sequential work is one exponentially forgetting scan per segment,
+    ``S[j] = S[j-1] * exp(-k dt) + (Tb[j] - Tb[j-1])``, whose partial sums turn the
+    interior-edge terms of every cell into two gathers; everything else is elementwise on
+    the stored cell factors and one scatter-add. All exponents are non-positive, so no
+    input scale can overflow. A segment whose target never moves has no interior-edge sum at
+    all, so its scan is skipped -- which is most of them when the caller carries inert copies
+    of its segments.
+
+    Parameters
+    ----------
+    transfer : NetworkTransfer
+        Operator built by :func:`paths_transfer` with ``with_target_terms=True``.
+    segment_target : ndarray
+        Relaxation target of every segment [same unit as the source signal], piecewise
+        constant on the input bins, shape ``(n_seg, n_cin)``.
+
+    Returns
+    -------
+    ndarray
+        Bias of each output bin, shape ``(n_nodes, n_cout)``. Zero where
+        :attr:`NetworkTransfer.valid_out` is False, so adding it to ``W @ c_source``
+        keeps the NaN policy of the caller intact.
+
+    Raises
+    ------
+    ValueError
+        If the operator was built without target terms.
+    """
+    terms = transfer.target_terms
+    if terms is None:
+        msg = "operator was built without target terms; pass with_target_terms=True to paths_transfer"
+        raise ValueError(msg)
+    target = np.asarray(segment_target, dtype=float)
+    n_seg, n_cin = target.shape
+    n_nodes, n_cout = transfer.valid_out.shape
+    dt = terms.dt_days
+
+    # Forgetting scan over the interior input edges, one fused C pass per segment.
+    steps = np.diff(target, axis=1)
+    rho = np.exp(-terms.segment_rate * dt)
+    scan = np.zeros((n_seg, n_cin))
+    for e in np.flatnonzero(steps.any(axis=1)):
+        scan[e, 1:] = lfilter([1.0], [1.0, -rho[e]], steps[e])
+
+    # Per depth: entry piece, exit piece and the scanned interior-edge sum of each cell.
+    # Inactive path slots cancel exactly -- their entry and exit stages are the same
+    # floats -- so no masking is needed.
+    cell_bias = np.zeros_like(terms.cell_weight)
+    for depth in range(terms.paths_idx.shape[1]):
+        seg = terms.paths_idx[:, depth]
+        rate = terms.segment_rate[seg, None]
+        tb = target[seg]
+        scan_seg = scan[seg]
+        b_a, b_b = terms.bin_entry[depth], terms.bin_exit[depth]
+        interior = np.take_along_axis(scan_seg, b_b, axis=1) - np.take_along_axis(scan_seg, b_a, axis=1) * np.exp(
+            -rate * dt * (b_b - b_a)
+        )
+        cell_bias += (
+            np.take_along_axis(tb, b_b, axis=1) * terms.mean_down[depth + 1]
+            - np.take_along_axis(tb, b_a, axis=1) * terms.mean_down[depth]
+            - terms.mean_shift[depth] * interior
+        )
+
+    out_slots = n_nodes * (n_cout + 2)
+    bias = np.bincount(terms.flat_cout, weights=(cell_bias * terms.cell_weight).ravel(), minlength=out_slots).reshape(
+        n_nodes, n_cout + 2
+    )[:, 1:-1]
+    return np.where(transfer.valid_out, bias, 0.0)
 
 
 def network_transfer(
