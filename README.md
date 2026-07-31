@@ -13,6 +13,7 @@
 - **Trace a contamination event** from the plant to every delivery point, with arrival times that follow the real demand pattern
 - **Model chlorine residual** with separate bulk and wall decay, so thin service lines lose residual faster than trunk mains — as they do
 - **Map water age** across the network and watch it swing over the day
+- **Predict the temperature at the tap** from the weather and what the pipes are buried under, including the heat the network itself stores in the soil
 - **Reconstruct the produced water quality** from measurements at a handful of delivery points
 - **Size a monitoring campaign** by asking which part of the production history each sampling point actually constrains
 

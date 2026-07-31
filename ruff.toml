@@ -71,6 +71,8 @@ convention = "numpy"
     "INP001",  # __init__.py is not needed for the test folders
     "RUF002",  # Greek / math unicode in physics-module test docstrings
     "RUF003",  # Same rationale in comments
+    "C408",    # dict(...) reads better than a literal for a bundle of keyword arguments
+    "SLF001",  # Tests exercise the private helpers the public functions are assembled from
 ]
 "src/pipetransport/network.py" = [
     "DOC502",  # Public entry points document ValueError; the raises happen inside the validation helpers
@@ -83,6 +85,10 @@ convention = "numpy"
 ]
 "src/pipetransport/logremoval.py" = [
     "DOC502",  # Public entry points document ValueError; the raises happen inside the validation helpers
+]
+"src/pipetransport/heat.py" = [
+    "DOC502",  # Public entry points document ValueError and RuntimeError; the raises happen inside helpers
+    "PLR0913",  # The paired functions take the network, the soil table and the forcing as keywords
 ]
 "src/pipetransport/plot.py" = [
     "PLR0913",  # Plot helpers legitimately take many styling keywords

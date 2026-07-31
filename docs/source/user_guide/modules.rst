@@ -33,6 +33,11 @@ Pick the module by the question, not by the quantity.
      - :func:`~pipetransport.logremoval.segment_decay_rate`,
        :func:`~pipetransport.logremoval.residence_time_to_log_removal`,
        :func:`~pipetransport.logremoval.parallel_mean`
+   * - :mod:`pipetransport.heat`
+     - *How warm is the water at the tap, given the weather and what the pipes are buried in?*
+     - :func:`~pipetransport.heat.source_to_endmember`,
+       :func:`~pipetransport.heat.segment_heat_rate`,
+       :func:`~pipetransport.heat.soil_temperature`
    * - :mod:`pipetransport.examples`
      - *Give me a realistic network and demand pattern to try this on.*
      - :func:`~pipetransport.examples.example_network`,

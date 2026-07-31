@@ -320,6 +320,143 @@ limit of the decaying one, not a separate code path.
 **How it is checked.** Partly. Negative rates are rejected, and a ``Series`` of rates must cover
 every segment. The kinetic form itself is your modelling choice.
 
+Heat exchange with the soil
+---------------------------
+
+These assumptions apply only to :mod:`pipetransport.heat`; the rest of the package is unaffected by
+them. They sit on top of everything above --- the heat model is the same transport operator read as
+an affine map, so tree topology, plug flow and known demand are all still required.
+
+**Assumption.** The soil around a segment behaves as a set of independent radial columns around a
+*line* source at the pipe axis, with a mirror-image sink above the ground surface; the soil is
+homogeneous and time-constant per land-cover class; the pipe wall is a memoryless series resistance;
+and the water is well mixed across the pipe section.
+
+**Why it matters.** Independence of the columns is what makes the wall temperature a local quantity
+and reduces the halo to one convolution per segment. It is well founded: axial conduction reaches
+about a metre in a month, against axial variation scales of hundreds of metres. The mirror image is
+what makes the halo saturate at the steady buried-pipe resistance instead of growing without bound.
+The wall's own thermal response time is minutes, far below any sensible bin width, so it carries no
+memory of its own.
+
+**What breaks if it is violated.** Two mains sharing a trench warm each other's soil, which this
+model does not represent --- each segment sees only its own halo, so the delivered temperature of
+both is underestimated in summer. Freeze--thaw and seasonal moisture change the soil properties
+within a run, which the model holds fixed. Below a Fourier number :math:`\alpha \Delta t / r_o^2` of
+roughly 5 the line source overstates the deficit of the first lag bins, by up to about 9 % of the
+steady resistance near :math:`\mathrm{Fo} \approx 0.3`; because the deficit is a correction rather
+than the leading resistance, the delivered temperature moves by only hundredths of a kelvin for a
+service line on hourly bins, rising to a few tenths for a trunk main at sub-daily bins.
+
+**The pre-history matters more than any of that.** The model starts with an undisturbed halo, so a
+pipe that has in reality been running for years is modelled as one switched on at the first bin,
+meeting soil that accepts heat almost without resistance. On a 100 mm service line with a sustained
+12 K difference the delivered temperature is several kelvin too close to the soil at the start of the
+record; a week of lead-in brings that under 1 K, a month under 0.4 K and a season under 0.1 K.
+Supply lead-in you intend to discard, and discard it.
+
+**What you can do.** Start the record well before the period you care about, and give
+``surface_tedges`` a year or more of history so the soil field at depth is not leaning on ``t_pre``.
+Use bin widths that resolve the forcing you care about --- the halo memory reads the flux history
+only through bin averages. Keep parallel mains out, or merge them into one equivalent segment.
+
+**How it is checked.** Partly. Geometry and soil parameters must be positive and the burial depth
+must exceed the pipe radius; every segment's cover class must appear in the ``soil`` table and in the
+surface record; ``tedges`` must be uniformly spaced, since the halo memory is a convolution. The
+adequacy of the lead-in, the bin width and the trench spacing is your modelling choice.
+
+.. _assumption-uniform-wall-flux:
+
+How far along a pipe the wall flux is resolved
+----------------------------------------------
+
+**Assumption.** The wall flux is uniform along each internal piece of a pipe, and each piece keeps
+its own soil memory. The number of pieces follows from ``theta_max``:
+``n_sub = ceil(h_e tau_e / theta_max)``, capped at 16.
+
+**Why it matters.** Because the soil columns are independent, the flux is a *local* quantity, and it
+falls along a pipe like :math:`e^{-h_e \tau}` --- by a factor 1.6 over a 2 h transit on a 100 mm
+service line, and 3.8 over 6 h. Charging the whole pipe with one average flux history gives every
+parcel in it the same soil memory, and that is not a bin-resolution question that a finer ``tedges``
+would answer: it is a *spatial* one. Splitting the pipe is exact in the transport it does not
+touch --- ``n_sub`` series pieces of volume :math:`V/n_\text{sub}` at the same flow compose to the
+same arrival map, and their exchange exponents add to the whole pipe's --- so ``W``, the residence
+times and the coverage mask are unchanged to round-off, and only the soil bias is refined.
+
+**What breaks if it is violated.** With ``theta_max=inf`` (no split at all) the delivered temperature
+on the example network is wrong by up to 0.6 K against a well-resolved reference, and on a single
+100 mm line under diurnal forcing by more than a kelvin; the error concentrates on the slowest,
+thinnest branch, which is usually the one the study is about.
+
+**What the criterion deliberately leaves alone.** A trunk main can have a long transit and still
+barely equilibrate, so ``h_e \tau_e`` is small and it is never split. That is not an oversight. Those
+are the pipes whose first lag bin already holds the whole steady soil resistance ---
+:math:`\bar{D}[0]/R_\text{soil}` is 1.0000 for a 400 mm main on hourly bins --- so the same-bin
+coupling has no margin, and refining them does not converge to a better answer: the fixed-point
+iteration slows toward a stall (measured 254 sweeps unsplit against 1258 at six pieces per pipe on
+the example network, and outright non-convergence beyond that). Resolving the wall flux along a
+trunk main is blocked on a pipe-side kernel that does not send that ratio to 1 --- the constant-flux
+cylinder response, which is tracked separately.
+
+**What you can do.** Lower ``theta_max`` until the answer stops moving, and check the cost as you
+go. The build and each coupled sweep grow with the square of the *path* depth, and the depth is the
+sum of the splits along it, so one slow service line sets the price for the whole network: on the
+example network at hourly bins, ``theta_max=inf`` runs 90 days in about 14 s, ``0.5`` in 30 s,
+``0.25`` in 62 s and ``0.125`` in 13 minutes. The default 0.25 is where that curve is still gentle.
+
+**How it is checked.** ``theta_max`` must be positive, and a split that costs more sweeps than
+``max_sweeps`` allows raises rather than returning an unconverged answer. That the split converges
+where it is applied is a test, not a runtime check --- and the cap of 16 pieces per pipe is a cost
+ceiling, not a physical statement.
+
+.. _assumption-effective-target:
+
+The relaxation target is an effective driving temperature
+----------------------------------------------------------
+
+**Assumption.** The water relaxes toward :math:`T_b = T_\infty - \text{memory}` at the *steady*
+exchange rate. :math:`T_b` is a bookkeeping quantity, not the temperature of anything.
+
+**Why it matters.** The rate carries the fully developed soil resistance, which is too large while
+the halo is still building. To reproduce the faster early exchange the target has to be driven past
+the undisturbed soil, away from the water --- by several times the driving contrast in the bins just
+after a sharp change in the wall flux. That is the correct behaviour of the split into *steady part
+plus transient deficit*, not an artefact.
+
+**What breaks if it is violated.** Nothing internally, but it breaks an expectation: because the
+delivered temperature is a genuine weighted average of the produced water and those targets, **it can
+fall outside the range of its own inputs**. Measured worst case: about 20 % of the instantaneous
+plant-to-soil contrast, one to two transits after a step in the produced temperature, decaying over
+roughly two weeks --- 4.7 K on a 100 mm line after a 24 K step. Splitting the pipe
+(:ref:`assumption-uniform-wall-flux`) cuts it to 3--4 % but does not remove it. The one-way model
+(``max_sweeps=1``) has a fixed target and is exactly inside the range.
+
+**What you can do.** Read a delivered temperature in the first transits after a step as carrying
+that overshoot, and compare against ``max_sweeps=1`` if you need a bound that cannot leave the hull.
+
+**How it is checked.** Not at runtime --- the invariant a runtime check would assert is false, and a
+guard that fires on correct physics is worse than none. Its *size* is pinned by a test.
+
+Stagnation
+----------
+
+**Assumption.** A segment with no throughflow during a bin exchanges no heat with the soil.
+
+**Why it matters.** The wall flux is read off the water actually delivered, so a bin that delivers
+nothing reports nothing. The water standing in the pipe still relaxes toward the soil exactly --- the
+transport operator carries it --- but its heat does not enter the halo.
+
+**What breaks if it is violated.** An overnight stagnation of a service line reaches
+:math:`h\tau \approx 2`, nearly full equilibration, so the halo the model builds is smaller than the
+real one and the first water delivered the next morning meets soil the model believes undisturbed.
+This is the model's weakest point on dead-end branches with a strong diurnal pattern.
+
+**What you can do.** Treat delivered temperatures immediately after a long stagnation as a lower
+bound on the excursion, and prefer the results for bins that follow sustained flow.
+
+**How it is checked.** Not checked; it is a modelling choice made for you, and it is documented here
+because it is not visible in the output.
+
 Units
 -----
 
