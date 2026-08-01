@@ -118,8 +118,9 @@ if TYPE_CHECKING:
 _COVERAGE_TOLERANCE = 1e-8
 
 # Slack, in ulps of the cumulative-volume scale, allowed when a displacement target misses the
-# record's volume range. It has to clear both the round-trip interpolation error (about one ulp
-# per segment on the path) and the 16-ulp plateau separation in _make_strictly_monotone. At
+# record's volume range, and the floor below which a cell's label width is plateau residue
+# rather than water. Both have to clear the round-trip interpolation error (about one ulp per
+# segment on the path) and the 16-ulp plateau separation in _make_strictly_monotone. At
 # 1.4e-14 relative it is far below any physically meaningful volume.
 _ROUNDTRIP_ULPS = 64.0
 
@@ -480,11 +481,20 @@ def paths_transfer(
     row_supported = edge_in_record[:-1] & edge_in_record[1:] & (cout_label_width > 0.0)
 
     # Cells. Each spans one grid interval; both its boundaries must reach the node inside the
-    # record for it to carry information.
+    # record for it to carry information, and it must carry more water than the plateau
+    # separation of _make_strictly_monotone leaves behind. That separation is what keeps the
+    # volume-to-time inversion single-valued across a closed valve, but it lands in the label
+    # of exactly the cells whose parcels never departed: unfloored, their sliver of width
+    # reads as carried water, and a source bin no measurement constrains comes back with a
+    # finite age and a reconstruction of zero instead of NaN. The floor is relative to the
+    # record's own volume because the sliver is -- it is ulps of the cumulative scale, so any
+    # fixed threshold is crossed by a long enough record.
     cell_ok = np.isfinite(label[:, :-1]) & np.isfinite(label[:, 1:])
     midpoint = 0.5 * (grid[:, :-1] + grid[:, 1:])
     cin_bin = np.clip(np.searchsorted(tedges_days, midpoint, side="right") - 1, 0, n_cin - 1)
-    label_width = np.where(cell_ok, label[:, 1:] - label[:, :-1], 0.0)
+    label_floor = _ROUNDTRIP_ULPS * np.spacing(node_cumulative[:, -1:])
+    carrying = cell_ok & (label[:, 1:] - label[:, :-1] > label_floor)
+    label_width = np.where(carrying, label[:, 1:] - label[:, :-1], 0.0)
 
     # An input bin is constrained only if every parcel leaving in it arrives inside the
     # record. Every scatter-add below runs on indices flattened with a per-node offset.
@@ -509,15 +519,20 @@ def paths_transfer(
     # Cells are ordered by source time, and arrival, label and the input-bin index all
     # increase with it, so the cells of one output slot are a contiguous, non-decreasing run
     # -- globally, since the node offsets dominate. The band bounds are read off each run's
-    # first and last cell instead of a scatter-minimum.
-    n_cell = flat_cout.size
-    run_lo = np.searchsorted(flat_cout, np.arange(out_slots), side="left")
-    run_hi = np.searchsorted(flat_cout, np.arange(out_slots), side="right")
-    populated = run_hi > run_lo
-    safe_lo, safe_hi = np.clip(run_lo, 0, max(n_cell - 1, 0)), np.clip(run_hi - 1, 0, max(n_cell - 1, 0))
+    # first and last cell instead of a scatter-minimum, over the carrying cells only:
+    # compressing a sorted array keeps it sorted, and a run of non-carrying plateau cells
+    # spans a closure while contributing nothing to it, so reading them would stretch every
+    # band of the operator to the length of the longest closure.
     cin_flat = cin_bin.ravel()
-    col_start_all = np.where(populated, cin_flat[safe_lo], 0).astype(np.intp)
-    col_stop_all = np.where(populated, cin_flat[safe_hi], 0)
+    carry_cout, carry_cin = flat_cout[carrying.ravel()], cin_flat[carrying.ravel()]
+    n_carry = carry_cout.size
+    slots = np.arange(out_slots)
+    run_lo = np.searchsorted(carry_cout, slots, side="left")
+    run_hi = np.searchsorted(carry_cout, slots, side="right")
+    populated = run_hi > run_lo
+    safe_lo, safe_hi = np.clip(run_lo, 0, max(n_carry - 1, 0)), np.clip(run_hi - 1, 0, max(n_carry - 1, 0))
+    col_start_all = np.where(populated, carry_cin[safe_lo], 0).astype(np.intp)
+    col_stop_all = np.where(populated, carry_cin[safe_hi], 0)
     # The band width is shared across nodes and read off the real slots only: a dustbin run
     # may span the whole input range.
     spread = (col_stop_all - col_start_all).reshape(n_nodes, n_cout + 2)[:, 1:-1]
@@ -528,8 +543,8 @@ def paths_transfer(
     # label does not reach have zero width; their NaN decay exponents and travel times are
     # masked out rather than multiplied by it.
     cell_survive = _surviving_fraction(phi_lo, phi_hi)
-    survived = np.where(label_width > 0.0, label_width * cell_survive, 0.0)
-    carried_out = np.where(label_width > 0.0, label_width * cell_travel_time, 0.0)
+    survived = np.where(carrying, label_width * cell_survive, 0.0)
+    carried_out = np.where(carrying, label_width * cell_travel_time, 0.0)
     span = np.where(cout_label_width > 0.0, cout_label_width, 1.0)
     span_all = np.ones((n_nodes, n_cout + 2))
     span_all[:, 1:-1] = span
