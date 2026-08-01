@@ -144,10 +144,16 @@ class TargetTerms(NamedTuple):
         Cell means of ``exp(-(k_d (A_exit(s) - tau[bin_exit]) + phi_down(s)))``, the
         factor of the interior-edge sum, shape ``(max_depth, n_nodes, n_cells)``. The
         exponent is non-negative by the half-open edge convention, so it never overflows.
-    bin_entry, bin_exit : ndarray of intp
+    bin_entry, bin_exit : ndarray of int32
         Input bin holding the segment entry and exit time of each cell's parcels, shape
         ``(max_depth, n_nodes, n_cells)``; constant over a cell because the grid seeds the
-        input edges at every node.
+        input edges at every node. Bin numbers are below ``n_cin``, so 32 bits are exact;
+        :func:`apply_segment_targets` adds the segment's row offset to reach the raveled
+        target, and that sum widens to the platform index type on its own.
+    gap : ndarray
+        ``exp(-k_d dt (bin_exit - bin_entry))``, the factor carrying the forgetting scan from
+        the entry bin to the exit bin, shape ``(max_depth, n_nodes, n_cells)``. It depends
+        only on the operator, so it is built once here rather than per applied target set.
     cell_weight : ndarray
         Label width of each cell over the label span of its output slot, shape
         ``(n_nodes, n_cells)`` -- the same weight the ``W`` scatter uses.
@@ -164,8 +170,9 @@ class TargetTerms(NamedTuple):
 
     mean_down: npt.NDArray[np.floating]
     mean_shift: npt.NDArray[np.floating]
-    bin_entry: npt.NDArray[np.intp]
-    bin_exit: npt.NDArray[np.intp]
+    bin_entry: npt.NDArray[np.int32]
+    bin_exit: npt.NDArray[np.int32]
+    gap: npt.NDArray[np.floating]
     cell_weight: npt.NDArray[np.floating]
     flat_cout: npt.NDArray[np.intp]
     segment_rate: npt.NDArray[np.floating]
@@ -565,8 +572,9 @@ def paths_transfer(
         covered = label_width > 0.0
         mean_down = np.empty((max_depth + 1, n_nodes, n_cells))
         mean_shift = np.empty((max_depth, n_nodes, n_cells))
-        bin_entry = np.empty((max_depth, n_nodes, n_cells), dtype=np.intp)
-        bin_exit = np.empty((max_depth, n_nodes, n_cells), dtype=np.intp)
+        bin_entry = np.empty((max_depth, n_nodes, n_cells), dtype=np.int32)
+        bin_exit = np.empty((max_depth, n_nodes, n_cells), dtype=np.int32)
+        gap = np.empty((max_depth, n_nodes, n_cells))
         mean_down[0] = np.where(covered, cell_survive, 0.0)
         for depth in range(max_depth):
             phi_down = quarter_phi - stage_phi[depth + 1].reshape(n_nodes, 2, n_cells)
@@ -583,11 +591,13 @@ def paths_transfer(
             rate = segment_decay[paths_idx[:, depth], None, None]
             shift = rate * (exits - tedges_days[bin_exit[depth]][:, None, :]) + phi_down
             mean_shift[depth] = np.where(covered, _surviving_fraction(*_cell_edges(shift)), 0.0)
+            gap[depth] = np.exp(-rate[:, 0] * float(dt_days[0]) * (bin_exit[depth] - bin_entry[depth]))
         target_terms = TargetTerms(
             mean_down=mean_down,
             mean_shift=mean_shift,
             bin_entry=bin_entry,
             bin_exit=bin_exit,
+            gap=gap,
             cell_weight=label_width / span_all.ravel()[flat_cout].reshape(n_nodes, n_cells),
             flat_cout=flat_cout,
             segment_rate=segment_decay,
@@ -652,19 +662,23 @@ def apply_segment_targets(
     # Per depth: entry piece, exit piece and the scanned interior-edge sum of each cell.
     # Inactive path slots cancel exactly -- their entry and exit stages are the same
     # floats -- so no masking is needed.
+    #
+    # The gathers read the raveled target and scan through a flat index, the segment's row
+    # offset plus the stored bin. That is the same element ``take_along_axis`` would fetch,
+    # but it neither materializes the broadcast index grid that call builds internally nor
+    # copies ``target[seg]`` and ``scan[seg]`` first -- together about two thirds of the work
+    # of this loop, which is in turn most of the module's runtime. The offset is formed here
+    # rather than stored so the flat index never has to be held at operator scale.
+    flat_target, flat_scan = target.ravel(), scan.ravel()
     cell_bias = np.zeros_like(terms.cell_weight)
     for depth in range(terms.paths_idx.shape[1]):
-        seg = terms.paths_idx[:, depth]
-        rate = terms.segment_rate[seg, None]
-        tb = target[seg]
-        scan_seg = scan[seg]
-        b_a, b_b = terms.bin_entry[depth], terms.bin_exit[depth]
-        interior = np.take_along_axis(scan_seg, b_b, axis=1) - np.take_along_axis(scan_seg, b_a, axis=1) * np.exp(
-            -rate * dt * (b_b - b_a)
-        )
+        offset = (terms.paths_idx[:, depth] * n_cin)[:, None]
+        at_entry = terms.bin_entry[depth] + offset
+        at_exit = terms.bin_exit[depth] + offset
+        interior = flat_scan[at_exit] - flat_scan[at_entry] * terms.gap[depth]
         cell_bias += (
-            np.take_along_axis(tb, b_b, axis=1) * terms.mean_down[depth + 1]
-            - np.take_along_axis(tb, b_a, axis=1) * terms.mean_down[depth]
+            flat_target[at_exit] * terms.mean_down[depth + 1]
+            - flat_target[at_entry] * terms.mean_down[depth]
             - terms.mean_shift[depth] * interior
         )
 
