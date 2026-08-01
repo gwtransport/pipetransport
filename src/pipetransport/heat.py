@@ -786,9 +786,12 @@ def _build_system(
     # The arrival maps compose and the decay exponents add, so ``W`` is unchanged to round-off
     # and only the relaxation bias is refined; ``network.segments`` keeps the user's own pipes.
     # The count follows from a cap on how far a piece may equilibrate, so it is set by the
-    # physics rather than guessed -- a stagnant pipe delivers nothing and needs no split.
+    # physics rather than guessed -- a stagnant pipe delivers nothing and needs no split. The
+    # statistic reads the caller's own record only: the warm-start prefix repeats the first
+    # flow value, so including it would let the padding decide the split, and the median is a
+    # knife-edge on a two-shift demand where half the bins sit at each level.
     with np.errstate(divide="ignore", invalid="ignore"):
-        equilibration = rate * volume / np.median(seg_flow, axis=1)
+        equilibration = rate * volume / np.median(seg_flow[:, n_pad:], axis=1)
     pieces = np.ceil(np.where(np.isfinite(equilibration), equilibration, 0.0) / theta_max)
     n_sub = np.clip(pieces, 1.0, _MAX_PIECES).astype(np.intp)
     parent = np.repeat(np.arange(len(segments)), n_sub)
