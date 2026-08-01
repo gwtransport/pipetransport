@@ -640,13 +640,8 @@ def test_batched_nodes_of_mixed_depth_agree_with_single_node_calls(heat_network,
 # ============================================================================
 
 
-def _uniform_case(network, tedges, *, tin, sol_air, flow, theta_max=np.inf):
-    """Run the coupled model with constant inputs.
-
-    ``theta_max=inf`` by default: sub-segmentation refines *when* the halo sees each parcel's
-    wall flux, and with constant inputs the flux is constant too, so there is nothing for it
-    to refine and every case below would only pay for it.
-    """
+def _uniform_case(network, tedges, *, tin, sol_air, flow):
+    """Run the coupled model with constant inputs."""
     n = len(tedges) - 1
     return heat.source_to_endmember(
         tin=np.full(n, tin),
@@ -656,7 +651,6 @@ def _uniform_case(network, tedges, *, tin, sol_air, flow, theta_max=np.inf):
         network=network,
         soil=pd.DataFrame([GRASS], index=["grass"]),
         surface_temperature=pd.DataFrame({"grass": np.full(n, sol_air)}),
-        theta_max=theta_max,
     )
 
 
@@ -741,9 +735,9 @@ def _local_reference(*, tin, t_inf, dt, tau, n_slug, r_inner, d_eff, alpha, kapp
 def _series_pipe(n_sub, *, transit_hours, tin, tedges, film_coefficient=0.454):
     """Run the package on one 100 mm, 2 km grass pipe cut into ``n_sub`` series pieces.
 
-    Splitting a pipe into identical series pieces is exactly what ``theta_max`` does
-    internally; doing it here as a visible chain of user segments makes the refinement
-    explicit and independent of how ``n_sub`` is chosen.
+    The model carries one wall-flux history per pipe, so declaring the pipe as a chain of
+    shorter segments is how a caller refines the soil memory along it. That refinement is
+    the subject of the tests below.
 
     Returns
     -------
@@ -773,7 +767,6 @@ def _series_pipe(n_sub, *, transit_hours, tin, tedges, film_coefficient=0.454):
         soil=pd.DataFrame([GRASS], index=["grass"]),
         surface_temperature=pd.DataFrame({"grass": np.full(n_bins, 18.0)}),
         film_coefficient=film_coefficient,
-        theta_max=np.inf,
     )[0]
 
 
@@ -906,7 +899,7 @@ def test_one_way_model_is_the_first_iterate(heat_network, hourly_tedges, diurnal
         soil=soil,
         surface_temperature=surface(hourly_tedges, amplitude=3.0),
     )
-    one_way = heat.source_to_endmember(tin=tin, **shared, theta_max=0.4, max_sweeps=1)
+    one_way = heat.source_to_endmember(tin=tin, **shared, max_sweeps=1)
 
     system = heat._build_system(
         **shared,
@@ -914,7 +907,6 @@ def test_one_way_model_is_the_first_iterate(heat_network, hourly_tedges, diurnal
         nodes=None,
         kappa_pipe=None,
         film_coefficient=None,
-        theta_max=0.4,
         spinup="constant",
     )
     padded = np.concatenate([np.full(system.n_pad, tin[0]), tin])
@@ -957,7 +949,6 @@ def test_each_segment_relaxes_toward_its_own_cover_and_depth(
         nodes=None,
         kappa_pipe=None,
         film_coefficient=None,
-        theta_max=np.inf,  # keep one t_inf row per user segment
         spinup="constant",
     )
     # The field is built on the padded grid, which the spin-up prepends to the caller's.
@@ -1042,7 +1033,7 @@ def test_the_delivered_temperature_overshoots_the_forcing_range_by_a_measured_am
     )
     contrast = 45.0 - 21.0
 
-    two_way = heat.source_to_endmember(**shared, theta_max=np.inf)[0]
+    two_way = heat.source_to_endmember(**shared)[0]
     finite = two_way[np.isfinite(two_way)]
     # The hot water pours heat into a halo that does not exist yet, so the target is driven
     # *below* the soil and the delivered water follows it down: the excursion is on the cold
@@ -1052,11 +1043,24 @@ def test_the_delivered_temperature_overshoots_the_forcing_range_by_a_measured_am
     assert 0.15 < excursion < 0.25, excursion
 
     # Two things bound it. The one-way model has a fixed target and is exactly inside the
-    # hull; and splitting the pipe, which refines the flux history the halo is built from,
-    # cuts the excursion severalfold without removing it.
+    # hull; and declaring the same pipe as two segments, which refines the flux history the
+    # halo is built from, cuts the excursion severalfold without removing it.
     one_way = heat.source_to_endmember(**shared, max_sweeps=1)[0]
     assert np.nanmin(one_way) >= 21.0 - 1e-9
-    split = heat.source_to_endmember(**shared, theta_max=1.5)[0]  # h tau = 2.7 here, so two pieces
+    halves = PipeNetwork(
+        segments=pd.DataFrame(
+            {
+                "from": ["Plant", "mid"],
+                "to": ["mid", "T1"],
+                "length": [500.0, 500.0],
+                "diameter": [0.1, 0.1],
+                "cover": ["grass", "grass"],
+            },
+            index=["a", "b"],
+        ),
+        source="Plant",
+    )
+    split = heat.source_to_endmember(**{**shared, "network": halves})[0]
     assert (21.0 - np.nanmin(split)) / contrast < 0.5 * excursion
 
 
@@ -1076,7 +1080,6 @@ def test_the_model_is_linear_in_every_temperature_input(heat_network, hourly_ted
         cout_tedges=hourly_tedges,
         network=heat_network,
         soil=soil,
-        theta_max=np.inf,
     )
     base = heat.source_to_endmember(
         tin=np.full(n, 9.0), surface_temperature=surface(hourly_tedges, amplitude=4.0), **shared
@@ -1115,7 +1118,6 @@ def test_the_answer_does_not_depend_on_the_temperature_origin(
         cout_tedges=hourly_tedges,
         network=heat_network,
         soil=soil,
-        theta_max=np.inf,
     )
     base = heat.source_to_endmember(tin=tin, surface_temperature=surface(hourly_tedges, amplitude=4.0), **shared)
     shifted = heat.source_to_endmember(
@@ -1147,7 +1149,6 @@ def test_inert_copy_makes_the_entry_row_the_same_water(heat_network, short_tedge
         nodes=None,
         kappa_pipe=None,
         film_coefficient=None,
-        theta_max=np.inf,
         spinup=None,
     )
     rng = np.random.default_rng(41)
@@ -1181,7 +1182,6 @@ def test_leaf_delivery_rows_agree_with_the_transport_module(heat_network, short_
         nodes=None,
         kappa_pipe=None,
         film_coefficient=None,
-        theta_max=np.inf,
         spinup=None,
     )
     tin = np.full(n, 9.0)
@@ -1230,7 +1230,6 @@ def test_wall_flux_vanishes_without_a_temperature_difference(heat_network, hourl
         nodes=None,
         kappa_pipe=None,
         film_coefficient=None,
-        theta_max=np.inf,
         spinup="constant",
     )
     targets = heat._update_targets(system, heat._internal_pass(system, np.full(system.n_bins, 14.0), system.t_inf))
@@ -1277,90 +1276,69 @@ def test_pre_history_transient_decays_with_a_longer_lead_in(heat_pipe):
     assert errors[3] < 0.1
 
 
-def test_sub_segmentation_leaves_the_transport_operator_alone(
+def test_declaring_a_pipe_as_series_segments_leaves_the_transport_operator_alone(
     heat_network, hourly_tedges, diurnal_demand, soil, surface
 ):
-    """Splitting a pipe refines the soil memory only: ``W``, its coverage and its travel times hold.
+    """Refining the soil memory must not perturb the transport: ``W``, its coverage, its travel times.
 
-    The split is admissible only because ``n_sub`` series pieces of volume ``V/n_sub`` at the
-    same flow compose to the same arrival map, and their exchange exponents add to the whole
-    pipe's. Applying the operator with the targets left out isolates ``W @ tin`` from the
-    bias, which is the quantity that must not move --- otherwise ``theta_max`` would silently
-    perturb conservative transport, the residence times and the ``h -> 0`` reduction.
+    The model carries one wall-flux history per pipe, so a caller who needs the flux resolved
+    along a pipe declares it as a chain of shorter segments. That is admissible only because
+    ``k`` series pieces of volume ``V/k`` at the same flow compose to the same arrival map and
+    their exchange exponents add to the whole pipe's. Applying the operator with the targets
+    left out isolates ``W @ tin`` from the bias, which is the quantity that must not move ---
+    otherwise refining the memory would silently perturb conservative transport, the residence
+    times and the ``h -> 0`` reduction.
     """
-    shared = dict(
-        flow=diurnal_demand(heat_network, hourly_tedges),
-        tedges=hourly_tedges,
-        cout_tedges=hourly_tedges,
-        network=heat_network,
-        soil=soil,
-        surface_temperature=surface(hourly_tedges, amplitude=3.0),
-        surface_tedges=None,
-        nodes=None,
-        kappa_pipe=None,
-        film_coefficient=None,
-        spinup="constant",
-    )
-    whole = heat._build_system(**shared, theta_max=np.inf)
-    assert len(whole.length) == len(heat_network.segments), "theta_max=inf must keep every pipe whole"
+
+    def chained(k):
+        rows = {"from": [], "to": [], "length": [], "diameter": [], "volume": [], "cover": [], "depth": []}
+        index = []
+        for name, row in heat_network.segments.iterrows():
+            previous = row["from"]
+            for i in range(k):
+                nxt = row["to"] if i == k - 1 else f"{name}~{i}"
+                rows["from"].append(previous)
+                rows["to"].append(nxt)
+                rows["length"].append(row["length"] / k)
+                rows["volume"].append(row["volume"] / k)
+                rows["diameter"].append(row["diameter"])
+                rows["cover"].append(row["cover"])
+                rows["depth"].append(row["depth"])
+                index.append(f"{name}~p{i}")
+                previous = nxt
+        return PipeNetwork(segments=pd.DataFrame(rows, index=index), source="Plant")
+
+    def system(network):
+        return heat._build_system(
+            flow=diurnal_demand(heat_network, hourly_tedges),
+            tedges=hourly_tedges,
+            cout_tedges=hourly_tedges,
+            network=network,
+            soil=soil,
+            surface_temperature=surface(hourly_tedges, amplitude=3.0),
+            surface_tedges=None,
+            nodes=None,
+            kappa_pipe=None,
+            film_coefficient=None,
+            spinup="constant",
+        )
+
+    whole = system(heat_network)
+    assert len(whole.length) == len(heat_network.segments), "one flux history per pipe"
 
     tin = np.random.default_rng(7).normal(10.0, 2.0, whole.n_bins)
     reference = heat._apply(whole.reporting, tin)
     # The deviation is round-off in the composed displacement maps and grows with the record
     # (about 64 ulps of the cumulative volume over the per-bin node volume), so it is pinned
     # absolutely rather than bit-exactly; it measures ~2e-13 K on these ten days.
-    for theta_max in (1.0, 0.5, 0.25):
-        split = heat._build_system(**shared, theta_max=theta_max)
-        assert len(split.length) > len(whole.length), f"theta_max={theta_max} split nothing"
+    for k in (2, 3, 4):
+        split = system(chained(k))
+        assert len(split.length) == k * len(heat_network.segments)
         np.testing.assert_allclose(heat._apply(split.reporting, tin), reference, atol=1e-11)
         np.testing.assert_array_equal(split.reporting.valid_out, whole.reporting.valid_out)
         np.testing.assert_allclose(
             split.reporting.residence_time_out, whole.reporting.residence_time_out, rtol=1e-10, equal_nan=True
         )
-        # Stronger still: with one uniform target per pipe the bias telescopes across the
-        # split, so the *delivered temperature* of the one-way model is a no-op too -- not
-        # just the operator it is read off.
-        one_way = [
-            heat._apply(system.reporting, tin) + apply_segment_targets(system.reporting, heat._extended(system.t_inf))
-            for system in (whole, split)
-        ]
-        np.testing.assert_allclose(one_way[1], one_way[0], atol=1e-11)
-
-
-def test_sub_segmentation_converges_as_the_pieces_shrink(heat_pipe):
-    """Refining the split has to converge, not merely change the answer.
-
-    Collapsing the wall flux of a pipe onto one segment-average history makes every parcel
-    see one soil memory, and under diurnal forcing that is the model's largest error. The fix
-    counts only if the remaining gap shrinks as the pieces do, so the delivered temperature is
-    measured against the finest split available and the sequence must be monotone --- and the
-    unsplit answer must be far outside it, or there was nothing to fix.
-    """
-    volume = float(heat_pipe.segments.loc["Plant-T1", "volume"])
-    tedges = pd.date_range("2025-06-01", periods=20 * 24 + 1, freq="h")
-    n = len(tedges) - 1
-    shared = dict(
-        tin=10.0 + 6.0 * np.sin(2.0 * np.pi * np.arange(n) / 24.0),
-        flow=np.full((1, n), volume / (2.0 / 24.0)),
-        tedges=tedges,
-        cout_tedges=tedges,
-        network=heat_pipe,
-        soil=pd.DataFrame([GRASS], index=["grass"]),
-        surface_temperature=pd.DataFrame({"grass": np.full(n, 22.0)}),
-    )
-    # h tau = 0.445 here, so these ask for 1, 2, 4, 8 and 15 pieces.
-    finest = heat.source_to_endmember(**shared, theta_max=0.03)[0]
-    settled = np.arange(n) >= 7 * 24
-
-    gaps = []
-    for theta_max in (np.inf, 0.25, 0.125, 0.0625):
-        out = heat.source_to_endmember(**shared, theta_max=theta_max)[0]
-        both = settled & np.isfinite(out) & np.isfinite(finest)
-        gaps.append(float(np.max(np.abs(out[both] - finest[both]))))
-
-    assert gaps[0] > 0.2, f"nothing to fix in this configuration: {gaps}"
-    assert gaps[0] > gaps[1] > gaps[2] > gaps[3], f"refining the split did not converge: {gaps}"
-    assert gaps[3] < 0.1 * gaps[0], f"refining the split barely helped: {gaps}"
 
 
 def test_the_fixed_point_does_not_depend_on_how_long_the_record_runs(heat_pipe):
@@ -1396,47 +1374,6 @@ def test_the_fixed_point_does_not_depend_on_how_long_the_record_runs(heat_pipe):
     # And the halo really is still developing over those 90 days, so the agreement above is
     # not the trivial one of a signal that has already settled.
     assert abs(float(np.nanmean(longest[-24:]) - np.nanmean(short[-24:]))) > 0.1
-
-
-def test_the_split_does_not_depend_on_the_warm_start_padding(heat_pipe):
-    """How far a piece equilibrates is physics; the spin-up padding is bookkeeping.
-
-    ``n_sub`` follows from ``h_e tau_e`` at the segment's own flow, so it has to be a property
-    of the record the caller supplied. The warm start prepends bins holding the *first* flow
-    value, and a median taken over the padded record therefore reads a demand pattern the
-    caller never gave. The median is a knife-edge statistic on a two-shift demand -- half the
-    bins sit at each level, so the padded copies decide which side it lands on -- and three
-    padded bins are enough to move the count, and with it the answer, on a record of 144.
-    """
-    volume = float(heat_pipe.segments.loc["Plant-T1", "volume"])
-    tedges = pd.date_range("2025-06-01", periods=6 * 24 + 1, freq="h")
-    n = len(tedges) - 1
-    hours = np.arange(n) % 24
-    # A works branch drawing hard for twelve hours and idling at 40 % for the other twelve,
-    # with the record opening on the busy shift so the padding repeats the high flow.
-    duty = np.where(hours < 12, 1.0, 0.4)
-    shared = dict(
-        flow=(duty / duty.mean() * volume / (2.5 / 24.0))[None, :],
-        tedges=tedges,
-        cout_tedges=tedges,
-        network=heat_pipe,
-        soil=pd.DataFrame([GRASS], index=["grass"]),
-        surface_temperature=pd.DataFrame({"grass": np.full(n, 22.0)}),
-        surface_tedges=None,
-        nodes=None,
-        kappa_pipe=None,
-        film_coefficient=None,
-        theta_max=0.25,
-    )
-    padded = heat._build_system(**shared, spinup="constant")
-    bare = heat._build_system(**shared, spinup=None)
-
-    assert padded.n_pad > 0, "this configuration is meant to exercise the warm start"
-    assert len(bare.length) > 1, "nothing to pin if the pipe is not split at all"
-    assert len(padded.length) == len(bare.length), (
-        f"the warm start changed the split: {len(padded.length)} pieces with padding, "
-        f"{len(bare.length)} without, from {padded.n_pad} padded bins on a record of {n}"
-    )
 
 
 def test_halo_memory_converges_under_bin_refinement():
@@ -1484,39 +1421,10 @@ def _reverse_case(network, tedges, demand, soil, surface_frame, *, nodes, tin, *
         # What these test is the deconvolution and its refusals, none of which the internal
         # split touches; carrying it here would multiply their cost to re-measure what
         # test_the_reverse_direction_survives_splitting_the_pipes already covers.
-        theta_max=np.inf,
     )
     measured = heat.source_to_endmember(tin=tin, **shared)
     recovered = heat.endmember_to_source(tout=measured, **shared, **kwargs)
     return measured, recovered
-
-
-def test_the_reverse_direction_survives_splitting_the_pipes(heat_pipe):
-    """The inverse works against the refined bias too, not only the unsplit one.
-
-    The reverse deconvolves against ``W``, which the split leaves alone, but it subtracts a
-    bias that the split does change --- and it does so inside an outer iteration. A split that
-    perturbed the bias rows the solve reads, or that reached the inner fixed point from a
-    warm start it no longer matched, would show up as a round trip that no longer closes.
-    """
-    tedges = pd.date_range("2025-06-01", periods=6 * 24 + 1, freq="h")
-    n = len(tedges) - 1
-    volume = float(heat_pipe.segments.loc["Plant-T1", "volume"])
-    shared = dict(
-        flow=np.full((1, n), volume / (2.0 / 24.0)),
-        tedges=tedges,
-        cout_tedges=tedges,
-        network=heat_pipe,
-        soil=pd.DataFrame([GRASS], index=["grass"]),
-        surface_temperature=pd.DataFrame({"grass": np.full(n, 19.0)}),
-    )
-    tin = 11.0 + 2.5 * np.sin(2.0 * np.pi * np.arange(n) / 24.0)
-    measured = heat.source_to_endmember(tin=tin, **shared)
-    recovered = heat.endmember_to_source(tout=measured, **shared)
-
-    inner = np.isfinite(recovered)
-    assert inner.sum() > 0.8 * n
-    np.testing.assert_allclose(recovered[inner], tin[inner], atol=1e-6)
 
 
 def test_the_reconstruction_reproduces_the_measurements_it_was_built_from(heat_pipe):
@@ -1544,7 +1452,6 @@ def test_the_reconstruction_reproduces_the_measurements_it_was_built_from(heat_p
         network=heat_pipe,
         soil=pd.DataFrame([GRASS], index=["grass"]),
         surface_temperature=pd.DataFrame({"grass": np.full(n, 20.0)}),
-        theta_max=np.inf,
     )
     tin = 10.0 + 2.5 * np.sin(2.0 * np.pi * np.arange(n) / 30.0)
     measured = heat.source_to_endmember(tin=tin, **shared)
@@ -1590,7 +1497,6 @@ def test_reverse_tolerates_a_measurement_outage(heat_network, short_tedges, diur
         network=heat_network,
         soil=soil,
         surface_temperature=surface(short_tedges, amplitude=4.0),
-        theta_max=np.inf,  # as in _reverse_case: the split is not what this exercises
     )
     measured = heat.source_to_endmember(tin=tin, **shared)
     gapped = measured.copy()
@@ -1669,12 +1575,11 @@ def test_non_convergence_raises_rather_than_returning_a_partial_answer(
 def test_a_year_of_hourly_data_converges_and_stays_physical(heat_network, soil, diurnal_demand):
     """Convergence does not degrade with the record length, and the answer stays bounded.
 
-    ``theta_max=inf`` here: what this test is about --- that the Picard iteration reaches its
-    fixed point and the convolution stays bounded over 8760 bins --- is a property of the
-    driver and the kernel, neither of which the split touches, and running it at the default
-    would spend several minutes to re-measure what
-    :func:`test_sub_segmentation_converges_as_the_pieces_shrink` and
-    :func:`test_the_fixed_point_does_not_depend_on_how_long_the_record_runs` already pin.
+    What this test is about --- that the Picard iteration reaches its fixed point and the
+    convolution stays bounded over 8760 bins --- is a property of the driver and the kernel,
+    and it complements
+    :func:`test_the_fixed_point_does_not_depend_on_how_long_the_record_runs`, which pins that
+    the answer for a bin does not move as the record grows around it.
     """
     tedges = pd.date_range("2025-01-01", "2026-01-01", freq="h")
     n = len(tedges) - 1
@@ -1687,7 +1592,6 @@ def test_a_year_of_hourly_data_converges_and_stays_physical(heat_network, soil, 
         network=heat_network,
         soil=soil,
         surface_temperature=pd.DataFrame({"grass": 12.0 + 10.0 * seasonal, "paved": 16.0 + 12.0 * seasonal}),
-        theta_max=np.inf,
     )
     finite = out[np.isfinite(out)]
     assert finite.size > 0.9 * out.size
