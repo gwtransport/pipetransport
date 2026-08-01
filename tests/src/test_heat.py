@@ -1351,6 +1351,47 @@ def test_the_fixed_point_does_not_depend_on_how_long_the_record_runs(heat_pipe):
     assert abs(float(np.nanmean(longest[-24:]) - np.nanmean(short[-24:]))) > 0.1
 
 
+def test_the_split_does_not_depend_on_the_warm_start_padding(heat_pipe):
+    """How far a piece equilibrates is physics; the spin-up padding is bookkeeping.
+
+    ``n_sub`` follows from ``h_e tau_e`` at the segment's own flow, so it has to be a property
+    of the record the caller supplied. The warm start prepends bins holding the *first* flow
+    value, and a median taken over the padded record therefore reads a demand pattern the
+    caller never gave. The median is a knife-edge statistic on a two-shift demand -- half the
+    bins sit at each level, so the padded copies decide which side it lands on -- and three
+    padded bins are enough to move the count, and with it the answer, on a record of 144.
+    """
+    volume = float(heat_pipe.segments.loc["Plant-T1", "volume"])
+    tedges = pd.date_range("2025-06-01", periods=6 * 24 + 1, freq="h")
+    n = len(tedges) - 1
+    hours = np.arange(n) % 24
+    # A works branch drawing hard for twelve hours and idling at 40 % for the other twelve,
+    # with the record opening on the busy shift so the padding repeats the high flow.
+    duty = np.where(hours < 12, 1.0, 0.4)
+    shared = dict(
+        flow=(duty / duty.mean() * volume / (2.5 / 24.0))[None, :],
+        tedges=tedges,
+        cout_tedges=tedges,
+        network=heat_pipe,
+        soil=pd.DataFrame([GRASS], index=["grass"]),
+        surface_temperature=pd.DataFrame({"grass": np.full(n, 22.0)}),
+        surface_tedges=None,
+        nodes=None,
+        kappa_pipe=None,
+        film_coefficient=None,
+        theta_max=0.25,
+    )
+    padded = heat._build_system(**shared, spinup="constant")
+    bare = heat._build_system(**shared, spinup=None)
+
+    assert padded.n_pad > 0, "this configuration is meant to exercise the warm start"
+    assert len(bare.length) > 1, "nothing to pin if the pipe is not split at all"
+    assert len(padded.length) == len(bare.length), (
+        f"the warm start changed the split: {len(padded.length)} pieces with padding, "
+        f"{len(bare.length)} without, from {padded.n_pad} padded bins on a record of {n}"
+    )
+
+
 def test_halo_memory_converges_under_bin_refinement():
     """The bin-averaged deficit convolution converges to the continuous Duhamel integral.
 
