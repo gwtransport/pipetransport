@@ -98,10 +98,19 @@ Validity
   still developing, so the target has to be pushed past the undisturbed soil to reproduce
   the faster early exchange -- measured excursions of several times the driving contrast in
   the bins after a sharp change in the wall flux. The delivered temperature is a weighted
-  average of ``tin`` and those targets, so it can leave the range of its own inputs: up to
-  about 20 % of the instantaneous plant-to-soil contrast for one to two transits after a
-  step, decaying over about two weeks, and 3-4 % once the pipe is split. ``max_sweeps=1``
-  is exactly inside that range.
+  average of ``tin`` and those targets, so it can leave the range of its own inputs, and
+  there is no general bound on by how much. A step in ``tin`` into a *continuously flowing*
+  pipe is the mild case and the one the figure usually quoted describes: 20 % of the
+  instantaneous plant-to-soil contrast, 1.9 transits after the step, back inside the range
+  after nine days, falling to 1-4 % once the pipe is split. **Intermittent demand is far
+  worse and does not decay.** A line idle 16 h a day delivers water 66 % of the contrast past
+  the soil, settling at a third of the contrast and recurring every duty cycle for as long as
+  the duty cycle lasts; at 20-22 h idle it reaches 81-85 %. Splitting does not rescue it --
+  on such a branch the criterion below usually declines to split at all, and where it does
+  split the excursion can *grow* (47 % unsplit against 75 % at the default ``theta_max`` on
+  one 12 h-idle line). Only ``max_sweeps=1`` is guaranteed inside the range of its inputs.
+  For wide pipes there is a further regime in which this becomes unusable rather than merely
+  large; see the bin-width note above.
 - Bins in which a segment has no throughflow contribute zero wall flux to the halo, so the
   soil around a stagnant branch is treated as undisturbed while the water in it goes on
   relaxing exactly. Overnight stagnation of a service line reaches ``h tau`` of order 2,
@@ -178,7 +187,7 @@ def _step_response_integral(
     u = z / (2.0 * root)
     gauss = np.exp(-np.square(u))
     with np.errstate(divide="ignore"):
-        tail = erfcx(u + root / rl) if rl > 0.0 else np.zeros_like(t)
+        tail = erfcx(u + root / rl)
     out[m] = (
         (t + ((z + rl) ** 2 + rl**2) / (2.0 * alpha)) * erfc(u)
         - (z + 2.0 * rl) / np.sqrt(np.pi * alpha) * np.sqrt(t) * gauss
@@ -290,7 +299,8 @@ def sol_air_temperature(
         Shortwave absorptivity of the surface [-], non-negative.
     eta : float
         Surface film coefficient ``h_s / (rho c_w)`` [m/day], positive: multiply
-        W/(m² K) by 0.0207.
+        W/(m² K) by 0.0207. ``inf`` is the prescribed-temperature surface, as elsewhere in
+        this module, and returns the air temperature unchanged.
     heat_loss : array-like, optional
         Longwave and latent flux leaving the surface, in the same normalized unit as
         ``solar_irradiance`` [K m/day], broadcast against it. Default 0.0, which models a
@@ -333,7 +343,12 @@ def sol_air_temperature(
     ... ).round(1)
     np.float64(26.7)
     """
-    _validate_positive(eta, name="eta")
+    # ``inf`` is the prescribed-temperature surface here too, as it is in soil_temperature and
+    # segment_heat_rate: an infinitely conductive film pins the surface to the air temperature,
+    # which is what dividing the absorbed flux by it gives. NaN still fails the comparison.
+    if not eta > 0.0:
+        msg = "eta must be positive (inf is a prescribed-temperature surface)"
+        raise ValueError(msg)
     if not absorptivity >= 0.0:
         msg = "absorptivity must be non-negative"
         raise ValueError(msg)
@@ -496,17 +511,24 @@ def segment_heat_rate(
         prescribed-temperature surface (no displacement).
     kappa_pipe : float or pandas.Series or None, optional
         Pipe wall conductivity over the water heat capacity [m²/day]. ``None`` (default)
-        omits the wall term (bare-pipe limit). PE ~0.008, PVC ~0.0035 m²/day; either adds
-        roughly 10 % to the soil resistance of a buried main.
+        omits the wall term -- the bare-pipe limit, which also reads the soil resistance from
+        ``r_i`` rather than ``r_o``. PE ~0.008, PVC ~0.0035 m²/day. At a fixed SDR the wall
+        resistance ``ln(SDR/(SDR - 2)) / (2 pi kappa_pipe)`` does not depend on the diameter
+        while ``R_soil`` falls with it, so the wall's share *grows* with the pipe rather than
+        shrinking: at ``kappa = 0.025`` and ``depth = 1`` it is 10-17 % of ``R_soil`` for PE
+        SDR17 and 18-30 % for PVC SDR21 across 100-400 mm, lowering the rate by 6-10 % and
+        13-20 % respectively. Both shares scale with ``kappa / kappa_pipe``, so rescale them
+        for your own soil; PVC is never the ~10 % that PE is.
     film_coefficient : float or pandas.Series or None, optional
         Water-side film coefficient ``h_film / (rho c_w)`` [m/day]. ``None`` (default)
         assumes the film is not limiting. Like the mass transfer coefficient of
         :func:`pipetransport.logremoval.segment_decay_rate` it depends on velocity, so pass
         a value representative of the operating range. It is negligible for turbulent trunk
         mains (well under 1 %) but not at the low night-time flows of a service line: fully
-        developed laminar flow (``Nu = 3.66``, ``h_film = 3.66 k_water / D``) gives
-        ``film_coefficient = 0.454 m/day`` in a 100 mm pipe, about 29 % of its soil
-        resistance.
+        developed laminar flow (``Nu = 3.66``, ``h_film = 3.66 k_water / D``, taking
+        ``k_water = 0.6 W/(m K)``) gives ``film_coefficient = 0.454 m/day`` in a 100 mm pipe,
+        about 29 % of its soil resistance at ``kappa = 0.025`` and ``depth = 1`` -- 24 % at
+        ``kappa = 0.02``, 35 % at ``kappa = 0.03``.
 
     Returns
     -------
@@ -1060,12 +1082,31 @@ def source_to_endmember(
         Water-side film coefficient [m/day]; see :func:`segment_heat_rate`. Default None
         (film not limiting).
     theta_max : float, optional
-        Cap on how far one internal piece of a pipe may equilibrate with its wall,
-        ``h_e tau_e``, before the pipe is carried as several pieces with independent
-        wall-flux histories: ``n_sub = ceil(h_e tau_e / theta_max)``, at most 16. Splitting
-        leaves the transport operator, the travel times and the ``h -> 0`` reduction
-        untouched to round-off and refines the soil memory only; under diurnal forcing it is
-        worth about a kelvin on a service line. Default 0.25. ``inf`` keeps every pipe whole.
+        Cap on how far one internal piece of a pipe may equilibrate with its wall before the
+        pipe is carried as several pieces with independent wall-flux histories:
+        ``n_sub = ceil(h_e tau_e / theta_max)``, at most 16. Splitting leaves the transport
+        operator, the travel times and the ``h -> 0`` reduction untouched to round-off and
+        refines the soil memory only; under diurnal forcing it is worth about a kelvin on a
+        service line. Default 0.25. ``inf`` keeps every pipe whole.
+
+        ``tau_e`` here is the whole pipe's transit at its **median** throughflow over your
+        record, not the transit of one piece and not the transit while the pipe is running.
+        Two consequences follow, and both bite on exactly the intermittent branches the split
+        exists for. A segment with no throughflow in more than half the bins has a median of
+        zero, so the criterion declines to split it *at any* ``theta_max``: the answer is then
+        bit-identical to ``inf``. And because a median is a step function of the duty cycle,
+        the count can jump the wrong way across that boundary -- on one 2 km service line the
+        correction the split is worth switches between 0 K and about 4 K on one hour a day of
+        demand. Declare such a branch as an explicit chain of shorter segments if you need it
+        resolved; but check convergence when you do, because refining an intermittently
+        stagnant branch does not reliably converge to a better answer and can leave the
+        delivered temperature far outside the range of its inputs.
+
+        The 16-piece cap engages once ``h_e tau_e`` exceeds ``16 * theta_max`` -- above 4 at
+        the default, which a bare 100 mm line reaches at roughly an 18 h transit. It costs
+        almost nothing where it engages: beyond 16 pieces the water already leaves each piece
+        at its wall temperature, and 16 against 32 pieces differ by under 1e-3 K, four orders
+        below what the split itself buys.
 
         Both the build and every coupled sweep grow with the square of the path depth, and
         the depth is the sum of the splits along it, so one thin branch sets the price for

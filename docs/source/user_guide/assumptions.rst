@@ -372,7 +372,16 @@ How far along a pipe the wall flux is resolved
 
 **Assumption.** The wall flux is uniform along each internal piece of a pipe, and each piece keeps
 its own soil memory. The number of pieces follows from ``theta_max``:
-``n_sub = ceil(h_e tau_e / theta_max)``, capped at 16.
+``n_sub = ceil(h_e tau_e / theta_max)``, capped at 16, with ``tau_e`` the pipe's transit at its
+**median** throughflow over your record.
+
+**The median is why an intermittent branch may not be split at all.** A segment with no throughflow
+in more than half the bins has a median of zero, and the criterion then returns one piece whatever
+``theta_max`` says --- the result is bit-identical to ``theta_max=inf``. Because a median is a step
+function of the duty cycle, the count can also jump the wrong way across that boundary: on one 2 km
+service line the correction the split is worth switches between 0 K and about 4 K on one hour a day
+of demand. This is the case the split matters most for, and the case the criterion is worst at
+detecting.
 
 **Why it matters.** Because the soil columns are independent, the flux is a *local* quantity, and it
 falls along a pipe like :math:`e^{-h_e \tau}` --- by a factor 1.6 over a 2 h transit on a 100 mm
@@ -425,14 +434,27 @@ plus transient deficit*, not an artefact.
 
 **What breaks if it is violated.** Nothing internally, but it breaks an expectation: because the
 delivered temperature is a genuine weighted average of the produced water and those targets, **it can
-fall outside the range of its own inputs**. Measured worst case: about 20 % of the instantaneous
-plant-to-soil contrast, one to two transits after a step in the produced temperature, decaying over
-roughly two weeks --- 4.7 K on a 100 mm line after a 24 K step. Splitting the pipe
-(:ref:`assumption-uniform-wall-flux`) cuts it to 3--4 % but does not remove it. The one-way model
-(``max_sweeps=1``) has a fixed target and is exactly inside the range.
+fall outside the range of its own inputs**, and there is no general bound on by how much.
 
-**What you can do.** Read a delivered temperature in the first transits after a step as carrying
-that overshoot, and compare against ``max_sweeps=1`` if you need a bound that cannot leave the hull.
+A step in the produced temperature into a *continuously flowing* pipe is the mild case: 20 % of the
+instantaneous plant-to-soil contrast --- 4.7 K on a 100 mm line after a 24 K step --- peaking 1.9
+transits after the step and back inside the range after about nine days. Splitting the pipe
+(:ref:`assumption-uniform-wall-flux`) cuts that to 1--4 % depending on ``theta_max``.
+
+Intermittent demand is the case to watch, and it is far worse. A 100 mm line idle 16 hours a day
+delivers water 66 % of the contrast past the soil, and it does not decay: it settles at about a third
+of the contrast and recurs once per duty cycle for as long as the duty cycle lasts. At 20--22 hours
+idle it reaches 81--85 %. Splitting does not rescue it, in two separate ways --- on a branch idle in
+more than half the bins the criterion declines to split at all, and where it does split the excursion
+can *grow* (measured 47 % unsplit against 75 % at the default ``theta_max`` on one 12 h-idle line).
+
+The one-way model (``max_sweeps=1``) has a fixed target and is the only variant guaranteed inside the
+range of its inputs.
+
+**What you can do.** Treat any delivered temperature outside the hull of your inputs as carrying this
+overshoot rather than as a physical prediction, and compare against ``max_sweeps=1`` when you need a
+bound that cannot leave the hull. Be most suspicious on branches with a strong duty cycle, where the
+effect is largest, persistent, and least helped by ``theta_max``.
 
 **How it is checked.** Not at runtime --- the invariant a runtime check would assert is false, and a
 guard that fires on correct physics is worse than none. Its *size* is pinned by a test.
