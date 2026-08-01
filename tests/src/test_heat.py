@@ -933,6 +933,53 @@ def test_one_way_model_is_the_first_iterate(heat_network, hourly_tedges, diurnal
     assert np.nanmax(np.abs(two_way - one_way)) > 0.1
 
 
+def test_each_segment_relaxes_toward_its_own_cover_and_depth(
+    heat_network, hourly_tedges, diurnal_demand, soil, surface
+):
+    """Every pipe must be given the soil field of *its* land cover at *its* burial depth.
+
+    ``_build_system`` fans the undisturbed field out over segments by matching on the
+    ``(cover, depth)`` pair and reading the matching surface column, and that plumbing is
+    invisible in the delivered temperature: a mix-up hands every pipe a wrong but perfectly
+    smooth soil field, so nothing downstream looks anomalous. The fixture network is built for
+    this check --- two covers against four distinct depths --- and the field is re-derived here
+    from each segment's own parameters, which is exact rather than merely close.
+    """
+    surface_temperature = surface(hourly_tedges, amplitude=4.0)
+    system = heat._build_system(
+        flow=diurnal_demand(heat_network, hourly_tedges),
+        tedges=hourly_tedges,
+        cout_tedges=hourly_tedges,
+        network=heat_network,
+        soil=soil,
+        surface_temperature=surface_temperature,
+        surface_tedges=None,
+        nodes=None,
+        kappa_pipe=None,
+        film_coefficient=None,
+        theta_max=np.inf,  # keep one t_inf row per user segment
+        spinup="constant",
+    )
+    # The field is built on the padded grid, which the spin-up prepends to the caller's.
+    width = hourly_tedges[1] - hourly_tedges[0]
+    padded = (hourly_tedges[0] - pd.TimedeltaIndex(width * np.arange(system.n_pad, 0, -1))).append(hourly_tedges)
+
+    segments = heat_network.segments
+    assert len(set(zip(segments["cover"], segments["depth"], strict=True))) > 1, "fixture must mix covers and depths"
+    for row, name in enumerate(segments.index):
+        cover, depth = segments.loc[name, "cover"], float(segments.loc[name, "depth"])
+        expected = heat.soil_temperature(
+            surface_temperature=surface_temperature[cover].to_numpy(dtype=float),
+            tedges=padded,
+            depth=depth,
+            alpha=float(soil.loc[cover, "alpha"]),
+            kappa=float(soil.loc[cover, "kappa"]),
+            eta=float(soil.loc[cover, "eta"]),
+            surface_tedges=hourly_tedges,
+        )
+        np.testing.assert_array_equal(system.t_inf[row], expected, err_msg=f"segment {name} ({cover}, {depth} m)")
+
+
 def test_the_halo_stores_heat_and_gives_it_back(heat_pipe):
     """The memory reverses sign when the flux does, which is what makes it a memory.
 
