@@ -630,16 +630,31 @@ def paths_transfer(
         order = np.argsort(-path_depth, kind="stable")
         stage_rows = [order[: int(np.count_nonzero(path_depth > max(stage - 1, 0)))] for stage in range(max_depth + 1)]
         mean_down = [np.where(carrying[stage_rows[0]], cell_survive[stage_rows[0]], 0.0)]
+        # A segment's entry face is the exit face of the one before it, so the input bin of
+        # every face is read once per stage rather than once per depth per side. The row order
+        # is what makes the sharing free: stage l + 1 keeps a prefix of stage l's rows, so the
+        # narrower read is a slice of the wider one rather than a second gather.
+        faces = [
+            np.clip(
+                np.searchsorted(
+                    tedges_days,
+                    stage_arrival[stage].reshape(n_nodes, 2, n_cells)[stage_rows[stage]].mean(axis=1),
+                    side="right",
+                )
+                - 1,
+                0,
+                n_cin - 1,
+            ).astype(np.int32)
+            for stage in range(max_depth + 1)
+        ]
         mean_shift, bin_entry, bin_exit, gap, row_offset = [], [], [], [], []
         for depth in range(max_depth):
             rows = stage_rows[depth + 1]
             here = carrying[rows]
             phi_down = quarter_phi[rows] - stage_phi[depth + 1].reshape(n_nodes, 2, n_cells)[rows]
             mean_down.append(np.where(here, _surviving_fraction(*_cell_edges(phi_down)), 0.0))
-            entries = stage_arrival[depth].reshape(n_nodes, 2, n_cells)[rows]
             exits = stage_arrival[depth + 1].reshape(n_nodes, 2, n_cells)[rows]
-            entry_bin = np.clip(np.searchsorted(tedges_days, entries.mean(axis=1), side="right") - 1, 0, n_cin - 1)
-            exit_bin = np.clip(np.searchsorted(tedges_days, exits.mean(axis=1), side="right") - 1, 0, n_cin - 1)
+            entry_bin, exit_bin = faces[depth][: rows.size], faces[depth + 1][: rows.size]
             # The interior-edge factor, shifted by the exit bin's left edge so the exponent
             # stays non-negative (up to the operator's roundtrip rounding) however long the
             # record is.
@@ -647,8 +662,8 @@ def paths_transfer(
             shift = rate * (exits - tedges_days[exit_bin][:, None, :]) + phi_down
             mean_shift.append(np.where(here, _surviving_fraction(*_cell_edges(shift)), 0.0))
             gap.append(np.exp(-rate[:, 0] * float(dt_days[0]) * (exit_bin - entry_bin)))
-            bin_entry.append(entry_bin.astype(np.int32))
-            bin_exit.append(exit_bin.astype(np.int32))
+            bin_entry.append(entry_bin)
+            bin_exit.append(exit_bin)
             row_offset.append(paths_idx[rows, depth] * n_cin)
         target_terms = TargetTerms(
             mean_down=mean_down,
