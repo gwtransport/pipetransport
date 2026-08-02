@@ -330,6 +330,7 @@ def paths_transfer(
     node_flow: npt.NDArray[np.floating],
     paths_idx: npt.NDArray[np.intp],
     active: npt.NDArray[np.bool_],
+    bin_end_rate: npt.NDArray[np.floating] | None = None,
     with_target_terms: bool = False,
 ) -> NetworkTransfer:
     """Build the exact transfer operators and travel times of every source-to-node path.
@@ -358,6 +359,12 @@ def paths_transfer(
         Which slots of ``paths_idx`` are real path steps, shape ``(n_nodes, max_depth)``. A
         path occupies the leading slots of its row, so a node reporting at the source itself
         is a row of ``False``.
+    bin_end_rate : ndarray or None, optional
+        Per-row rate ``w`` [1/day] of an extra reading weight ``exp(-w (t_end - t))``, where
+        ``t`` is a parcel's arrival and ``t_end`` the right edge of the output bin it lands
+        in. The row then reads the exponentially weighted bin average of its input rather
+        than the plain one, which is what an enthalpy balance over a bin asks for. Length
+        ``n_nodes``; ``None`` (default) is a plain reading and adds exactly zero.
     with_target_terms : bool, optional
         Also build the target-independent factors of the affine relaxation bias (see
         :class:`TargetTerms`); requires uniform ``tedges_days`` spacing, which the scan of
@@ -480,7 +487,21 @@ def paths_transfer(
             stage_arrival.append(arrival[:, n_edge:])
             stage_phi.append(decay_exponent[:, n_edge:].copy())
     quarter_arrival = arrival[:, n_edge:].reshape(n_nodes, 2, -1)
-    quarter_phi = decay_exponent[:, n_edge:].reshape(n_nodes, 2, -1)
+    # Output-bin membership of every cell, read off the midpoint arrival. It is needed here,
+    # before any exponent factor, because ``bin_end_rate`` measures its weight from that bin's
+    # right edge; the refined grid carries the preimages of the output edges, so a cell lies
+    # inside a single output bin and both its quarter samples share that edge -- which is what
+    # keeps the weighted exponent affine across the cell, exactly as the plain one is. Cells
+    # arriving past the output range are dustbins that the slices below drop; clamping their
+    # lag at zero keeps every exponent non-negative rather than letting a long record
+    # overflow one.
+    arrival_mid = quarter_arrival.mean(axis=1)
+    cout_bin = np.searchsorted(cout_tedges_days, arrival_mid, side="right") - 1
+    bin_end = cout_tedges_days[np.clip(cout_bin, 0, n_cout - 1) + 1]
+    weight = np.zeros(n_nodes) if bin_end_rate is None else np.asarray(bin_end_rate, dtype=float)
+    quarter_phi = decay_exponent[:, n_edge:].reshape(n_nodes, 2, -1) + weight[:, None, None] * np.maximum(
+        bin_end[:, None, :] - quarter_arrival, 0.0
+    )
     cell_travel_time = (quarter_arrival - samples[:, n_edge:].reshape(n_nodes, 2, -1)).mean(axis=1)
     phi_lo, phi_hi = _cell_edges(quarter_phi)
     label = _interp_rows(arrival[:, :n_edge], tedges_days, node_cumulative)
@@ -524,11 +545,8 @@ def paths_transfer(
     valid_in = (broken == 0.0) & (in_volume > 0.0)
     residence_time_in = np.where(valid_in, in_travel / np.where(valid_in, in_volume, 1.0), np.nan)
 
-    # Output-bin membership is read off the arrival time of the cell midpoint; cells arriving
-    # before the output range, after it, or outside the record drain into the two dustbin
-    # slots wrapped around each node's real bins and are sliced away below.
-    arrival_mid = quarter_arrival.mean(axis=1)
-    cout_bin = np.searchsorted(cout_tedges_days, arrival_mid, side="right") - 1
+    # Cells arriving before the output range, after it, or outside the record drain into the
+    # two dustbin slots wrapped around each node's real bins and are sliced away below.
     flat_cout = (node_offset * (n_cout + 2) + cout_bin + 1).ravel()
     out_slots = n_nodes * (n_cout + 2)
 

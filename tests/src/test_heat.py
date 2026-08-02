@@ -718,6 +718,92 @@ def test_target_terms_leave_the_transport_operator_bit_identical(heat_network, h
     assert plain.target_terms is None
 
 
+@pytest.mark.parametrize("rate", [0.0, 0.5, 5.336, 40.0])
+def test_end_of_bin_weight_reduces_to_its_closed_form_without_travel(rate):
+    """A row that does not travel reads the exponentially weighted mean of its own input.
+
+    ``bin_end_rate`` weights a reading by ``exp(-w (t_end - t))``, which is what the enthalpy
+    balance over a bin asks of the water entering it. With an empty path the only thing left
+    is that weight, so the reading of a piecewise-constant series must be the closed-form
+    ``(1 - exp(-w dt)) / (w dt)`` times it -- the factor a root segment's inflow term carries.
+    At ``w = 0`` it is the plain bin average, bit for bit.
+    """
+    n_bins = 48
+    tedges = pd.date_range("2025-06-01", periods=n_bins + 1, freq="h")
+    days = tedges_to_days(tedges)
+    dt = float(days[1] - days[0])
+    values = 10.0 + np.random.default_rng(0).normal(0.0, 3.0, n_bins)
+    flow = np.full((1, n_bins), 500.0)
+
+    transfer = paths_transfer(
+        tedges_days=days,
+        cout_tedges_days=days,
+        segment_volume=np.array([100.0]),
+        segment_flow=flow,
+        segment_decay=np.array([0.0]),
+        node_flow=flow,
+        paths_idx=np.zeros((1, 0), dtype=np.intp),
+        active=np.zeros((1, 0), dtype=bool),
+        bin_end_rate=np.array([rate]),
+    )
+    columns = np.clip(transfer.col_start[..., None] + np.arange(transfer.band_vals.shape[-1]), 0, n_bins - 1)
+    read = np.einsum("nkb,nkb->nk", transfer.band_vals, values[columns])[0]
+
+    factor = (1.0 - np.exp(-rate * dt)) / (rate * dt) if rate else 1.0
+    np.testing.assert_allclose(read, factor * values, rtol=0.0, atol=1e-13)
+    if not rate:
+        assert np.array_equal(read, values), "an unweighted reading must be the plain bin average"
+
+
+@pytest.mark.parametrize("rate", [0.0, 1.0, 5.336])
+def test_end_of_bin_weight_matches_the_brute_force_oracle_on_a_travelling_path(rate):
+    """The weighted reading is as exact as the plain one, parcel by parcel.
+
+    The oracle integrates the same weight against delivery time with adaptive quadrature and
+    shares no arithmetic with the operator. Both flows vary and the split is non-proportional,
+    so the arrival map has kinks the cell grid has to resolve; agreement therefore pins the
+    end-of-bin weight itself rather than a coincidence of a constant-flow case.
+    """
+    n_bins = 60
+    tedges = pd.date_range("2025-06-01", periods=n_bins + 1, freq="h")
+    days = tedges_to_days(tedges)
+    hours = np.arange(n_bins)
+    cin = 10.0 + np.random.default_rng(7).normal(0.0, 2.0, n_bins)
+    downstream = 600.0 + 200.0 * np.sin(2.0 * np.pi * hours / 24.0)
+    segment_flow = np.vstack([downstream + 250.0 + 100.0 * np.cos(2.0 * np.pi * hours / 17.0), downstream])
+    volume, decay = np.array([120.0, 45.0]), np.array([0.35, 0.6])
+
+    transfer = paths_transfer(
+        tedges_days=days,
+        cout_tedges_days=days,
+        segment_volume=volume,
+        segment_flow=segment_flow,
+        segment_decay=decay,
+        node_flow=downstream[None, :],
+        paths_idx=np.array([[0, 1]], dtype=np.intp),
+        active=np.ones((1, 2), dtype=bool),
+        bin_end_rate=np.array([rate]),
+    )
+    columns = np.clip(transfer.col_start[..., None] + np.arange(transfer.band_vals.shape[-1]), 0, n_bins - 1)
+    read = np.where(transfer.valid_out[0], np.einsum("nkb,nkb->nk", transfer.band_vals, cin[columns])[0], np.nan)
+
+    reference = OraclePath(
+        tedges_days=days,
+        segment_flow=segment_flow,
+        segment_volume=volume,
+        segment_decay=decay,
+        node_flow=downstream,
+    ).cout(cin=cin, cout_tedges_days=days, bin_end_rate=rate)
+
+    assert np.array_equal(np.isnan(read), np.isnan(reference))
+    covered = np.isfinite(read)
+    assert covered.sum() > 40, "the comparison must cover most of the record"
+    # The oracle's own quadrature floor: it integrates with scipy.integrate.quad at its
+    # default epsabs = 1.49e-8 per sub-interval, and the unweighted reading sits at the same
+    # 7e-8 -- so the weighted reading is exact to the precision of the reference, not less.
+    np.testing.assert_allclose(read[covered], reference[covered], rtol=0.0, atol=3e-7)
+
+
 def test_bias_weights_are_non_negative_and_complete_the_row_sum(heat_network, short_tedges, diurnal_demand):
     """Every target bin enters with a non-negative weight, and the weights close the budget.
 
