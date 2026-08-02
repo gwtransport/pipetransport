@@ -148,6 +148,7 @@ See the ./LICENSE file or go to https://github.com/gwtransport/pipetransport/blo
 
 from __future__ import annotations
 
+import warnings
 from typing import NamedTuple
 
 import numpy as np
@@ -167,10 +168,16 @@ from pipetransport.utils import solve_inverse_transport_banded, tedges_to_days
 # has settled, so the answer is the same to well under ``atol``; at 1e-2 the reverse direction
 # spends about a third of the inner sweeps that a fully resolved inner solve does.
 _INNER_FORCING = 1e-2
-# Anderson window on the reverse outer iterate. Five is the shallowest depth that captured
-# the whole win in measurement; deeper windows buy a few per cent of the sweep count and
-# cost a larger least-squares solve on every outer step.
-_ANDERSON_DEPTH = 5
+# Anderson window on the reverse outer iterate. Truncated Anderson is truncated GMRES, so
+# the window is not a tuning knob with a free choice: too short a memory drops the directions
+# the iteration needs and it stalls. A depth of five raises on a 400 mm main at a half-hour
+# transit, which ten reconstructs to 1e-9. It buys range, not a guarantee: a pipe past the
+# coupling the divergence test names is out of reach at any depth.
+_ANDERSON_DEPTH = 10
+# Consecutive growing outer residuals that mark divergence rather than a slow start.
+_DIVERGENCE_STEPS = 5
+# Consecutive growing outer residuals that mark divergence rather than a slow start.
+_DIVERGENCE_STEPS = 5
 
 
 def _step_response_integral(
@@ -756,6 +763,10 @@ class _HeatSystem(NamedTuple):
     volume: npt.NDArray[np.floating]
     rho: npt.NDArray[np.floating]
     parent: npt.NDArray[np.intp]
+    held_slope: npt.NDArray[np.floating]
+    held_offset: npt.NDArray[np.floating]
+    h_tau: npt.NDArray[np.floating]
+    segment_names: tuple[str, ...]
     internal: NetworkTransfer
     reporting: NetworkTransfer
 
@@ -978,6 +989,33 @@ def _build_system(
 
     rho = np.exp(-rate * dt_days)
     length = segments["length"].to_numpy(dtype=float)
+    running = np.where(seg_flow > 0.0, seg_flow, np.nan)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # a segment that never flows is all-NaN
+        running = np.nanmedian(running, axis=1)
+
+    # What the pipes are holding when the record opens. The warm start fills them with water
+    # produced at ``tin[0]`` under the leading flow, held long enough to have settled, so each
+    # pipe's content is the steady profile ``T(s) = T_inf + (T_entry - T_inf) exp(-h s)`` and
+    # its excess over the undisturbed field integrates to ``Q (T_entry - T_inf)(1 - e^-h tau)/h``.
+    # The enthalpy budget has to start there, because the readings on the other side of the
+    # same balance describe exactly that water: starting from an equilibrated pipe instead
+    # differences two different pipes and books a first flux wrong by its own size. Both
+    # directions know ``tin[0]``, so the content is carried as its affine coefficients and the
+    # sweep evaluates them against whatever series it is reconstructing.
+    parent = np.array([up[-1] if up.size else -1 for up in entry_chains], dtype=np.intp)
+    with np.errstate(divide="ignore"):
+        # A pipe the record opens idle has an infinite transit, so it holds water that has
+        # already settled onto the soil and carries no excess: exp(-inf) is the right zero.
+        settled = np.exp(-rate * volume / seg_flow[:, 0])
+    entry_slope, entry_offset = np.ones(n_seg), np.zeros(n_seg)
+    # One pass from the source outward; the loop is over path depth, which is what orders it.
+    for e in sorted(range(n_seg), key=lambda seg: entry_chains[seg].size):
+        upstream = parent[e]
+        if upstream >= 0:
+            entry_slope[e] = entry_slope[upstream] * settled[upstream]
+            entry_offset[e] = t_inf[upstream, 0] + (entry_offset[upstream] - t_inf[upstream, 0]) * settled[upstream]
+    held = seg_flow[:, 0] * (1.0 - settled) / rate
     return _HeatSystem(
         nodes=requested,
         n_pad=n_pad,
@@ -990,7 +1028,13 @@ def _build_system(
         length=length,
         volume=volume,
         rho=rho,
-        parent=np.array([up[-1] if up.size else -1 for up in entry_chains], dtype=np.intp),
+        parent=parent,
+        held_slope=held * entry_slope,
+        held_offset=held * (entry_offset - t_inf[:, 0]),
+        # How far a pipe equilibrates over one transit. It is what decides whether the
+        # reverse coupling is invertible at all, so the diagnostics quote it.
+        h_tau=rate * volume / np.where(running > 0.0, running, np.nan),
+        segment_names=tuple(str(name) for name in segments.index),
         internal=build(
             int_paths, int_active, np.vstack([seg_flow] * 3), tedges_days, np.concatenate([np.zeros(n_seg), rate, rate])
         ),
@@ -1005,6 +1049,7 @@ def _converge_targets(
     max_sweeps: int,
     atol: float,
     initial: npt.NDArray[np.floating] | None = None,
+    fabricated: npt.NDArray[np.bool_] | None = None,
 ) -> npt.NDArray[np.floating]:
     """Iterate the relaxation targets to their fixed point for one source series.
 
@@ -1050,13 +1095,45 @@ def _converge_targets(
     # follows the iterate.
     transported = _apply(system.internal, tin_padded)
     for _ in range(max_sweeps - 1):
-        updated = _update_targets(system, _internal_pass(system, transported, targets), targets, tin_padded)
+        updated = _update_targets(system, _internal_pass(system, transported, targets), targets, tin_padded, fabricated)
         increment = float(np.max(np.abs(updated - targets)))
         targets = updated
         if increment <= atol:
             return targets
     msg = f"the two-way fixed point did not converge within max_sweeps={max_sweeps}; raise max_sweeps or atol"
     raise RuntimeError(msg)
+
+
+def _diverged_message(system: _HeatSystem, previous: float, increment: float, exhausted: int | None = None) -> str:
+    """Explain a reverse iteration that will not reach its fixed point.
+
+    Parameters
+    ----------
+    system : _HeatSystem
+        Prebuilt system, read for the segment that couples most strongly.
+    previous, increment : float
+        The last two outer residuals.
+    exhausted : int or None, optional
+        The sweep budget, when the loop ran out rather than being cut short by the
+        divergence test. Default None.
+
+    Returns
+    -------
+    str
+        Message naming the regime, the segment driving it, and the variant that works.
+    """
+    worst = int(np.nanargmax(system.h_tau)) if np.isfinite(system.h_tau).any() else 0
+    coupling = float(system.h_tau[worst])
+    ran_out = f" within max_sweeps={exhausted}" if exhausted is not None else ""
+    return (
+        f"the reverse two-way fixed point did not converge{ran_out}: the outer residual went "
+        f"{previous:.3e} -> {increment:.3e}. The strongest coupling is segment "
+        f"{system.segment_names[worst]!r} at h*tau = {coupling:.2f}, and past about 0.7 the "
+        f"reverse problem is ill-conditioned rather than merely slow -- water that equilibrates "
+        f"over its transit carries little of the produced temperature to the endmember, so no "
+        f"cap, tolerance or regularization recovers it. Use max_sweeps=1 for the one-way "
+        f"reverse, which stays well-posed, or shorten the segment."
+    )
 
 
 def _internal_pass(
@@ -1091,6 +1168,7 @@ def _update_targets(
     t_int: npt.NDArray[np.floating],
     targets: npt.NDArray[np.floating],
     tin_padded: npt.NDArray[np.floating],
+    fabricated: npt.NDArray[np.bool_] | None = None,
 ) -> npt.NDArray[np.floating]:
     """One flux-and-halo pass: internal temperatures -> new per-segment targets.
 
@@ -1111,13 +1189,19 @@ def _update_targets(
     exactly: nothing is booked that the water did not carry.
 
     Stagnation needs no special case -- ``Q = 0`` drops the advective terms and the pipe still
-    leaks ``-h (H - V Tb)`` into the halo. Bins without a defined budget (spin-up edge, no
-    throughflow, a reading the record does not constrain) contribute zero flux: the
-    undisturbed-soil assumption applied at bin resolution.
+    leaks ``-h (H - V Tb)`` into the halo, which is the whole point: a bin with no throughflow
+    books its storage term like any other. What contributes zero flux is the spin-up prefix,
+    and a bin whose readings the record does not constrain -- the undisturbed-soil assumption
+    applied at bin resolution.
 
     A bin's own target moves that bin's storage term and the lag-0 deficit brings it straight
     back, so the sweep has a same-bin gain of about ``Dbar[0] V (1 - rho) / (L dt)``, which is
     strictly below one because ``Dbar[0] < R_total`` and ``(1 - exp(-h dt)) / (h dt) < 1``.
+    The target also moves that bin's own readings -- a parcel relaxes toward it for the part
+    of the bin it spends in the pipe -- which adds ``Dbar[0] Q dt (a - b) / (L dt)`` with
+    ``a``, ``b`` the sensitivities of the plain and weighted delivery readings. That term is
+    smaller than the first by of order ``h dt / 2`` and is what the measured gains below
+    include; it is the reason they are quoted as measured rather than derived.
     Every other path through the map is strictly causal in time and runs strictly from
     upstream to downstream within a bin, so the iteration matrix is block lower triangular and
     its eigenvalues *are* those same-bin gains: the sweep contracts for every geometry and
@@ -1136,6 +1220,9 @@ def _update_targets(
         Targets the readings were taken at; the same-bin solve needs them.
     tin_padded : ndarray
         Source temperature on the padded input grid, the inflow of every root segment.
+    fabricated : ndarray of bool or None, optional
+        Bins whose flux is to be suppressed, treated exactly like a bin the record does not
+        constrain. ``None`` (default) suppresses nothing.
 
     Returns
     -------
@@ -1156,6 +1243,7 @@ def _update_targets(
     # constrains, and does not have to.
     usable = np.zeros_like(t_out, dtype=bool)
     usable[:, system.n_pad :] = True
+    usable &= ~(np.zeros_like(usable) if fabricated is None else fabricated)
     flowing = usable & (system.seg_flow > 0.0)
     for reading in (t_in, t_out, d_in, d_out):
         flowing &= np.isfinite(reading)
@@ -1163,6 +1251,12 @@ def _update_targets(
     advected = np.where(flowing, carried * (t_in - t_out), 0.0)
     storage = system.volume[:, None] * (1.0 - system.rho)[:, None] * (targets - system.t_inf[:, :1])
     forcing = np.where(flowing, carried * (d_in - d_out), 0.0) + np.where(usable, storage, 0.0)
+
+    # The record opens with the pipes holding the warm start's own water; see _build_system.
+    # With no warm start there is no prior state to carry, and the leading bins are
+    # unconstrained anyway, so the slice is simply absent.
+    if system.n_pad:
+        forcing[:, system.n_pad - 1] += system.held_slope * tin_padded[0] + system.held_offset
 
     content = np.zeros_like(forcing)
     for e in range(n_seg):
@@ -1199,7 +1293,7 @@ def source_to_endmember(
     crosses, at that pipe's exchange rate. The relaxation target is the undisturbed soil
     temperature at pipe depth (from the land-cover surface forcing) shifted by the halo the
     network's own heat flux has built up -- a fixed point that is found by iterating a
-    transport pass, a delivered-water flux pass and one convolution per segment.
+    transport pass, an enthalpy-budget flux pass and one convolution per segment.
     ``max_sweeps=1`` skips the coupling entirely and is exactly the classical one-way
     model (steady buried-pipe resistance, undisturbed soil).
 
@@ -1369,6 +1463,7 @@ def endmember_to_source(
     max_sweeps: int = 5000,
     atol: float = 1e-9,
     regularization_strength: float = 1e-10,
+    gap_atol: float = 1e-3,
     spinup: str | None = "constant",
 ) -> npt.NDArray[np.floating]:
     """Reconstruct the produced water temperature from temperatures measured at endmembers.
@@ -1390,12 +1485,18 @@ def endmember_to_source(
     regularization_strength : float, optional
         Tikhonov parameter of each banded solve; see
         :func:`pipetransport.utils.solve_inverse_transport_banded`. Default 1e-10.
+    gap_atol : float, optional
+        How far [K] the reconstruction may move when the flux invented over a measurement
+        gap is removed before the bin is reported as unconstrained. Default 1e-3, three
+        orders below any temperature measurement and six above the no-gap round-trip floor.
 
     Returns
     -------
     numpy.ndarray
         Reconstructed production temperature on ``tedges``, length ``len(tedges) - 1``.
-        NaN for bins no measurement constrains.
+        NaN for bins no measurement constrains, and for bins whose reconstruction moves by
+        more than ``gap_atol`` when the flux invented over such a gap is removed -- so every
+        value returned is one the record supports to that tolerance.
 
     Raises
     ------
@@ -1403,8 +1504,11 @@ def endmember_to_source(
         As :func:`source_to_endmember`, plus a shape or naming mismatch of ``tout`` and a
         non-positive ``regularization_strength``.
     RuntimeError
-        If the fixed point has not converged within ``max_sweeps``. Losing every endmember
-        over a window makes the coupled inverse ill-posed, and this is how it shows.
+        If the fixed point diverges or has not converged within ``max_sweeps``. Past a
+        ``h*tau`` of about 0.7 -- a pipe that equilibrates appreciably over its transit --
+        the coupled inverse is ill-conditioned rather than slow, and this is how it shows;
+        the message names the segment responsible. ``max_sweeps=1`` is the one-way reverse,
+        which stays well-posed.
 
     See Also
     --------
@@ -1414,21 +1518,28 @@ def endmember_to_source(
     -----
     The halo is brought to its own fixed point inside every outer step, so the cost is a
     product of two iterations rather than a sum. The outer step extrapolates over its last few
-    iterates rather than simply repeating, which is what lets it converge on pipes that
-    equilibrate appreciably over their transit; plain repetition diverges there.
+    iterates rather than simply repeating, which reaches pipes plain repetition cannot -- but
+    only so far: the extrapolation is truncated, and past a coupling of roughly
+    ``h*tau = 0.7`` nothing reaches the fixed point, which is what the RuntimeError reports.
 
     The reconstruction leans on a fabricated production series over the bins no measurement
-    constrains, and the halo memory carries that forward: a measurement gap perturbs the
-    answer after it as well as inside it.
+    constrains, and the coupling carries that invention into bins the record *does* constrain
+    -- after the gap through the halo memory, and before it because the deconvolution couples
+    the whole record. Measured on a single 100 mm pipe with a 72 h outage, that was worth
+    0.44 K after the gap and 0.46 K before it, on bins reported as constrained. The answer is
+    therefore re-solved once with the invented flux suppressed; because the model is affine
+    that difference is the exact imprint of the invention, and the bins it moves by more than
+    ``gap_atol`` come back NaN. The one-way reverse needs none of this and is exactly local:
+    with a fixed target, the same outage changes nothing outside itself.
 
-    **The record's own end is unconstrained too, and further in than its NaN bins suggest.**
-    Most of the heat the last bins exchange with the soil arrives after the record stops, so
-    no measurement in it pins them; the solve falls back on the regularization target and the
-    error grows geometrically into the final bins -- the lead-*out* counterpart of the lead-in
-    transient the forward direction has. On the example network at hourly bins it is under
-    1e-5 K about sixty bins from the end, 1e-3 K at forty and of order a kelvin in the last
-    dozen before the bins that come back NaN. Discard the tail, or end the record after the
-    period you care about.
+    **The record's own end is unconstrained too, and further in than transport coverage
+    alone suggests.** Most of the heat the last bins exchange with the soil arrives after the
+    record stops, so no measurement in it pins them -- the lead-*out* counterpart of the
+    lead-in transient the forward direction has. They lean on flux the model invents past the
+    end of the record, so the same re-solve catches them and they come back NaN: on the
+    example network at hourly bins that is the last 36 bins of a 240-bin record, and every
+    bin still answered is within 7e-4 K. End the record after the period you care about, and
+    the answers you get are ones the record supports.
 
     Examples
     --------
@@ -1538,37 +1649,87 @@ def endmember_to_source(
     # The outer map is affine, so plain repetition converges only where its own spectral
     # radius happens to be under one -- and a pipe that equilibrates appreciably over its
     # transit puts it over. Extrapolating over the last few iterates instead (Anderson, which
-    # on an affine map is a Krylov method) converges whenever the fixed point is unique at
-    # all, which is what a linear reconstruction problem is entitled to. The residual is
+    # on an affine map is a Krylov method) reaches configurations plain repetition cannot,
+    # though with a truncated window it carries no guarantee: past a coupling of roughly
+    # h*tau = 0.7 it stops reaching them and the divergence test below is what answers. The
+    # residual is
     # measured on the bins the operator covers; that set is a property of the operator, not of
     # the iterate, so it is fixed once and asserted to stay fixed.
-    recovered = solve(system.reporting, system.t_inf)
-    covered = np.isfinite(recovered)
-    converged = max_sweeps == 1
-    targets = system.t_inf
-    increment = np.inf
-    history: list[tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]] = []
-    for _ in range(max_sweeps - 1):
-        inner_atol = max(atol, _INNER_FORCING * increment)
-        targets = _converge_targets(system, filled(recovered), max_sweeps=max_sweeps, atol=inner_atol, initial=targets)
-        mapped = solve(system.reporting, targets)
-        if not np.array_equal(np.isfinite(mapped), covered):
-            msg = "the reverse iterate changed which output bins the record covers; this is a bug, please report it"
-            raise RuntimeError(msg)
-        residual = mapped[covered] - recovered[covered]
-        increment = float(np.max(np.abs(residual), initial=0.0))
-        if increment <= atol:
-            converged = True
-            break
-        history.append((recovered[covered], residual))
-        del history[: -(_ANDERSON_DEPTH + 1)]
-        recovered = mapped
-        if len(history) > 1:
-            past = np.column_stack([r for _, r in history])
-            steps = np.column_stack([x for x, _ in history])
-            gamma = np.linalg.lstsq(np.diff(past, axis=1), residual, rcond=None)[0]
-            recovered[covered] -= (np.diff(steps, axis=1) + np.diff(past, axis=1)) @ gamma
-    if not converged:
-        msg = f"the reverse fixed point did not converge within max_sweeps={max_sweeps}; raise max_sweeps or atol"
-        raise RuntimeError(msg)
+    first = solve(system.reporting, system.t_inf)
+    covered = np.isfinite(first)
+
+    def converge(fabricated: npt.NDArray[np.bool_] | None) -> npt.NDArray[np.floating]:
+        """Drive the outer iteration to its fixed point, optionally suppressing some flux.
+
+        Parameters
+        ----------
+        fabricated : ndarray of bool or None
+            Per-segment, per-bin flux to suppress; see :func:`_update_targets`.
+
+        Returns
+        -------
+        ndarray
+            Reconstructed production series on the padded grid.
+
+        Raises
+        ------
+        RuntimeError
+            If the iteration diverges or exhausts ``max_sweeps``.
+        """
+        recovered, targets = first, system.t_inf
+        increment, previous, best, growing = np.inf, np.inf, np.inf, 0
+        history: list[tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]] = []
+        for _ in range(max_sweeps - 1):
+            inner_atol = max(atol, _INNER_FORCING * increment)
+            targets = _converge_targets(
+                system,
+                filled(recovered),
+                max_sweeps=max_sweeps,
+                atol=inner_atol,
+                initial=targets,
+                fabricated=fabricated,
+            )
+            mapped = solve(system.reporting, targets)
+            if not np.array_equal(np.isfinite(mapped), covered):
+                msg = "the reverse iterate changed which output bins the record covers; this is a bug, please report it"
+                raise RuntimeError(msg)
+            residual = mapped[covered] - recovered[covered]
+            previous, increment = increment, float(np.max(np.abs(residual), initial=0.0))
+            if increment <= atol:
+                return recovered
+            # A residual that keeps growing is not a slow iteration, it is the wrong regime,
+            # and no cap or tolerance reaches the answer from there. Catch it while the
+            # numbers are still finite: left alone the iterate overflows and the banded solve
+            # raises about infs, which says nothing about the cause.
+            growing = growing + 1 if increment > previous else 0
+            best = min(best, increment)
+            if growing >= _DIVERGENCE_STEPS and increment > 100.0 * best:
+                raise RuntimeError(_diverged_message(system, previous, increment))
+            history.append((recovered[covered], residual))
+            del history[: -(_ANDERSON_DEPTH + 1)]
+            recovered = mapped
+            if len(history) > 1:
+                past = np.column_stack([r for _, r in history])
+                steps = np.column_stack([x for x, _ in history])
+                gamma = np.linalg.lstsq(np.diff(past, axis=1), residual, rcond=None)[0]
+                recovered[covered] -= (np.diff(steps, axis=1) + np.diff(past, axis=1)) @ gamma
+        raise RuntimeError(_diverged_message(system, previous, increment, exhausted=max_sweeps))
+
+    if max_sweeps == 1:
+        return first[system.n_pad :]
+    recovered = converge(None)
+
+    # Bins no measurement constrains are filled in above so the flux pass has something to
+    # read, and the coupling carries that invention into bins the record does constrain --
+    # after the gap through the halo memory, and before it because the deconvolution couples
+    # the whole record. Neither reach can be read off the band support. The model is affine,
+    # so re-solving without the invented flux gives the exact imprint of it on the answer, and
+    # the bins it moves by more than ``gap_atol`` are the ones the record does not support.
+    # The one-way reverse needs none of this: with a fixed target it is exactly local.
+    if not covered.all():
+        reads_invented = _apply(system.internal, (~covered).astype(float)) > 0.0
+        n_seg = len(system.length)
+        honest = converge(reads_invented[:n_seg] | reads_invented[n_seg : 2 * n_seg] | reads_invented[2 * n_seg :])
+        with np.errstate(invalid="ignore"):
+            recovered = np.where(np.abs(honest - recovered) > gap_atol, np.nan, recovered)
     return recovered[system.n_pad :]

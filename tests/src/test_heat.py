@@ -2054,12 +2054,13 @@ def test_reverse_recovers_the_production_temperature(heat_network, hourly_tedges
 
     The record's own end is a different matter, and the reason this test needs a longer record
     than its neighbours. Most of the heat the last bins exchange with the soil arrives after
-    the record stops, so no measurement in it constrains them; the solve falls back on the
-    regularization target and the error grows geometrically into the final bins -- the
-    lead-*out* counterpart of the lead-in transient the forward direction has. It is a
-    property of the model rather than of the solver, so it is pinned here rather than tuned
-    away: bins the transport does not reach at all are already NaN, and the bins just inside
-    them are the ones a caller has to discard.
+    the record stops, so no measurement in it constrains them -- the lead-*out* counterpart of
+    the lead-in transient the forward direction has. Those bins are not returned as confident
+    numbers: they lean on the flux the model invents past the end of the record, so the same
+    re-solve that catches a measurement gap catches them, and they come back NaN.
+
+    What this pins is therefore the contract rather than a decay rate: every bin the model
+    still answers is accurate, and where it is not it says so.
     """
     n = len(hourly_tedges) - 1
     tin = 10.0 + 2.0 * np.sin(2.0 * np.pi * np.arange(n) / 72.0)
@@ -2076,13 +2077,16 @@ def test_reverse_recovers_the_production_temperature(heat_network, hourly_tedges
     interior = slice(36, -96)
     np.testing.assert_allclose(recovered[interior], tin[interior], atol=1e-8)
 
-    # The lead-out, measured: it decays by more than two decades over the 36 bins before the
-    # window above, so a caller who keeps too much of the tail is wrong gradually, not
-    # suddenly, and refining the record's end is what fixes it.
+    # The whole record, not just the interior: wherever the model answers at all it is within
+    # the tolerance it documents, and the lead-out is declined rather than guessed.
     error = np.abs(recovered - tin)
-    near, far = np.nanmax(error[-48:-24]), np.nanmax(error[-96:-72])
-    assert far < 0.01 * near, (far, near)
-    assert near > 1e-3, "the lead-out must still be visible, or this pins nothing"
+    assert np.nanmax(error[36:]) <= 1e-3, float(np.nanmax(error[36:]))
+    declined = ~np.isfinite(recovered)
+    assert declined[-12:].all(), "the last bins lean on flux invented past the record's end"
+    assert not declined[interior].any(), "declining the whole record would be vacuous"
+    # It is a contiguous tail, not a scatter of holes: the further from the end, the more the
+    # record constrains, so once the model starts answering it keeps answering.
+    assert np.all(np.diff(np.flatnonzero(declined)) == 1), "the declined bins must be one run"
 
 
 def test_reverse_tolerates_a_measurement_outage(heat_network, hourly_tedges, diurnal_demand, soil, surface):
@@ -2132,6 +2136,133 @@ def test_reverse_refuses_an_answer_it_cannot_stand_behind(heat_network, short_te
     blinded[:, 40:70] = np.nan
     with pytest.raises(RuntimeError, match="did not converge"):
         heat.endmember_to_source(tout=blinded, **shared, max_sweeps=40)
+
+
+def test_a_measurement_outage_does_not_corrupt_the_record_around_it():
+    """A sensor dropping out must not come back as a confident wrong answer elsewhere.
+
+    Over the outage nothing constrains the production, so the flux pass is handed an invented
+    series -- and the coupling carries that invention into bins the record *does* constrain:
+    forward through the halo memory, and backward because the deconvolution couples the whole
+    record. Both reaches were measured at 0.44 K and 0.46 K here, on bins reported as
+    constrained, against a no-gap round trip of 1.7e-10.
+
+    The discriminating comparison is against the one-way reverse, which has a fixed target
+    and is exactly local: the same outage changes nothing at all outside itself. Anything the
+    two-way direction reports outside the gap must therefore be a value the record supports,
+    which is what ``gap_atol`` defines and what this pins.
+    """
+    n = 24 * 14
+    tedges = pd.date_range("2025-06-01", periods=n + 1, freq="h")
+    segments = pd.DataFrame(
+        {"from": ["Plant"], "to": ["T1"], "length": [1000.0], "diameter": [0.1], "cover": ["grass"]},
+        index=["main"],
+    )
+    network = PipeNetwork(segments=segments, source="Plant")
+    volume = float(network.segments["volume"].iloc[0])
+    tin = 9.0 + 2.0 * np.sin(2.0 * np.pi * np.arange(n) / 24.0)
+    shared = dict(
+        flow=np.full((1, n), volume / (2.0 / 24.0)),
+        tedges=tedges,
+        cout_tedges=tedges,
+        network=network,
+        soil=pd.DataFrame([GRASS], index=["grass"]),
+        surface_temperature=pd.DataFrame({"grass": np.full(n, 20.0)}),
+    )
+    measured = heat.source_to_endmember(tin=tin, **shared)
+    gap = slice(96, 168)
+    gapped = measured.copy()
+    gapped[0, gap] = np.nan
+
+    clean = heat.endmember_to_source(tout=measured, **shared)
+    holed = heat.endmember_to_source(tout=gapped, **shared)
+    settled = slice(36, n - 96)
+    assert np.nanmax(np.abs(clean[settled] - tin[settled])) < 1e-8, "the no-gap round trip must stay exact"
+
+    # Nothing the two-way direction still reports may have moved by more than the tolerance
+    # the contract names -- neither after the gap nor before it.
+    moved = np.abs(holed - clean)
+    assert np.nanmax(moved[settled]) <= 1e-3, float(np.nanmax(moved[settled]))
+    assert np.all(np.isnan(holed[gap])), "the gap itself is unconstrained"
+    assert np.isfinite(holed[settled]).any(), "flagging everything would be vacuous"
+
+    # The one-way reverse is the local variant, and stays bit-for-bit unaffected outside the
+    # gap -- which is what makes the flagging above a statement about the coupling.
+    one_clean = heat.endmember_to_source(tout=measured, **shared, max_sweeps=1)
+    one_holed = heat.endmember_to_source(tout=gapped, **shared, max_sweeps=1)
+    # The outage does cost coverage -- bins only that sensor's water reached come back NaN --
+    # but wherever the one-way direction still answers, it answers exactly what it did
+    # without the gap, to the last bit.
+    both = np.isfinite(one_clean) & np.isfinite(one_holed)
+    assert both[: gap.start].any(), "the one-way comparison must have something to compare"
+    np.testing.assert_array_equal(one_holed[both], one_clean[both])
+
+
+def _equilibrating_pipe(h_tau, *, days=12):
+    """A 100 mm x 1 km grass main whose flow puts it at a chosen ``h*tau``, and its inputs."""
+    segments = pd.DataFrame(
+        {"from": ["Plant"], "to": ["T1"], "length": [1000.0], "diameter": [0.1], "cover": ["grass"]},
+        index=["main"],
+    )
+    network = PipeNetwork(segments=segments, source="Plant")
+    rate = float(_rate(network, depth=1.0).iloc[0])
+    volume = float(network.segments["volume"].iloc[0])
+    n = 24 * days
+    tedges = pd.date_range("2025-06-01", periods=n + 1, freq="h")
+    tin = 8.0 + 2.0 * np.sin(2.0 * np.pi * np.arange(n) / 72.0)
+    shared = dict(
+        flow=np.full((1, n), volume * rate / h_tau),
+        tedges=tedges,
+        cout_tedges=tedges,
+        network=network,
+        soil=pd.DataFrame([GRASS], index=["grass"]),
+        surface_temperature=pd.DataFrame({"grass": np.full(n, 22.0)}),
+    )
+    return shared, tin
+
+
+@pytest.mark.parametrize("h_tau", [1.0, 2.0, 8.0])
+def test_the_reverse_names_the_regime_it_cannot_invert(h_tau):
+    """Past the point where a pipe equilibrates over its transit, the reverse says why.
+
+    The outer map's spectral radius crosses one at ``h*tau`` of about 0.7 and keeps growing
+    (measured 1.11, 1.32 and 2.37 at 0.75, 1.0 and 2.0), so beyond it the two-way reverse is
+    ill-conditioned rather than slow: water that equilibrates over its transit carries little
+    of the produced temperature to the endmember, and no cap, tolerance or regularization
+    recovers it. Left alone the iterate overflows and the banded solve raises about infs,
+    which says nothing; the message has to name the segment, its coupling, and the variant
+    that works.
+    """
+    shared, tin = _equilibrating_pipe(h_tau)
+    measured = heat.source_to_endmember(tin=tin, **shared)
+
+    with pytest.raises(RuntimeError, match=r"h\*tau = ") as raised:
+        heat.endmember_to_source(tout=measured, **shared)
+    message = str(raised.value)
+    assert "'main'" in message, message
+    assert "max_sweeps=1" in message, message
+    assert "raise max_sweeps or atol" not in message, "the knobs that cannot help must not be advertised"
+
+    # The one-way reverse it points at really does return a usable answer here.
+    one_way = heat.endmember_to_source(tout=measured, **shared, max_sweeps=1)
+    assert np.isfinite(one_way).any()
+
+
+def test_the_reverse_gives_up_on_divergence_instead_of_exhausting_its_cap():
+    """Divergence is caught in a handful of steps, not after ``max_sweeps`` of thrashing.
+
+    A monotonically growing residual is a regime, not a slow start, and every further step
+    doubles the numbers on the way to an overflow. The detector fires while they are still
+    finite, so the call costs a fraction of a second rather than seconds of arithmetic whose
+    only output is a misleading message.
+    """
+    shared, tin = _equilibrating_pipe(2.0, days=8)
+    measured = heat.source_to_endmember(tin=tin, **shared)
+
+    with pytest.raises(RuntimeError, match="did not converge") as raised:
+        heat.endmember_to_source(tout=measured, **shared, max_sweeps=5000)
+    # The cap is 5000; the detector must stop long before it, which the wording records.
+    assert "within max_sweeps" not in str(raised.value), str(raised.value)
 
 
 def test_one_way_reverse_is_a_single_banded_solve(heat_network, short_tedges, diurnal_demand, soil, surface):
