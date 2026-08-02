@@ -156,7 +156,7 @@ class OraclePath:
         """
         return float(brentq(lambda t: self.node(t) - label, self.tedges[0], self.tedges[-1], xtol=1e-14))
 
-    def cout(self, *, cin, cout_tedges_days):
+    def cout(self, *, cin, cout_tedges_days, bin_end_rate=0.0):
         """Bin-averaged delivered quality on the output grid.
 
         Splits every output bin's label interval at the labels where ``cin`` steps, then
@@ -168,6 +168,10 @@ class OraclePath:
             Source quality, one value per input bin.
         cout_tedges_days : ndarray
             Output bin edges in days.
+        bin_end_rate : float, optional
+            Rate ``w`` [1/day] of an extra reading weight ``exp(-w (t_end - t))``, with ``t``
+            the parcel's delivery time and ``t_end`` the right edge of its output bin. Default
+            0, the plain bin average.
 
         Returns
         -------
@@ -195,10 +199,18 @@ class OraclePath:
             interior = edge_label[np.isfinite(edge_label) & (edge_label > lo) & (edge_label < hi)]
             bounds = np.concatenate([[lo], interior, [hi]])
             total = 0.0
+            bin_end = cout_tedges_days[j + 1]
             for a, b in itertools.pairwise(bounds):
                 source_time = self.departure(self._time_at_label(0.5 * (a + b)))
                 bin_index = int(np.clip(np.searchsorted(self.tedges, source_time, side="right") - 1, 0, len(cin) - 1))
-                integral, _ = quad(lambda label: np.exp(-exponent(label)), a, b, limit=200)
+                integral, _ = quad(
+                    lambda label, end=bin_end: np.exp(
+                        -exponent(label) - bin_end_rate * (end - self._time_at_label(label))
+                    ),
+                    a,
+                    b,
+                    limit=200,
+                )
                 total += cin[bin_index] * integral
             out[j] = total / (hi - lo)
         return out
