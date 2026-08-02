@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from _oracle import OraclePath
+from scipy.fft import rfft
 from scipy.integrate import quad
 from scipy.linalg import solve_banded
 from scipy.special import erfc, erfcx, exp1, j1, kve, y1
@@ -1270,8 +1271,12 @@ def test_the_pipe_wall_moves_the_radius_the_halo_is_read_at(heat_pipe, soil):
         d_eff=np.array([1.0 + GRASS["kappa"] / GRASS["eta"]]),
         alpha=np.array([GRASS["alpha"]]),
         kappa=np.array([GRASS["kappa"]]),
-    )[0]
-    np.testing.assert_array_equal(system.dbar[0], outer)
+    )
+    # The system carries the kernel transformed -- it is convolved with a fresh flux history
+    # on every sweep -- so the reference goes through the same batched transform at the same
+    # length. A 1-D ``rfft`` is not bitwise the same as one row of a batched one, so this has
+    # to be compared whole rather than row by row.
+    np.testing.assert_array_equal(system.dbar_spectrum, rfft(outer, n=system.halo_length, axis=1))
 
     # And the series resistance still points the right way end to end.
     tin = np.full(n, 8.0)
