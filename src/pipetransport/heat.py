@@ -168,10 +168,12 @@ from pipetransport.utils import solve_inverse_transport_banded, tedges_to_days
 # has settled, so the answer is the same to well under ``atol``; at 1e-2 the reverse direction
 # spends about a third of the inner sweeps that a fully resolved inner solve does.
 _INNER_FORCING = 1e-2
-# Anderson window on the reverse outer iterate. Five is the shallowest depth that captured
-# the whole win in measurement; deeper windows buy a few per cent of the sweep count and
-# cost a larger least-squares solve on every outer step.
-_ANDERSON_DEPTH = 5
+# Anderson window on the reverse outer iterate. Truncated Anderson is truncated GMRES, so
+# the window is not a tuning knob with a free choice: too short a memory drops the directions
+# the iteration needs and it stalls. A depth of five raises on a 400 mm main at a half-hour
+# transit, which ten reconstructs to 1e-9. It buys range, not a guarantee: a pipe past the
+# coupling the divergence test names is out of reach at any depth.
+_ANDERSON_DEPTH = 10
 # Consecutive growing outer residuals that mark divergence rather than a slow start.
 _DIVERGENCE_STEPS = 5
 # Consecutive growing outer residuals that mark divergence rather than a slow start.
@@ -761,6 +763,8 @@ class _HeatSystem(NamedTuple):
     volume: npt.NDArray[np.floating]
     rho: npt.NDArray[np.floating]
     parent: npt.NDArray[np.intp]
+    held_slope: npt.NDArray[np.floating]
+    held_offset: npt.NDArray[np.floating]
     h_tau: npt.NDArray[np.floating]
     segment_names: tuple[str, ...]
     internal: NetworkTransfer
@@ -989,6 +993,29 @@ def _build_system(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)  # a segment that never flows is all-NaN
         running = np.nanmedian(running, axis=1)
+
+    # What the pipes are holding when the record opens. The warm start fills them with water
+    # produced at ``tin[0]`` under the leading flow, held long enough to have settled, so each
+    # pipe's content is the steady profile ``T(s) = T_inf + (T_entry - T_inf) exp(-h s)`` and
+    # its excess over the undisturbed field integrates to ``Q (T_entry - T_inf)(1 - e^-h tau)/h``.
+    # The enthalpy budget has to start there, because the readings on the other side of the
+    # same balance describe exactly that water: starting from an equilibrated pipe instead
+    # differences two different pipes and books a first flux wrong by its own size. Both
+    # directions know ``tin[0]``, so the content is carried as its affine coefficients and the
+    # sweep evaluates them against whatever series it is reconstructing.
+    parent = np.array([up[-1] if up.size else -1 for up in entry_chains], dtype=np.intp)
+    with np.errstate(divide="ignore"):
+        # A pipe the record opens idle has an infinite transit, so it holds water that has
+        # already settled onto the soil and carries no excess: exp(-inf) is the right zero.
+        settled = np.exp(-rate * volume / seg_flow[:, 0])
+    entry_slope, entry_offset = np.ones(n_seg), np.zeros(n_seg)
+    # One pass from the source outward; the loop is over path depth, which is what orders it.
+    for e in sorted(range(n_seg), key=lambda seg: entry_chains[seg].size):
+        upstream = parent[e]
+        if upstream >= 0:
+            entry_slope[e] = entry_slope[upstream] * settled[upstream]
+            entry_offset[e] = t_inf[upstream, 0] + (entry_offset[upstream] - t_inf[upstream, 0]) * settled[upstream]
+    held = seg_flow[:, 0] * (1.0 - settled) / rate
     return _HeatSystem(
         nodes=requested,
         n_pad=n_pad,
@@ -1001,7 +1028,9 @@ def _build_system(
         length=length,
         volume=volume,
         rho=rho,
-        parent=np.array([up[-1] if up.size else -1 for up in entry_chains], dtype=np.intp),
+        parent=parent,
+        held_slope=held * entry_slope,
+        held_offset=held * (entry_offset - t_inf[:, 0]),
         # How far a pipe equilibrates over one transit. It is what decides whether the
         # reverse coupling is invertible at all, so the diagnostics quote it.
         h_tau=rate * volume / np.where(running > 0.0, running, np.nan),
@@ -1160,13 +1189,19 @@ def _update_targets(
     exactly: nothing is booked that the water did not carry.
 
     Stagnation needs no special case -- ``Q = 0`` drops the advective terms and the pipe still
-    leaks ``-h (H - V Tb)`` into the halo. Bins without a defined budget (spin-up edge, no
-    throughflow, a reading the record does not constrain) contribute zero flux: the
-    undisturbed-soil assumption applied at bin resolution.
+    leaks ``-h (H - V Tb)`` into the halo, which is the whole point: a bin with no throughflow
+    books its storage term like any other. What contributes zero flux is the spin-up prefix,
+    and a bin whose readings the record does not constrain -- the undisturbed-soil assumption
+    applied at bin resolution.
 
     A bin's own target moves that bin's storage term and the lag-0 deficit brings it straight
     back, so the sweep has a same-bin gain of about ``Dbar[0] V (1 - rho) / (L dt)``, which is
     strictly below one because ``Dbar[0] < R_total`` and ``(1 - exp(-h dt)) / (h dt) < 1``.
+    The target also moves that bin's own readings -- a parcel relaxes toward it for the part
+    of the bin it spends in the pipe -- which adds ``Dbar[0] Q dt (a - b) / (L dt)`` with
+    ``a``, ``b`` the sensitivities of the plain and weighted delivery readings. That term is
+    smaller than the first by of order ``h dt / 2`` and is what the measured gains below
+    include; it is the reason they are quoted as measured rather than derived.
     Every other path through the map is strictly causal in time and runs strictly from
     upstream to downstream within a bin, so the iteration matrix is block lower triangular and
     its eigenvalues *are* those same-bin gains: the sweep contracts for every geometry and
@@ -1217,6 +1252,12 @@ def _update_targets(
     storage = system.volume[:, None] * (1.0 - system.rho)[:, None] * (targets - system.t_inf[:, :1])
     forcing = np.where(flowing, carried * (d_in - d_out), 0.0) + np.where(usable, storage, 0.0)
 
+    # The record opens with the pipes holding the warm start's own water; see _build_system.
+    # With no warm start there is no prior state to carry, and the leading bins are
+    # unconstrained anyway, so the slice is simply absent.
+    if system.n_pad:
+        forcing[:, system.n_pad - 1] += system.held_slope * tin_padded[0] + system.held_offset
+
     content = np.zeros_like(forcing)
     for e in range(n_seg):
         content[e] = lfilter([1.0], [1.0, -system.rho[e]], forcing[e])
@@ -1252,7 +1293,7 @@ def source_to_endmember(
     crosses, at that pipe's exchange rate. The relaxation target is the undisturbed soil
     temperature at pipe depth (from the land-cover surface forcing) shifted by the halo the
     network's own heat flux has built up -- a fixed point that is found by iterating a
-    transport pass, a delivered-water flux pass and one convolution per segment.
+    transport pass, an enthalpy-budget flux pass and one convolution per segment.
     ``max_sweeps=1`` skips the coupling entirely and is exactly the classical one-way
     model (steady buried-pipe resistance, undisturbed soil).
 
@@ -1477,8 +1518,9 @@ def endmember_to_source(
     -----
     The halo is brought to its own fixed point inside every outer step, so the cost is a
     product of two iterations rather than a sum. The outer step extrapolates over its last few
-    iterates rather than simply repeating, which is what lets it converge on pipes that
-    equilibrate appreciably over their transit; plain repetition diverges there.
+    iterates rather than simply repeating, which reaches pipes plain repetition cannot -- but
+    only so far: the extrapolation is truncated, and past a coupling of roughly
+    ``h*tau = 0.7`` nothing reaches the fixed point, which is what the RuntimeError reports.
 
     The reconstruction leans on a fabricated production series over the bins no measurement
     constrains, and the coupling carries that invention into bins the record *does* constrain
@@ -1607,8 +1649,10 @@ def endmember_to_source(
     # The outer map is affine, so plain repetition converges only where its own spectral
     # radius happens to be under one -- and a pipe that equilibrates appreciably over its
     # transit puts it over. Extrapolating over the last few iterates instead (Anderson, which
-    # on an affine map is a Krylov method) converges whenever the fixed point is unique at
-    # all, which is what a linear reconstruction problem is entitled to. The residual is
+    # on an affine map is a Krylov method) reaches configurations plain repetition cannot,
+    # though with a truncated window it carries no guarantee: past a coupling of roughly
+    # h*tau = 0.7 it stops reaching them and the divergence test below is what answers. The
+    # residual is
     # measured on the bins the operator covers; that set is a property of the operator, not of
     # the iterate, so it is fixed once and asserted to stay fixed.
     first = solve(system.reporting, system.t_inf)
