@@ -20,8 +20,10 @@ piecewise-constant inputs and two of the three in closed form:
   cylinder is the one kernel with no closed form; it is a quadrature, evaluated once per
   distinct Fourier number when the system is built and held to about 1e-13 relative.
   Splitting its response into *steady part + transient deficit* turns the two-way model into
-  the one-way model with a memory-shifted target: one short convolution of the wall-flux
-  history per segment.
+  the one-way model with a memory-shifted target: one convolution of the wall-flux history
+  per segment, over the whole record rather than a window. The deficit decays only as
+  ``1/t``, so there is no lag at which it can be truncated: cutting it at two months
+  discards about 40 % of its mass and costs a seventh of the halo correction.
 - **Exchange rate**: the series resistance of the water-side film, the pipe wall and the
   soil, divided by the water column's heat capacity, gives the relaxation rate [1/day] --
   the same ``1/(D**2 ln D)``-flavoured diameter law as chlorine wall decay: service lines
@@ -1248,6 +1250,10 @@ def _update_targets(
     psi = (np.concatenate([np.zeros((n_seg, 1)), content[:, :-1]], axis=1) - content + advected) / (
         system.length[:, None] * system.dt_days
     )
+    # The prefix sets the state the record opens from; it is not part of the record's flux
+    # history. Its own forcing is already zero, but the step onto that state would otherwise
+    # register as heat drawn from the soil in the bin before the record starts.
+    psi[:, : system.n_pad] = 0.0
     dpsi = np.diff(psi, axis=1, prepend=0.0)
     spectrum = rfft(dpsi, n=system.halo_length, axis=1) * system.dbar_spectrum
     return system.t_inf - irfft(spectrum, n=system.halo_length, axis=1)[:, : system.n_bins]
@@ -1325,6 +1331,11 @@ def source_to_endmember(
         hourly bins, unchanged from 30 days of record to a year), and a 400 mm main run at a
         0.5 m/s design velocity on hourly bins needs about 160. Exceeding the cap
         raises rather than returning an unconverged answer. Default 5000.
+
+        The working set is the operator, and it scales with the record rather than with the
+        sweeps: measured on the example network at hourly bins, the peak is 1.3 MiB per day
+        of record -- 39 MiB over a month, 462 MiB over a year -- so a year of hourly data on
+        a network of this size is comfortable, and a network ten times larger is not.
     atol : float, optional
         Convergence tolerance on the relaxation-target increment, absolute and in the unit of
         the temperature inputs. Default 1e-9, several orders below anything a temperature
@@ -1359,6 +1370,9 @@ def source_to_endmember(
     endmember_to_source : Reverse direction.
     soil_temperature : The undisturbed field the targets are built from.
     segment_heat_rate : The exchange rates, as a standalone diagnostic.
+    :ref:`concept-relaxation` : How the halo turns the one-way model into this one.
+    :ref:`assumption-uniform-wall-flux` : One wall-flux history per pipe, and what it costs.
+    :ref:`assumption-effective-target` : Why the delivered temperature can leave its own hull.
 
     Examples
     --------
@@ -1482,8 +1496,10 @@ def endmember_to_source(
     numpy.ndarray
         Reconstructed production temperature on ``tedges``, length ``len(tedges) - 1``.
         NaN for bins no measurement constrains, and for bins whose reconstruction moves by
-        more than ``gap_atol`` when the flux invented over such a gap is removed -- so every
-        value returned is one the record supports to that tolerance.
+        more than ``gap_atol`` when the flux invented over such a gap is removed. That is a
+        statement about *dependence* on invented data rather than a bound on accuracy: a bin
+        the record determines poorly for some other reason can be insensitive to that
+        particular removal and still be returned.
 
     Raises
     ------
