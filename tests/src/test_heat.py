@@ -1125,9 +1125,15 @@ def test_two_way_model_agrees_with_the_local_fine_step_reference(transit_hours, 
     The reference keeps one soil memory per axial cell; the package keeps one per pipe. The
     gap between them is therefore that one modelling difference, and the test that they are
     the same physics rather than two answers that happen to land near each other is that the
-    gap *closes* as the pipe is modelled as more series pieces. It does so at first order in
-    the number of pieces, not second: the flux of a piece is read off the water it delivers,
-    which smears the flux history over one piece transit.
+    gap *closes* as the pipe is modelled as more series pieces.
+
+    It used to close at first order, because a second and larger error sat on top of the
+    axial one: the flux of a piece was read off the water it delivered, which smeared the flux
+    history over one piece transit and shrank only as fast as the pieces did. With the flux
+    booked over the residence time that term is gone, the unsplit gap falls several-fold, and
+    what is left drops steeply at the first refinement and then flattens onto a floor that
+    more pieces do not move -- so the assertions below pin the drop and the floor rather than
+    a rate. Issue #32 tracks attributing that floor.
 
     A film resistance is supplied deliberately. At the bare-pipe limit the reference's
     closed-form per-step solve is singular and it diverges below about 2 % of the soil
@@ -1160,8 +1166,8 @@ def test_two_way_model_agrees_with_the_local_fine_step_reference(transit_hours, 
         for n_sub in (1, 4, 8)
     ]
     assert gaps[0] < tolerance, gaps
-    assert gaps[1] < 0.4 * gaps[0], gaps  # two doublings; measured ratio 0.21-0.25
-    assert gaps[2] < 0.75 * gaps[1], gaps  # one more; measured 0.50-0.56
+    assert gaps[1] < 0.4 * gaps[0], gaps  # measured 0.09-0.34 of the unsplit gap
+    assert gaps[2] <= gaps[1], gaps  # the floor: measured 0.68-0.99, never a rise
 
 
 def test_uniform_temperature_is_a_fixed_point(heat_network, hourly_tedges, diurnal_demand):
@@ -1258,9 +1264,7 @@ def test_one_way_model_is_the_first_iterate(heat_network, hourly_tedges, diurnal
         spinup="constant",
     )
     padded = np.concatenate([np.full(system.n_pad, tin[0]), tin])
-    expected = heat._apply(system.reporting, padded) + apply_segment_targets(
-        system.reporting, heat._extended(system.t_inf)
-    )
+    expected = heat._apply(system.reporting, padded) + apply_segment_targets(system.reporting, system.t_inf)
     expected[~system.reporting.valid_out] = np.nan
 
     np.testing.assert_array_equal(np.isnan(one_way), np.isnan(expected))
@@ -1464,17 +1468,87 @@ def test_the_delivered_temperature_overshoots_the_forcing_range_by_a_measured_am
     assert (21.0 - np.nanmin(split)) / contrast < 0.5 * excursion
 
 
-def test_stagnation_turns_the_overshoot_warm_and_refining_makes_it_worse(soil):
-    """The excursion under a duty cycle: warm side, much larger, and *grown* by refining.
+@pytest.mark.parametrize(
+    ("label", "diameter", "length", "flow", "ceiling"),
+    [
+        # Two hours of flow in every 24, at 0.8 m/s: the running transit is shorter than one
+        # bin, so a delivery-bin flux charges a whole day of exchange to a couple of bins.
+        ("flushed twice a day", 0.4, 500.0, "flush", 1.2),
+        # Ten days standing, then a normal four-hour transit.
+        ("stagnant for ten days", 0.3, 1000.0, "stagnant", 4.0),
+    ],
+)
+def test_intermittent_demand_stays_near_the_range_of_its_inputs(label, diameter, length, flow, ceiling):
+    """Water that stands still must not charge its whole standing time to one delivery bin.
 
-    The test above is the mild case, a step into a continuously flowing pipe, and neither of
-    its two conclusions survives an idle period. A bin with no throughflow contributes no wall
-    flux, so a pipe standing idle builds no halo while it stands idle; the first water out
-    afterwards meets a halo the model never built, and the target overshoots on the *warm*
-    side instead. Declaring the pipe as a chain of shorter segments then makes it worse rather
-    than severalfold better --- the opposite of what it does under continuous flow --- which
-    is why the module documents ``max_sweeps=1`` as the only answer guaranteed inside its own
-    hull, and why the user guide tells you to check that refining settles before trusting it.
+    Both shapes come from issue #24, where the delivered temperature converged cleanly and
+    silently to -102..+146 C and to +47 C out of inputs that never leave [8, 22] C -- 8.8 and
+    1.8 times the driving contrast. The cause was the attribution rather than the kernel or
+    the inputs: heat picked up over hours of standing was booked into the single bin the water
+    finally left in, overstating that bin's flux by the ratio of the standing time to the
+    transit. Booking it over the bins the water actually stood in removes the mechanism, so
+    the delivered temperature stays within a small margin of the range of its own inputs.
+
+    The margin is not zero and is not claimed to be: the target is an effective driving
+    temperature that legitimately runs past the undisturbed soil while the halo develops. It
+    is a couple of kelvin here, against 124 K before.
+    """
+    hull_lo, hull_hi = 8.0, 22.0
+    if flow == "flush":
+        peak = 0.8 * np.pi * (diameter / 2.0) ** 2 * 86400.0
+        demand = np.tile(np.concatenate([np.full(2, peak), np.zeros(22)]), 20)
+    else:
+        steady = np.pi * (diameter / 2.0) ** 2 * length / (4.0 / 24.0)
+        demand = np.full(480, steady)
+        demand[24:264] = 0.0
+    n = len(demand)
+    tedges = pd.date_range("2025-06-01", periods=n + 1, freq="h")
+    segments = pd.DataFrame(
+        {
+            "from": ["Plant"],
+            "to": ["T1"],
+            "length": [length],
+            "diameter": [diameter],
+            "cover": ["grass"],
+            "depth": [1.0],
+        },
+        index=["P"],
+    )
+    shared = dict(
+        tin=np.full(n, hull_lo),
+        flow=demand[None, :],
+        tedges=tedges,
+        cout_tedges=tedges,
+        network=PipeNetwork(segments=segments, source="Plant"),
+        soil=pd.DataFrame([GRASS], index=["grass"]),
+        surface_temperature=pd.DataFrame({"grass": np.full(n, hull_hi)}),
+    )
+    delivered = heat.source_to_endmember(**shared)
+
+    assert np.isfinite(delivered).any(), f"{label}: nothing was delivered"
+    assert np.nanmin(delivered) > hull_lo - ceiling, (label, float(np.nanmin(delivered)))
+    assert np.nanmax(delivered) < hull_hi + ceiling, (label, float(np.nanmax(delivered)))
+    # ... and the one-way model, which is inside the hull by construction, is not simply being
+    # reproduced: the coupling is doing something here.
+    one_way = heat.source_to_endmember(**shared, max_sweeps=1)
+    assert np.nanmax(np.abs(delivered - one_way)) > 0.1, label
+
+
+def test_stagnation_overshoot_stays_small_and_refining_settles_it(soil):
+    """The excursion under a duty cycle: small, warm-side, and *removed* by refining.
+
+    Standing water is the case the wall flux has to get right. It exchanges heat with the soil
+    for as long as it stands, and the enthalpy budget books that heat into the bins it
+    actually stood in -- a bin with no throughflow still leaks ``-h (H - V Tb)``. Reading the
+    flux off the water a pipe delivers instead would charge a whole idle night to the single
+    bin the water finally left in, overstating it by the ratio of the standing time to the
+    transit; that is what used to drive the delivered temperature a quarter of the contrast
+    past the soil here, and several times the contrast on the shapes in issue #24.
+
+    So the excursion is now small, and -- the discriminating part -- declaring the pipe as a
+    chain of shorter segments *reduces* it monotonically and takes the answer back inside the
+    hull, where it used to grow. A model whose refinement diverges cannot be trusted at any
+    resolution; one that settles can.
 
     This is also the only configuration in the file with zero flow anywhere, so it is what
     exercises the stagnation assumption end to end rather than as a statement in the docs.
@@ -1513,9 +1587,11 @@ def test_stagnation_turns_the_overshoot_warm_and_refining_makes_it_worse(soil):
         assert np.nanmax(one_way) <= 20.0 + 1e-9, "the one-way model must stay inside its hull"
         return (np.nanmax(heat.source_to_endmember(**shared)) - 20.0) / contrast
 
-    whole, refined = excursion(1), excursion(4)
-    assert 0.20 < whole < 0.28, whole
-    assert refined > whole, (whole, refined)
+    whole, halved, refined = excursion(1), excursion(2), excursion(4)
+    assert 0.05 < whole < 0.11, whole
+    assert halved < whole, (whole, halved)
+    assert refined < halved, (halved, refined)
+    assert refined < 0.0, f"four pieces must bring the delivered temperature back inside the hull: {refined}"
 
 
 def test_the_model_is_linear_in_every_temperature_input(heat_network, hourly_tedges, diurnal_demand, soil, surface):
@@ -1580,15 +1656,15 @@ def test_the_answer_does_not_depend_on_the_temperature_origin(
     np.testing.assert_allclose(shifted - 273.15, base, atol=1e-10, equal_nan=True)
 
 
-def test_inert_copy_makes_the_entry_row_the_same_water(heat_network, short_tedges, diurnal_demand, surface):
-    """With nothing to exchange, the entry and delivery rows must coincide exactly.
+def test_the_inflow_rows_read_the_water_the_parent_delivered(heat_network, short_tedges, diurnal_demand, surface):
+    """With nothing to exchange, the three readings of a segment must collapse onto two.
 
-    The flux pass differences two operator rows: the delivery temperature at a segment's
-    downstream node, and the temperature of that same water where it entered the segment,
-    obtained by replacing the segment with an inert copy that carries the parcel across
-    without exchanging. If the two rows ever described different parcels, driving every
-    exchange rate to zero -- which makes the real segment and its inert copy identical --
-    would not collapse them onto each other.
+    The flux pass reads each pipe three ways: what it delivers, that reading weighted toward
+    the bin end, and the weighted reading of what *enters* it. The weight is the pipe's own
+    exchange rate, so driving every rate to zero must collapse the weighted delivery onto the
+    plain one, and must leave the inflow row reading exactly what the pipe upstream delivered
+    -- the source series itself for a segment fed by the plant. If the inflow rows were wired
+    to the wrong path, or the weight applied at the wrong end, neither would hold.
     """
     heat_network.segments["cover"] = "grass"
     inert = pd.DataFrame([{"alpha": GRASS["alpha"], "kappa": 1e-9, "eta": GRASS["eta"]}], index=["grass"])
@@ -1609,11 +1685,18 @@ def test_inert_copy_makes_the_entry_row_the_same_water(heat_network, short_tedge
     tin = 9.0 + rng.normal(0.0, 1.0, system.n_bins)
     t_int = heat._internal_pass(system, heat._apply(system.internal, tin), system.t_inf)
     n_seg = len(heat_network.segments)
-    entry, delivered = t_int[:n_seg], t_int[n_seg:]
+    delivered, weighted, inflow = t_int[:n_seg], t_int[n_seg : 2 * n_seg], t_int[2 * n_seg :]
 
-    both = np.isfinite(entry) & np.isfinite(delivered)
-    assert both.sum() > 0.5 * entry.size
-    np.testing.assert_allclose(entry[both], delivered[both], atol=1e-6)
+    both = np.isfinite(delivered) & np.isfinite(weighted)
+    assert both.sum() > 0.5 * delivered.size
+    np.testing.assert_allclose(weighted[both], delivered[both], atol=1e-6)
+
+    upstream = np.where(system.parent[:, None] >= 0, delivered[system.parent], tin)
+    both = np.isfinite(inflow) & np.isfinite(upstream)
+    assert both.sum() > 0.5 * inflow.size
+    assert (system.parent < 0).any(), "a root segment must be exercised"
+    assert (system.parent >= 0).any(), "a fed segment must be exercised"
+    np.testing.assert_allclose(inflow[both], upstream[both], atol=1e-6)
 
 
 def test_leaf_delivery_rows_agree_with_the_transport_module(heat_network, short_tedges, diurnal_demand, soil, surface):
@@ -1643,7 +1726,7 @@ def test_leaf_delivery_rows_agree_with_the_transport_module(heat_network, short_
     # The rates the operator was built with, per cover class; what they should be is pinned
     # separately, and reusing them here keeps this test about the operator rows alone.
     rates = pd.Series(system.internal.target_terms.segment_rate[:n_seg], index=heat_network.segments.index)
-    bare = heat._apply(system.internal, tin) + apply_segment_targets(system.internal, np.zeros((2 * n_seg, n)))
+    bare = heat._apply(system.internal, tin) + apply_segment_targets(system.internal, np.zeros((n_seg, n)))
     bare = np.where(system.internal.valid_out, bare, np.nan)
 
     checked = 0
@@ -1661,7 +1744,7 @@ def test_leaf_delivery_rows_agree_with_the_transport_module(heat_network, short_
             decay_rate=rates,
             spinup=None,
         )[0]
-        actual = bare[n_seg + row]
+        actual = bare[row]
         both = np.isfinite(actual) & np.isfinite(expected)
         assert both.sum() > 0, f"no comparable bin for {name}"
         np.testing.assert_allclose(actual[both], expected[both], rtol=1e-12, err_msg=f"segment {name}")
@@ -1688,7 +1771,10 @@ def test_wall_flux_vanishes_without_a_temperature_difference(heat_network, hourl
     )
     uniform = np.full(system.n_bins, 14.0)
     targets = heat._update_targets(
-        system, heat._internal_pass(system, heat._apply(system.internal, uniform), system.t_inf)
+        system,
+        heat._internal_pass(system, heat._apply(system.internal, uniform), system.t_inf),
+        system.t_inf,
+        uniform,
     )
     np.testing.assert_allclose(targets, system.t_inf, atol=1e-11)
 
@@ -1959,46 +2045,68 @@ def test_the_reconstruction_reproduces_the_measurements_it_was_built_from(heat_p
     assert np.nanmax(residual) < 1e-6, np.nanmax(residual)
 
 
-def test_reverse_recovers_the_production_temperature(heat_network, short_tedges, diurnal_demand, soil, surface):
+def test_reverse_recovers_the_production_temperature(heat_network, hourly_tedges, diurnal_demand, soil, surface):
     """Round trip through every endmember: the deconvolution inverts the affine model.
 
-    The tolerance is the banded solver's own, not a concession to the coupling: the outer
-    iteration is driven to the same target increment as the forward direction, so the extra
-    error it contributes stays below the deconvolution's.
+    In the interior the tolerance is the banded solver's own, not a concession to the
+    coupling: the outer iteration is driven to the same target increment as the forward
+    direction, so the extra error it contributes stays below the deconvolution's.
+
+    The record's own end is a different matter, and the reason this test needs a longer record
+    than its neighbours. Most of the heat the last bins exchange with the soil arrives after
+    the record stops, so no measurement in it constrains them; the solve falls back on the
+    regularization target and the error grows geometrically into the final bins -- the
+    lead-*out* counterpart of the lead-in transient the forward direction has. It is a
+    property of the model rather than of the solver, so it is pinned here rather than tuned
+    away: bins the transport does not reach at all are already NaN, and the bins just inside
+    them are the ones a caller has to discard.
     """
-    n = len(short_tedges) - 1
+    n = len(hourly_tedges) - 1
     tin = 10.0 + 2.0 * np.sin(2.0 * np.pi * np.arange(n) / 72.0)
     _, recovered = _reverse_case(
         heat_network,
-        short_tedges,
-        diurnal_demand(heat_network, short_tedges),
+        hourly_tedges,
+        diurnal_demand(heat_network, hourly_tedges),
         soil,
-        surface(short_tedges, amplitude=4.0),
+        surface(hourly_tedges, amplitude=4.0),
         nodes=None,
         tin=tin,
     )
-    inner = slice(36, -36)
-    np.testing.assert_allclose(recovered[inner], tin[inner], atol=1e-8)
+
+    interior = slice(36, -96)
+    np.testing.assert_allclose(recovered[interior], tin[interior], atol=1e-8)
+
+    # The lead-out, measured: it decays by more than two decades over the 36 bins before the
+    # window above, so a caller who keeps too much of the tail is wrong gradually, not
+    # suddenly, and refining the record's end is what fixes it.
+    error = np.abs(recovered - tin)
+    near, far = np.nanmax(error[-48:-24]), np.nanmax(error[-96:-72])
+    assert far < 0.01 * near, (far, near)
+    assert near > 1e-3, "the lead-out must still be visible, or this pins nothing"
 
 
-def test_reverse_tolerates_a_measurement_outage(heat_network, short_tedges, diurnal_demand, soil, surface):
-    """One sensor dropping out leaves the reconstruction to the endmembers still reporting."""
-    n = len(short_tedges) - 1
+def test_reverse_tolerates_a_measurement_outage(heat_network, hourly_tedges, diurnal_demand, soil, surface):
+    """One sensor dropping out leaves the reconstruction to the endmembers still reporting.
+
+    The record is the longer one for the same reason as the round trip above: the reverse
+    direction has a lead-out transient, and a four-day record is nearly all edge.
+    """
+    n = len(hourly_tedges) - 1
     tin = 10.0 + 2.0 * np.sin(2.0 * np.pi * np.arange(n) / 72.0)
     shared = dict(
-        flow=diurnal_demand(heat_network, short_tedges),
-        tedges=short_tedges,
-        cout_tedges=short_tedges,
+        flow=diurnal_demand(heat_network, hourly_tedges),
+        tedges=hourly_tedges,
+        cout_tedges=hourly_tedges,
         network=heat_network,
         soil=soil,
-        surface_temperature=surface(short_tedges, amplitude=4.0),
+        surface_temperature=surface(hourly_tedges, amplitude=4.0),
     )
     measured = heat.source_to_endmember(tin=tin, **shared)
     gapped = measured.copy()
-    gapped[1, 40:60] = np.nan
+    gapped[1, 60:80] = np.nan
     recovered = heat.endmember_to_source(tout=gapped, **shared)
 
-    inner = slice(36, -36)
+    inner = slice(36, -96)
     np.testing.assert_allclose(recovered[inner], tin[inner], atol=1e-7)
 
 

@@ -204,7 +204,9 @@ class OraclePath:
                 source_time = self.departure(self._time_at_label(0.5 * (a + b)))
                 bin_index = int(np.clip(np.searchsorted(self.tedges, source_time, side="right") - 1, 0, len(cin) - 1))
                 integral, _ = quad(
-                    lambda label: np.exp(-exponent(label) - bin_end_rate * (bin_end - self._time_at_label(label))),
+                    lambda label, end=bin_end: np.exp(
+                        -exponent(label) - bin_end_rate * (end - self._time_at_label(label))
+                    ),
                     a,
                     b,
                     limit=200,
