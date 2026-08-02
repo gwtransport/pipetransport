@@ -328,9 +328,9 @@ them. They sit on top of everything above --- the heat model is the same transpo
 an affine map, so tree topology, plug flow and known demand are all still required.
 
 **Assumption.** The soil around a segment behaves as a set of independent radial columns around a
-*line* source at the pipe axis, with a mirror-image sink above the ground surface; the soil is
-homogeneous and time-constant per land-cover class; the pipe wall is a memoryless series resistance;
-and the water is well mixed across the pipe section.
+*constant-flux cylinder* at the pipe wall, with a mirror-image line sink above the ground surface;
+the soil is homogeneous and time-constant per land-cover class; the pipe wall is a memoryless series
+resistance; and the water is well mixed across the pipe section.
 
 **Why it matters.** Independence of the columns is what makes the wall temperature a local quantity
 and reduces the halo to one convolution per segment. It is well founded: axial conduction reaches
@@ -339,14 +339,40 @@ what makes the halo saturate at the steady buried-pipe resistance instead of gro
 The wall's own thermal response time is minutes, far below any sensible bin width, so it carries no
 memory of its own.
 
+That the source is a cylinder rather than a line matters most in the *first* lag bin, which is the
+one the same-bin coupling leans on. Below a Fourier number :math:`\alpha \Delta t / r_o^2` of roughly
+5 --- which is every configuration this package is for --- a line source read at :math:`r = r_o` has
+barely begun to respond, because it puts the whole wall flux on a line of zero radius and then samples
+the field where the pipe surface actually is. The cylinder response is the only one of the module's
+three kernels without a closed form: it is evaluated by quadrature along the branch cut of its Laplace
+transform, once per distinct :math:`\alpha \Delta t / r_o^2` when the system is built, to about
+:math:`10^{-13}` relative. So the module's kernels are exact for piecewise-constant inputs, but one of
+them is exact only to a stated tolerance rather than in closed form. The image keeps its line source:
+read from :math:`2 d_\text{eff}` away rather than from the pipe's own wall, a cylinder is a line to
+the same order the *steady* resistance already is, and it costs the same order --- at most
+:math:`2\times10^{-4}` of :math:`R_\text{soil}` for a 100 mm service line buried a metre and
+:math:`3.5\times10^{-3}` for a 400 mm main, against the :math:`1\times10^{-4}` and
+:math:`3.8\times10^{-3}` that :math:`\ln(2 d_\text{eff}/r_o)` itself gives up against
+:math:`\operatorname{acosh}(d_\text{eff}/r_o)`. Both grow as the burial approaches :math:`r_o`.
+
 **What breaks if it is violated.** Two mains sharing a trench warm each other's soil, which this
 model does not represent --- each segment sees only its own halo, so the delivered temperature of
 both is underestimated in summer. Freeze--thaw and seasonal moisture change the soil properties
-within a run, which the model holds fixed. Below a Fourier number :math:`\alpha \Delta t / r_o^2` of
-roughly 5 the line source overstates the deficit of the first lag bins, by up to about 9 % of the
-steady resistance near :math:`\mathrm{Fo} \approx 0.3`; because the deficit is a correction rather
-than the leading resistance, the delivered temperature moves by only hundredths of a kelvin for a
-service line on hourly bins, rising to a few tenths for a trunk main at sub-daily bins.
+within a run, which the model holds fixed. A real pipe is not a perfect cylinder of constant flux
+either: the flux around the circumference is higher on the side facing the surface, which this model
+averages away, and it falls along the pipe, which :ref:`assumption-uniform-wall-flux` covers
+separately.
+
+**What the cylinder kernel is worth, in numbers.** The first lag bin holds a fraction
+:math:`\bar{D}[0]/R_\text{soil}` of the steady soil resistance as *not yet arrived*, and that fraction
+is what sets the same-bin loop gain. With the cylinder it is 0.8568 for a 100 mm service line and
+0.9323 for a 400 mm main on hourly bins; with a line source it would be 0.9418 and 1.0000. The 1.0000
+is the one that mattered: with no margin at all the fixed point is near-singular, and a 400 mm main at
+a half-hour transit came back spanning :math:`-88` to :math:`+78` °C from water produced at 8 °C into
+soil at 22 °C --- converged, without a warning, at default settings --- while refining ``tedges`` made
+it worse rather than better. The cylinder closes that regime: the same pipe delivers 8.2--9.0 °C
+against a one-way 8.15 °C, and no bin width reopens it. It also cuts the sweep count about fourfold,
+100 against 286 on the example network.
 
 **The pre-history matters more than any of that.** The model starts with an undisturbed halo, so a
 pipe that has in reality been running for years is modelled as one switched on at the first bin,
@@ -418,17 +444,17 @@ plus transient deficit*, not an artefact.
 delivered temperature is a genuine weighted average of the produced water and those targets, **it can
 fall outside the range of its own inputs**, and there is no general bound on by how much.
 
-A step in the produced temperature into a *continuously flowing* pipe is the mild case: 20 % of the
-instantaneous plant-to-soil contrast --- 4.7 K on a 100 mm line after a 24 K step --- peaking 1.9
+A step in the produced temperature into a *continuously flowing* pipe is the mild case: 18 % of the
+instantaneous plant-to-soil contrast --- 4.3 K on a 100 mm line after a 24 K step --- peaking 1.9
 transits after the step and back inside the range after about nine days. Splitting the pipe
 (:ref:`assumption-uniform-wall-flux`) into a chain of shorter segments cuts that to 1--4 %.
 
 Intermittent demand is the case to watch, and it is far worse. A 100 mm line idle 16 hours a day
-delivers water 66 % of the contrast past the soil, and it does not decay: it settles at about a third
+delivers water 59 % of the contrast past the soil, and it does not decay: it settles at about a third
 of the contrast and recurs once per duty cycle for as long as the duty cycle lasts. At 20--22 hours
-idle it reaches 81--85 %. Splitting does not rescue it, in two separate ways --- on a branch idle in
-more than half the bins the criterion declines to split at all, and where it does split the excursion
-can *grow* (measured 47 % for one pipe against 75 % for the same pipe as four, on a 12 h-idle line).
+idle it reaches 71--75 %. Resolving the pipe does not rescue it and makes it worse: the excursion
+*grows* when you refine (measured 44 % for one pipe against 62 % for the same pipe as four, on a
+12 h-idle line).
 
 The one-way model (``max_sweeps=1``) has a fixed target and is the only variant guaranteed inside the
 range of its inputs.

@@ -545,7 +545,7 @@ a specific, one-signed way: a pipe that has been losing heat for weeks is not su
 undisturbed soil but by a warm (or cold) **halo** of its own making, which reduces the temperature
 difference driving further exchange.
 
-The line-source response of that halo splits into a steady part and a transient deficit,
+The step response of that halo splits into a steady part and a transient deficit,
 :math:`G(t) = R_\text{soil} - D(t)`, and it is the deficit that carries the whole memory. Absorbing
 the steady part into :math:`h_e` leaves the one-way model with a *shifted* target,
 

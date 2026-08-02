@@ -21,7 +21,7 @@ import pytest
 from _oracle import OraclePath
 from scipy.integrate import quad
 from scipy.linalg import solve_banded
-from scipy.special import erfc, erfcx, exp1
+from scipy.special import erfc, erfcx, exp1, j1, kve, y1
 
 from pipetransport import heat, transport
 from pipetransport._transfer import apply_segment_targets, paths_transfer
@@ -277,8 +277,8 @@ def test_soil_temperature_holds_the_pre_history_before_the_surface_record():
 # ============================================================================
 
 
-def _halo_response_by_quadrature(lag, *, r_outer, d_eff, alpha, kappa):
-    """Wall-temperature step response by quadrature of the instantaneous Gaussian kernel.
+def _image_response_by_quadrature(lag, *, d_eff, alpha, kappa):
+    """Mirror-image step response by quadrature of the instantaneous Gaussian kernel.
 
     ``alpha`` sets the diffusion and ``kappa`` the amplitude, written separately: the
     package's ``E1`` form groups them into ``c = r**2/(4 alpha)`` and a ``1/(4 pi kappa)``
@@ -286,31 +286,196 @@ def _halo_response_by_quadrature(lag, *, r_outer, d_eff, alpha, kappa):
     """
 
     def integrand(s):
-        return (np.exp(-(r_outer**2) / (4.0 * alpha * s)) - np.exp(-((2.0 * d_eff) ** 2) / (4.0 * alpha * s))) / (
-            4.0 * np.pi * kappa * s
-        )
+        return np.exp(-((2.0 * d_eff) ** 2) / (4.0 * alpha * s)) / (4.0 * np.pi * kappa * s)
 
     value, _ = quad(integrand, 0.0, lag, limit=400)
     return value
 
 
+def _cylinder_integral_by_laplace(fo, n=48):
+    """``integral_0^fo Ghat`` of the constant-flux cylinder, by numerical Laplace inversion.
+
+    The constant-flux cylinder has no elementary time-domain form, but an elementary Laplace
+    one: solving the radial equation in ``s`` with a step flux at the wall gives a wall
+    temperature per unit flux of ``K0(z)/(2 pi kappa s z K1(z))``, ``z = r_o sqrt(s/alpha)``,
+    and dividing by ``s`` again transforms its time integral. In the dimensionless Fourier
+    variable that is ``K0(sqrt(s)) / (2 pi s**2 sqrt(s) K1(sqrt(s)))``, inverted here on
+    Talbot's cotangent contour.
+
+    This shares no arithmetic with the package, which integrates along the branch cut on the
+    *real* axis instead: different domain, different special functions (complex ``K`` against
+    real ``J1``/``Y1``), different quadrature. ``kve`` rather than ``kv`` because the contour
+    radius grows as ``1/fo`` and the unscaled Bessel functions underflow to a 0/0 there; the
+    ratio is unchanged by the shared ``exp(z)``.
+
+    Returns
+    -------
+    ndarray
+        ``integral_0^fo Ghat(s) ds``, elementwise; good to about 1e-8 relative.
+    """
+    fo = np.asarray(fo, dtype=float)
+    theta = np.arange(1, n) * np.pi / n
+    cot = 1.0 / np.tan(theta)
+    twist = theta + (theta * cot - 1.0) * cot
+
+    def transform(s):
+        root = np.sqrt(s)
+        return kve(0, root) / (2.0 * np.pi * s**2 * root * kve(1, root))
+
+    out = np.zeros(fo.shape)
+    live = fo > 0.0
+    radius = 2.0 * n / (5.0 * fo[live])
+    contour = radius[:, None] * theta * (cot + 1j)
+    series = np.exp(fo[live][:, None] * contour) * transform(contour) * (1.0 + 1j * twist)
+    out[live] = (radius / n) * (0.5 * np.exp(radius * fo[live]) * transform(radius + 0j).real + series.real.sum(axis=1))
+    return out
+
+
 def test_deficit_kernel_matches_the_gaussian_line_source():
-    """The bin-averaged deficit is the saturation gap of the line-source-plus-image response."""
-    r_outer, d_eff, dt = 0.05, 1.0605, 1.0
+    """The image half of the deficit is the mirror line sink, to machine precision.
+
+    The pipe half is the constant-flux cylinder and has its own tests; what is asserted here
+    is that the *image* is still read as a line source at ``2 d_eff`` and still enters with
+    the sign that makes the halo saturate. Subtracting the cylinder term from the kernel
+    leaves the image alone, and it is compared against an independently written Gaussian
+    quadrature rather than against ``exp1``.
+
+    The bins are twenty days wide because the image has a diffusion time of ``(2 d_eff)**2 /
+    (4 alpha)``, 22.5 days here: on daily bins its first lag bin is 1e-12 of a resistance of
+    20, and recovering it by subtraction would measure nothing but round-off.
+    """
+    r_outer, d_eff, dt = 0.05, 1.0605, 20.0
     alpha, kappa = GRASS["alpha"], GRASS["kappa"]
     dbar = heat._deficit_kernel(
         6, dt, r_o=np.array([r_outer]), d_eff=np.array([d_eff]), alpha=np.array([alpha]), kappa=np.array([kappa])
     )[0]
     r_inf = np.log(2.0 * d_eff / r_outer) / (2.0 * np.pi * kappa)
+    # Dbar = R_inf - Gbar_pipe + Gbar_image, so the image is what is left over.
+    pipe = np.diff(heat._cylinder_integral(alpha * dt * np.arange(7) / r_outer**2)) * r_outer**2 / (kappa * alpha * dt)
+    image = dbar - r_inf + pipe
 
     for m in range(6):
         averaged, _ = quad(
-            lambda s: _halo_response_by_quadrature(s, r_outer=r_outer, d_eff=d_eff, alpha=alpha, kappa=kappa),
+            lambda s: _image_response_by_quadrature(s, d_eff=d_eff, alpha=alpha, kappa=kappa),
             m * dt,
             (m + 1) * dt,
             limit=200,
         )
-        np.testing.assert_allclose(dbar[m], r_inf - averaged / dt, rtol=1e-9, err_msg=f"lag bin {m}")
+        np.testing.assert_allclose(image[m], averaged / dt, rtol=1e-9, err_msg=f"lag bin {m}")
+
+
+def test_cylinder_kernel_matches_an_independent_laplace_inversion():
+    """The quadrature that carries the pipe term against the same physics inverted in ``s``.
+
+    A numerically evaluated kernel is only as good as its evidence, and the strongest
+    available is a second evaluation that shares no arithmetic with the first. Eleven decades
+    of Fourier number are covered because a service line on hourly bins and a trunk main over
+    a year of lag sit six decades apart, and the quadrature grid has to hold over all of it.
+    """
+    fo = np.concatenate([[0.0], np.geomspace(1e-5, 1e6, 45)])
+    got = heat._cylinder_integral(fo)
+    assert got[0] == 0.0, "no heat has arrived at zero lag"
+    np.testing.assert_allclose(got[1:], _cylinder_integral_by_laplace(fo[1:]), rtol=2e-8)
+
+
+def test_cylinder_kernel_reaches_the_plane_and_line_source_limits():
+    """Both analytic limits, each approached at its own rate, and the gap between them.
+
+    Below ``Fo ~ 1`` the wall is locally a plane and the response is the half space's
+    ``sqrt(alpha t/pi)`` spread over the wall area; far above it the cylinder has shrunk to a
+    line. Asserting the *rate* of each approach as well as its value is what distinguishes
+    the real kernel from anything that merely lands near it: the plane is approached from
+    below at order ``sqrt(Fo)``, the line source from above at order ``ln(Fo)/Fo``.
+
+    The last block is why the swap was worth making. Every configuration this package is for
+    sits between the two limits, and at the hourly-bin Fourier numbers of a 100 mm service
+    line and a 400 mm trunk main the line source alone is short by a factor of 2.5 and of
+    1600 -- the second being the regime that returned hundreds of kelvin.
+    """
+
+    def line_source(fo):
+        """``integral_0^fo`` of the line source, same normalisation as ``Ghat``."""
+        return ((fo + 0.25) * exp1(0.25 / fo) - fo * np.exp(-0.25 / fo)) / (4.0 * np.pi)
+
+    small = np.array([1e-4, 1e-3, 1e-2])
+    plane_gap = 1.0 - heat._cylinder_integral(small) / (2.0 / (3.0 * np.pi**1.5) * small**1.5)
+    assert plane_gap[0] < 4e-3, plane_gap
+    np.testing.assert_allclose(plane_gap[1:] / plane_gap[:-1], np.sqrt(10.0), rtol=3e-2)
+
+    large = np.array([1e3, 1e4, 1e5])
+    line_gap = heat._cylinder_integral(large) / line_source(large) - 1.0
+    assert line_gap[-1] < 4e-5, line_gap
+    np.testing.assert_allclose(line_gap[1:] / line_gap[:-1], 0.12, rtol=5e-2)
+
+    for fo, shortfall in ((0.05 / 24.0 / 0.05**2, 2.4584), (0.05 / 24.0 / 0.2**2, 1617.77)):
+        np.testing.assert_allclose(heat._cylinder_integral(np.array(fo)) / line_source(fo), shortfall, rtol=1e-4)
+
+
+def test_cylinder_kernel_is_invariant_to_its_quadrature_grid():
+    """Refining the log grid the kernel is summed on, in range and in step, moves nothing.
+
+    The grid is fixed in the source, so this reimplements the same branch-cut integral with a
+    wider range and a finer step. It is the guard against a silent retune of the quadrature:
+    the shipped grid has to be converged, not merely tuned to the cases that were checked.
+    """
+    fo = np.geomspace(1e-5, 1e6, 40)
+
+    def refined(log_lo, log_hi, step):
+        beta = np.exp(np.arange(log_lo, log_hi, step))
+        b_sq = beta**2
+        weight = (1.0 / (beta * b_sq * (j1(beta) ** 2 + y1(beta) ** 2)) - (np.pi / 2.0) / (1.0 + b_sq)) * beta * step
+        x = fo[:, None] * b_sq
+        peeled = fo + 1.0 - erfcx(np.sqrt(fo)) - 2.0 * np.sqrt(fo / np.pi)
+        return peeled / (2.0 * np.pi) + (2.0 / np.pi**3) * ((x + np.expm1(-x)) / b_sq) @ weight
+
+    np.testing.assert_allclose(heat._cylinder_integral(fo), refined(-30.0, 16.0, 0.05), rtol=1e-12)
+    np.testing.assert_allclose(refined(-30.0, 16.0, 0.05), refined(-26.0, 13.0, 0.075), rtol=1e-12)
+
+
+def test_deficit_kernel_pins_the_first_lag_bin_share_of_the_soil_resistance():
+    """``Dbar[0]/R_soil`` for the four pipe-and-bin combinations of issue #9's table.
+
+    This ratio is what sets the same-bin loop gain, so it is the number that decides whether
+    the two-way fixed point is well conditioned on a given pipe. It is pinned here per
+    geometry because the line source it replaces put the 400 mm row at 1.0000 -- no margin at
+    all -- and that regime returned delivered temperatures spanning hundreds of kelvin.
+    """
+    d_eff = 1.0 + GRASS["kappa"] / GRASS["eta"]
+    expected = {(0.1, 1.0 / 24.0): 0.8568, (0.1, 1.0): 0.5870, (0.4, 1.0 / 24.0): 0.9323, (0.4, 1.0): 0.7338}
+    for (diameter, dt), share in expected.items():
+        r_outer = diameter / 2.0
+        dbar = heat._deficit_kernel(
+            1,
+            dt,
+            r_o=np.array([r_outer]),
+            d_eff=np.array([d_eff]),
+            alpha=np.array([GRASS["alpha"]]),
+            kappa=np.array([GRASS["kappa"]]),
+        )[0]
+        r_inf = np.log(2.0 * d_eff / r_outer) / (2.0 * np.pi * GRASS["kappa"])
+        np.testing.assert_allclose(dbar[0] / r_inf, share, atol=5e-5, err_msg=f"{diameter} m at dt={dt} d")
+
+
+def test_deficit_kernel_shares_one_solve_between_identical_geometries():
+    """Segments are grouped by Fourier number per bin, and the grouping is exact.
+
+    The pipe term is the one kernel in the module that is not closed-form, so it is evaluated
+    once per distinct ``alpha dt / r_o**2`` and broadcast. Rows that share that number must
+    come back bit-identical, and a row that does not share it must not be given its answer.
+    """
+    d_eff = np.array([1.0605, 1.0605, 1.0605, 2.0])
+    dbar = heat._deficit_kernel(
+        5,
+        1.0 / 24.0,
+        r_o=np.array([0.05, 0.2, 0.05, 0.05]),
+        d_eff=d_eff,
+        alpha=np.array([0.05, 0.05, 0.05, 0.05]),
+        kappa=np.array([0.025, 0.025, 0.025, 0.025]),
+    )
+    np.testing.assert_array_equal(dbar[0], dbar[2])
+    assert not np.allclose(dbar[0], dbar[1]), "a 400 mm main must not reuse the 100 mm kernel"
+    # Same Fourier number, different burial: only the image term may differ, and it does.
+    assert not np.allclose(dbar[0], dbar[3])
 
 
 def test_deficit_kernel_saturates_at_the_steady_buried_pipe_resistance():
@@ -328,6 +493,12 @@ def test_deficit_kernel_tail_follows_the_physical_law():
 
     Reading the constant off the tail constrains the diffusivity and the conductivity
     separately -- unlike the saturation limit, whose argument ratio is diffusivity-free.
+
+    Two terms are needed and both are physical. The line-source part is what is left of the
+    image that has not arrived. On top of it the cylinder reaches its own line-source limit
+    from *above*, by ``r_o**2 (ln(4 alpha tau / r_o**2) - gamma + 1/2) / (8 pi kappa alpha
+    tau)``, so the deficit is smaller by that much; dropping it puts the prediction 1.6 % out
+    at the lags below, an order above the tolerance asserted here.
     """
     r_outer, d_eff, alpha, kappa = 0.05, 1.0605, 0.05, 0.025
     dt = 200.0
@@ -335,8 +506,9 @@ def test_deficit_kernel_tail_follows_the_physical_law():
         60, dt, r_o=np.array([r_outer]), d_eff=np.array([d_eff]), alpha=np.array([alpha]), kappa=np.array([kappa])
     )[0]
     lag = dt * (np.arange(60) + 0.5)
-    predicted = ((2.0 * d_eff) ** 2 - r_outer**2) / (16.0 * np.pi * kappa * alpha)
-    np.testing.assert_allclose(dbar[-1] * lag[-1], predicted, rtol=2e-3)
+    image = ((2.0 * d_eff) ** 2 - r_outer**2) / (16.0 * np.pi * kappa * alpha)
+    overshoot = r_outer**2 * (np.log(4.0 * alpha * lag[-1] / r_outer**2) - np.euler_gamma + 0.5)
+    np.testing.assert_allclose(dbar[-1] * lag[-1], image - overshoot / (8.0 * np.pi * kappa * alpha), rtol=2e-3)
 
 
 def test_deficit_kernel_is_finite_at_zero_lag(recwarn):
@@ -441,6 +613,42 @@ def test_segment_heat_rate_accepts_per_segment_series(heat_network):
     )
     assert rates.iloc[0] != uniform.iloc[0]
     np.testing.assert_allclose(rates.iloc[1:], uniform.iloc[1:], rtol=1e-14)
+
+
+def test_segment_heat_rate_rejects_a_pipe_that_is_not_fully_buried(soil):
+    """The guard is the geometric minimum ``d_eff > r_o``, not half of it.
+
+    ``ln(2 d_eff/r_o)`` stays positive all the way down to ``d_eff = r_o/2``, so a guard
+    written on its domain admits pipes standing half out of the ground, where the exact
+    ``acosh(d_eff/r_o)`` it approximates does not exist at all. The resistance then collapses
+    toward zero and the rate diverges: a 1 m main whose axis sits at 0.2505 m is twenty times
+    faster than a 100 mm service line. That rate drives the whole coupled solve, which is why
+    the second half of this test matters -- with the loose guard the two-way model converged,
+    quietly and without exceeding ``max_sweeps``, on a delivered temperature far below every
+    input.
+    """
+    segments = pd.DataFrame({"from": ["P"], "to": ["A"], "length": [1000.0], "diameter": [1.0]}, index=["main"])
+    network = PipeNetwork(segments=segments, source="P")
+    for depth in (0.2505, 0.4, 0.5):
+        with pytest.raises(ValueError, match="burial depth must exceed the pipe radius"):
+            heat.segment_heat_rate(network=network, kappa=GRASS["kappa"], depth=depth)
+    just_buried = heat.segment_heat_rate(network=network, kappa=GRASS["kappa"], depth=0.5001)
+    assert np.isfinite(just_buried).all()
+    assert (just_buried > 0.0).all()
+
+    network.segments["cover"] = "grass"
+    network.segments["depth"] = 0.2
+    tedges = pd.date_range("2025-06-01", periods=25, freq="h")
+    with pytest.raises(ValueError, match="burial depth must exceed the pipe radius"):
+        heat.source_to_endmember(
+            tin=np.full(24, 8.0),
+            flow=np.full((1, 24), 500.0),
+            tedges=tedges,
+            cout_tedges=tedges,
+            network=network,
+            soil=soil,
+            surface_temperature=pd.DataFrame({"grass": np.full(24, 20.0)}),
+        )
 
 
 # ============================================================================
@@ -697,15 +905,18 @@ def _local_reference(*, tin, t_inf, dt, tau, n_slug, r_inner, d_eff, alpha, kapp
     step = tau / n_slug
     n_steps = len(tin) * per
 
-    # Bin-averaged deficit on the sub-step grid, from the physical parameters: the line
-    # source at the wall minus its mirror image at 2 d_eff, integrated in closed form.
+    # Bin-averaged deficit on the sub-step grid, from the physical parameters: the
+    # constant-flux cylinder at the wall, inverted from its Laplace transform rather than
+    # taken from the package, minus its mirror image at 2 d_eff, which is a line source and
+    # integrates in closed form.
     lag = step * np.arange(n_steps + 2)
-    integral = np.zeros((2, len(lag)))
-    for row, c in enumerate((r_inner**2 / (4.0 * alpha), (2.0 * d_eff) ** 2 / (4.0 * alpha))):
-        with np.errstate(divide="ignore", over="ignore"):
-            x = c / lag[1:]
-            integral[row, 1:] = (lag[1:] + c) * exp1(x) - lag[1:] * np.exp(-x)
-    deficit = np.diff(r_inf * lag - (integral[0] - integral[1]) / (4.0 * np.pi * kappa)) / step
+    c_image = (2.0 * d_eff) ** 2 / (4.0 * alpha)
+    image = np.zeros(len(lag))
+    with np.errstate(divide="ignore", over="ignore"):
+        x = c_image / lag[1:]
+        image[1:] = (lag[1:] + c_image) * exp1(x) - lag[1:] * np.exp(-x)
+    pipe = r_inner**2 / (kappa * alpha) * _cylinder_integral_by_laplace(alpha * lag / r_inner**2)
+    deficit = np.diff(r_inf * lag - pipe + image / (4.0 * np.pi * kappa)) / step
 
     rate = 1.0 / ((r_other + r_inf) * area)
     survive = np.exp(-rate * step)
@@ -971,6 +1182,54 @@ def test_each_segment_relaxes_toward_its_own_cover_and_depth(
         np.testing.assert_array_equal(system.t_inf[row], expected, err_msg=f"segment {name} ({cover}, {depth} m)")
 
 
+def test_the_pipe_wall_moves_the_radius_the_halo_is_read_at(heat_pipe, soil):
+    """``kappa_pipe`` reaches the halo, not only the exchange rate.
+
+    A walled pipe carries its wall flux across the *outer* surface, so the deficit kernel has
+    to be read at ``r_i + wall_thickness`` while the rate picks up the wall resistance in
+    series. The two are wired separately inside ``_build_system`` and only the rate has an
+    end-to-end consequence large enough to notice, so the radius is asserted white-box and
+    bit-exactly: reading the kernel at ``r_i`` instead moves the delivered temperature by
+    5e-3 K on this pipe -- above round-off but far below anything a black-box tolerance would
+    catch -- and by 0.3 K on a 400 mm main.
+    """
+    heat_pipe.segments["wall_thickness"] = 0.0065
+    n = 72
+    tedges = pd.date_range("2025-06-01", periods=n + 1, freq="h")
+    volume = float(heat_pipe.segments.loc["Plant-T1", "volume"])
+    shared = dict(
+        flow=np.full((1, n), volume / (2.0 / 24.0)),
+        tedges=tedges,
+        cout_tedges=tedges,
+        network=heat_pipe,
+        soil=soil,
+        surface_temperature=pd.DataFrame({"grass": np.full(n, 20.0), "paved": np.full(n, 20.0)}),
+    )
+    system = heat._build_system(
+        **shared,
+        surface_tedges=None,
+        nodes=None,
+        kappa_pipe=0.008,
+        film_coefficient=None,
+        spinup=None,
+    )
+    outer = heat._deficit_kernel(
+        system.n_bins,
+        1.0 / 24.0,
+        r_o=np.array([0.05 + 0.0065]),
+        d_eff=np.array([1.0 + GRASS["kappa"] / GRASS["eta"]]),
+        alpha=np.array([GRASS["alpha"]]),
+        kappa=np.array([GRASS["kappa"]]),
+    )[0]
+    np.testing.assert_array_equal(system.dbar[0], outer)
+
+    # And the series resistance still points the right way end to end.
+    tin = np.full(n, 8.0)
+    bare = float(np.nanmean(heat.source_to_endmember(tin=tin, **shared)))
+    walled = float(np.nanmean(heat.source_to_endmember(tin=tin, kappa_pipe=0.008, **shared)))
+    assert 8.0 < walled < bare, (walled, bare)
+
+
 def test_the_halo_stores_heat_and_gives_it_back(heat_pipe):
     """The memory reverses sign when the flux does, which is what makes it a memory.
 
@@ -1062,6 +1321,60 @@ def test_the_delivered_temperature_overshoots_the_forcing_range_by_a_measured_am
     )
     split = heat.source_to_endmember(**{**shared, "network": halves})[0]
     assert (21.0 - np.nanmin(split)) / contrast < 0.5 * excursion
+
+
+def test_stagnation_turns_the_overshoot_warm_and_refining_makes_it_worse(soil):
+    """The excursion under a duty cycle: warm side, much larger, and *grown* by refining.
+
+    The test above is the mild case, a step into a continuously flowing pipe, and neither of
+    its two conclusions survives an idle period. A bin with no throughflow contributes no wall
+    flux, so a pipe standing idle builds no halo while it stands idle; the first water out
+    afterwards meets a halo the model never built, and the target overshoots on the *warm*
+    side instead. Declaring the pipe as a chain of shorter segments then makes it worse rather
+    than severalfold better --- the opposite of what it does under continuous flow --- which
+    is why the module documents ``max_sweeps=1`` as the only answer guaranteed inside its own
+    hull, and why the user guide tells you to check that refining settles before trusting it.
+
+    This is also the only configuration in the file with zero flow anywhere, so it is what
+    exercises the stagnation assumption end to end rather than as a statement in the docs.
+    """
+    days, idle = 6, 8
+    n = 24 * days
+    tedges = pd.date_range("2025-06-01", periods=n + 1, freq="h")
+    contrast = 20.0 - 8.0
+
+    def excursion(pieces):
+        """Warm-side excursion past the soil, as a fraction of the contrast."""
+        nodes = ["Plant", *[f"n{i}" for i in range(1, pieces)], "T1"]
+        segments = pd.DataFrame(
+            {
+                "from": nodes[:-1],
+                "to": nodes[1:],
+                "length": [1000.0 / pieces] * pieces,
+                "diameter": [0.1] * pieces,
+                "cover": ["grass"] * pieces,
+            },
+            index=[f"s{i}" for i in range(pieces)],
+        )
+        network = PipeNetwork(segments=segments, source="Plant")
+        volume = float(network.segments["volume"].sum())
+        duty = np.concatenate([np.zeros(idle), np.full(24 - idle, volume / (2.0 / 24.0))])
+        shared = dict(
+            tin=np.full(n, 8.0),
+            flow=np.tile(duty, days)[None, :],
+            tedges=tedges,
+            cout_tedges=tedges,
+            network=network,
+            soil=soil,
+            surface_temperature=pd.DataFrame({"grass": np.full(n, 20.0), "paved": np.full(n, 20.0)}),
+        )
+        one_way = heat.source_to_endmember(**shared, max_sweeps=1)
+        assert np.nanmax(one_way) <= 20.0 + 1e-9, "the one-way model must stay inside its hull"
+        return (np.nanmax(heat.source_to_endmember(**shared)) - 20.0) / contrast
+
+    whole, refined = excursion(1), excursion(4)
+    assert 0.20 < whole < 0.28, whole
+    assert refined > whole, (whole, refined)
 
 
 def test_the_model_is_linear_in_every_temperature_input(heat_network, hourly_tedges, diurnal_demand, soil, surface):

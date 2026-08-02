@@ -7,17 +7,21 @@ pipe's thermal resistance -- first-order decay toward a moving target instead of
 zero -- so the delivered temperature is an *affine* reading of the same transport operator
 the rest of this package uses: ``T_out = W @ T_in + b``, with ``W`` built with the
 per-segment exchange rate in the decay-rate slot and ``b`` the soil's contribution
-accumulated along each path. Three exact, closed-form kernels carry all the soil physics:
+accumulated along each path. Three kernels carry all the soil physics, each exact for
+piecewise-constant inputs and two of the three in closed form:
 
 - **Surface to depth**: the undisturbed soil temperature at pipe depth is the superposition
   of Robin-boundary step responses of the half space, driven by the piecewise-constant
   sol-air temperature per land cover. Bin averages use the closed-form time integral of the
   step response, so a surface series that is constant per time bin maps exactly.
 - **Wall flux to wall temperature**: the warm halo the pipe builds in the soil is a
-  continuous line source plus a mirror-image sink above the surface (the image is what
-  makes the halo saturate at the steady buried-pipe resistance). Splitting its response
-  into *steady part + transient deficit* turns the two-way model into the one-way model
-  with a memory-shifted target: one short convolution of the wall-flux history per segment.
+  constant-flux cylinder at the pipe wall plus a mirror-image line sink above the surface
+  (the image is what makes the halo saturate at the steady buried-pipe resistance). The
+  cylinder is the one kernel with no closed form; it is a quadrature, evaluated once per
+  distinct Fourier number when the system is built and held to about 1e-13 relative.
+  Splitting its response into *steady part + transient deficit* turns the two-way model into
+  the one-way model with a memory-shifted target: one short convolution of the wall-flux
+  history per segment.
 - **Exchange rate**: the series resistance of the water-side film, the pipe wall and the
   soil, divided by the water column's heat capacity, gives the relaxation rate [1/day] --
   the same ``1/(D**2 ln D)``-flavoured diameter law as chlorine wall decay: service lines
@@ -74,17 +78,20 @@ segments must carry ``length``, ``diameter`` and a ``cover`` land-class column; 
 Validity
 --------
 
-- The halo is a *line* source read at the pipe wall. It is exact once the heat has
-  diffused well past the pipe itself, and it overstates the deficit of the first lag bins
-  before that, by up to about 9 % of the steady resistance around a Fourier number
-  ``alpha dt / r_o**2`` of 0.3. The deficit is the correction term rather than the leading
-  resistance, so the delivered temperature moves far less: a few hundredths of a kelvin
-  for a service line on hourly bins, and up to a few tenths for a trunk main at sub-daily
-  bins -- comparable there to the bin discretization itself. Replacing it with the
-  constant-flux cylinder response would need numerical evaluation, which is why the
-  closed form is kept. Its other cost is stiffness: the line source sends
-  ``Dbar[0]/R_soil`` to 1 for a wide pipe on short bins (1.0000 for a 400 mm main at
-  hourly bins), and that ratio is what sets the sweep count.
+- The pipe term of the halo is the constant-flux *cylinder* response, and it is the one
+  quantity in the module that is not closed-form. It is evaluated by quadrature along the
+  branch cut of its Laplace transform, once per distinct ``alpha dt / r_o**2`` at build
+  time, and holds about 1e-13 relative over every Fourier number reachable here. The image
+  keeps its line source, at a cost of the same order as the steady resistance's own
+  ``ln(2 d_eff/r_o)`` shape factor already carries: 2e-4 of ``R_soil`` for a 100 mm service
+  line buried a metre and 3.5e-3 for a 400 mm main, both growing as the burial approaches
+  ``r_o``. What the cylinder buys is the first lag bin, where a line source read at ``r = r_o``
+  understates the arrived resistance badly because the heat has not yet diffused past the
+  pipe: ``Dbar[0]/R_soil`` is 0.8568 for a 100 mm service line and 0.9323 for a 400 mm main
+  on hourly bins, against 0.9418 and 1.0000 for the line source -- the second of which left
+  the same-bin loop gain no margin at all. That ratio sets the sweep count and how far the
+  fixed point sits from singular, so the swap cuts the sweep count severalfold as well:
+  100 against 286 on the example network, 159 against 660 on a 400 mm main.
 - **One wall-flux history per pipe.** The soil columns along a pipe are independent and the
   wall flux falls along it like ``exp(-h tau)`` -- by a factor 1.6 over a 2 h transit on a
   100 mm service line -- but the model gives every parcel in a pipe the same soil memory.
@@ -106,17 +113,23 @@ Validity
   the bins after a sharp change in the wall flux. The delivered temperature is a weighted
   average of ``tin`` and those targets, so it can leave the range of its own inputs, and
   there is no general bound on by how much. A step in ``tin`` into a *continuously flowing*
-  pipe is the mild case and the one the figure usually quoted describes: 20 % of the
+  pipe is the mild case and the one the figure usually quoted describes: 18 % of the
   instantaneous plant-to-soil contrast, 1.9 transits after the step, back inside the range
   after nine days, falling to 1-4 % once the pipe is split. **Intermittent demand is far
-  worse and does not decay.** A line idle 16 h a day delivers water 66 % of the contrast past
+  worse and does not decay.** A line idle 16 h a day delivers water 59 % of the contrast past
   the soil, settling at a third of the contrast and recurring every duty cycle for as long as
-  the duty cycle lasts; at 20-22 h idle it reaches 81-85 %. Splitting does not rescue it --
-  on such a branch the criterion below usually declines to split at all, and where it does
-  split the excursion can *grow* (47 % unsplit against 75 % at four pieces on one 12 h-idle
-  line). Only ``max_sweeps=1`` is guaranteed inside the range of its inputs.
-  For wide pipes there is a further regime in which this becomes unusable rather than merely
-  large; see the bin-width note above.
+  the duty cycle lasts; at 20-22 h idle it reaches 71-75 %. Resolving the pipe does not rescue
+  it and makes it worse: declaring one 12 h-idle line as four segments grows the excursion
+  from 44 % to 62 %. Only ``max_sweeps=1`` is guaranteed inside the range of its inputs.
+  Wide pipes on short bins were once worse than any of this -- with the line-source halo a
+  400 mm main at a half-hour transit came back spanning -88 to +78 C from water produced at
+  8 C into soil at 22 C, converged and without a warning, and refining ``tedges`` made it
+  worse. The cylinder response closes that regime: the same pipe now delivers 8.2-9.0 C
+  against a one-way 8.15 C, and no bin width reopens it. That is the *continuous-flow* wide
+  pipe only. Intermittent demand on one still reaches several times the contrast, and where
+  the running transit is shorter than a bin it reaches far more -- and because the cylinder
+  kernel contracts where the line source diverged, some of those now return silently instead
+  of raising.
 - Bins in which a segment has no throughflow contribute zero wall flux to the halo, so the
   soil around a stagnant branch is treated as undisturbed while the water in it goes on
   relaxing exactly. Overnight stagnation of a service line reaches ``h tau`` of order 2,
@@ -140,7 +153,7 @@ import numpy as np
 import numpy.typing as npt
 import pandas as pd
 from scipy.signal import fftconvolve
-from scipy.special import erfc, erfcx, exp1
+from scipy.special import erfc, erfcx, exp1, j1, y1
 
 from pipetransport._transfer import NetworkTransfer, apply_segment_targets, paths_transfer, resolve_spinup
 from pipetransport._validation import _validate_no_nan, _validate_positive, _validate_tedges
@@ -227,6 +240,59 @@ def _halo_integral(c: npt.NDArray[np.floating], lag: npt.NDArray[np.floating]) -
     return out
 
 
+def _cylinder_integral(fo: npt.NDArray[np.floating]) -> npt.NDArray[np.floating]:
+    """``integral_0^fo Ghat(s) ds`` of the constant-flux cylinder, elementwise and dimensionless.
+
+    A pipe is a cylinder, not a line: the wall flux leaves over a surface of radius ``r_o``,
+    and until the heat has diffused well past that radius the line source read at ``r = r_o``
+    understates the wall temperature badly. The exact constant-flux cylinder response has no
+    closed form, but its Laplace transform does -- ``K0(z) / (2 pi kappa s z K1(z))`` with
+    ``z = r_o sqrt(s/alpha)`` -- and wrapping the Bromwich contour around the branch cut
+    turns it into a real integral in the dimensionless wavenumber ``b = u r_o``,
+
+    ``Ghat(Fo) = (2/pi**3) integral_0^inf (1 - exp(-Fo b**2)) w(b) db``,
+    ``w(b) = 1 / (b**3 (J1(b)**2 + Y1(b)**2))``,
+
+    with ``Ghat`` the wall temperature per unit flux in units of ``1/kappa``: the physical
+    response is ``G(t) = Ghat(alpha t / r_o**2) / kappa``. It carries both limits, the one the
+    line source misses and the one it reaches -- ``sqrt(Fo/pi)/pi`` as ``Fo -> 0`` (a plane,
+    because the wall is locally flat) and ``E1(1/(4 Fo))/(4 pi)`` as ``Fo -> inf`` (the line
+    source itself).
+
+    The time integral is what the deficit needs, and it is the same integral with the factor
+    ``(x + expm1(-x))/b**2`` in place of ``1 - exp(-x)``, ``x = Fo b**2``. Its tail decays only
+    as ``1/b**2``, so the ``(pi/2)/(1 + b**2)`` part of ``w`` -- which carries that whole tail
+    -- is peeled off and integrated in closed form, leaving a residue that decays as
+    ``1/b**4``. In ``y = ln b`` what is left falls off exponentially at both ends, where the
+    trapezoidal rule converges geometrically, so a fixed 360-node grid holds the result to
+    about 1e-13 relative over every Fourier number this package can reach.
+
+    Parameters
+    ----------
+    fo : ndarray
+        Fourier number ``alpha t / r_o**2`` [-], any shape, non-negative.
+
+    Returns
+    -------
+    ndarray
+        ``integral_0^fo Ghat(s) ds`` [-], same shape as ``fo``; 0 at ``fo = 0``.
+    """
+    fo = np.asarray(fo, dtype=float)
+    beta = np.exp(np.arange(-24.0, 12.0, 0.1))
+    b_sq = np.square(beta)
+    residue = 1.0 / (beta * b_sq * (np.square(j1(beta)) + np.square(y1(beta)))) - (np.pi / 2.0) / (1.0 + b_sq)
+    weight = residue * beta * (0.1 * 2.0 / np.pi**3)
+    # The (fo x beta) exponential matrix is built in bounded chunks, as in soil_temperature,
+    # so a year of hourly lag bins does not materialize at once.
+    ravelled, quadrature = fo.reshape(-1), np.empty(fo.size)
+    chunk = max(1, 8_388_608 // len(beta))
+    for lo in range(0, fo.size, chunk):
+        x = ravelled[lo : lo + chunk, None] * b_sq
+        quadrature[lo : lo + chunk] = ((x + np.expm1(-x)) / b_sq) @ weight
+    peeled = fo + 1.0 - erfcx(np.sqrt(fo)) - 2.0 * np.sqrt(fo / np.pi)
+    return peeled / (2.0 * np.pi) + quadrature.reshape(fo.shape)
+
+
 def _deficit_kernel(
     n_bins: int,
     dt_days: float,
@@ -238,11 +304,20 @@ def _deficit_kernel(
 ) -> npt.NDArray[np.floating]:
     """Bin-averaged transient deficit ``Dbar[m]`` of every segment, shape ``(n_seg, n_bins)``.
 
-    The wall-temperature step response of a continuous line source at the outer pipe radius,
-    with its mirror image at ``2 d_eff``, is ``G(t) = [E1(c_o/t) - E1(c_i/t)]/(4 pi kappa)``,
-    saturating at the steady buried-pipe resistance ``R_inf = ln(2 d_eff/r_o)/(2 pi kappa)``.
-    The deficit ``D = R_inf - G`` is what has *not yet arrived*; its exact bin average over
-    lag bin ``m`` comes from the closed-form time integral of ``G``.
+    The wall-temperature step response is the constant-flux cylinder at the outer pipe radius
+    (:func:`_cylinder_integral`) minus a mirror-image line sink at ``2 d_eff``, which is what
+    makes the halo saturate at the steady buried-pipe resistance
+    ``R_inf = ln(2 d_eff/r_o)/(2 pi kappa)``. The image keeps its closed form
+    ``E1(c_i/t)/(4 pi kappa)``: a cylinder read from ``2 d_eff`` away rather than from its own
+    wall is a line to the same order the *steady* resistance above already is, and it costs
+    the same order too -- at most 2e-4 of ``R_inf`` for a 100 mm service line buried a metre
+    and 3.5e-3 for a 400 mm main, against the 1e-4 and 3.8e-3 that ``ln(2 d_eff/r_o)`` itself
+    gives up against ``acosh(d_eff/r_o)``. Both grow as the burial approaches ``r_o``.
+
+    The deficit ``D = R_inf - G`` is what has *not yet arrived*; its bin average over lag bin
+    ``m`` comes from the time integral of ``G``, closed-form for the image and quadrature for
+    the pipe. Only the dimensionless Fourier number per bin, ``alpha dt / r_o**2``, enters the
+    pipe term, so it is evaluated once per distinct value and shared by the segments on it.
 
     Parameters
     ----------
@@ -259,11 +334,17 @@ def _deficit_kernel(
     ndarray
         ``Dbar`` [day/m²] per segment and lag bin; ``Dbar[:, 0]`` is ``R_inf - Gbar(dt)``.
     """
-    c_o = (r_o**2 / (4.0 * alpha))[:, None]
     c_i = ((2.0 * d_eff) ** 2 / (4.0 * alpha))[:, None]
     r_inf = (np.log(2.0 * d_eff / r_o) / (2.0 * np.pi * kappa))[:, None]
-    lag = dt_days * np.arange(n_bins + 1)[None, :]
-    cumulative = r_inf * lag - (_halo_integral(c_o, lag) - _halo_integral(c_i, lag)) / (4.0 * np.pi * kappa[:, None])
+    edge = np.arange(n_bins + 1)[None, :]
+    lag = dt_days * edge
+    fo_bin, segment_of = np.unique(alpha * dt_days / r_o**2, return_inverse=True)
+    cylinder = _cylinder_integral(fo_bin[:, None] * edge)[segment_of]
+    cumulative = (
+        r_inf * lag
+        - (r_o**2 / (kappa * alpha))[:, None] * cylinder
+        + _halo_integral(c_i, lag) / (4.0 * np.pi * kappa[:, None])
+    )
     return np.diff(cumulative, axis=1) / dt_days
 
 
@@ -505,7 +586,14 @@ def segment_heat_rate(
     kappa : float or pandas.Series
         Soil conductivity over the water heat capacity [m²/day], per segment or shared.
     depth : float or pandas.Series, optional
-        Burial depth to the pipe axis [m]. Default 1.0.
+        Burial depth to the pipe axis [m]. Default 1.0. It must put the pipe below the
+        surface, ``d_eff > r_o``; the exact shape factor ``acosh(d_eff/r_o)`` does not exist
+        below that and the ``ln(2 d_eff/r_o)`` used here runs away to a divergent rate rather
+        than to an error. That log is the large-``d/r`` limit of the exact factor and
+        overstates it by ``1/(4 (d_eff/r_o)**2)``, so accuracy is a matter of how far above
+        the guard the pipe is: 0.01 % for a 100 mm service line and 0.4 % for a 400 mm main
+        at a metre, 5.3 % at ``d_eff = 2 r_o``, 24 % for a DN1600 there, and 117 % for a
+        DN2000 -- leaving the default depth on a transmission main is the mis-entry to watch.
     eta : float or pandas.Series or None, optional
         Surface film coefficient [m/day]. ``None`` (default) or ``inf`` is a
         prescribed-temperature surface (no displacement).
@@ -539,7 +627,7 @@ def segment_heat_rate(
     ------
     ValueError
         If a required column is missing, a Series misses a segment, a parameter is not
-        positive, or the geometry gives ``2 d_eff <= r_o``.
+        positive, or the geometry gives ``d_eff <= r_o``.
 
     See Also
     --------
@@ -596,8 +684,8 @@ def segment_heat_rate(
         wall_resistance = np.log(r_o / r_i) / (2.0 * np.pi * kappa_pipe_seg)
 
     d_eff = depth_seg if eta_seg is None else depth_seg + kappa_seg / eta_seg
-    if not np.all(2.0 * d_eff > r_o):
-        msg = "burial depth must exceed the pipe radius (2 * d_eff > r_o); the line-source geometry needs d >> r"
+    if not np.all(d_eff > r_o):
+        msg = "burial depth must exceed the pipe radius (d_eff > r_o); the line-source geometry needs d >> r"
         raise ValueError(msg)
     film_resistance = np.zeros(len(segments))
     if film_coefficient is not None:
@@ -1057,10 +1145,10 @@ def source_to_endmember(
         Iteration cap. 1 is the one-way model. The sweep count is a property of the physics,
         not of the record length: it is set by how much of the steady soil resistance the
         first lag bin still holds, ``Dbar[0] / R_soil``, which rises toward 1 for wide pipes
-        on short bins. A few hundred sweeps is typical (286 on the example network at hourly
-        bins, unchanged from 30 days of record to a year), but a 400 mm main on hourly bins
-        needs about 1200. Exceeding the cap raises rather than returning an unconverged
-        answer. Default 5000.
+        on short bins. A hundred or two is typical (100 on the example network at
+        hourly bins, unchanged from 30 days of record to a year), and a 400 mm main run at a
+        0.5 m/s design velocity on hourly bins needs about 160. Exceeding the cap
+        raises rather than returning an unconverged answer. Default 5000.
     atol : float, optional
         Convergence tolerance on the relaxation-target increment, absolute and in the unit of
         the temperature inputs. Default 1e-9, several orders below anything a temperature
