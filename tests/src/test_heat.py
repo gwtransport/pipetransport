@@ -2514,6 +2514,15 @@ def test_output_grid_may_differ_from_the_input_grid(heat_network, hourly_tedges,
             "cover class",
         ),
         (lambda kwargs: kwargs.update(nodes=["nowhere"]), "unknown node"),
+        (lambda kwargs: kwargs.update(max_sweeps=0), "max_sweeps must be at least 1"),
+        (
+            lambda kwargs: kwargs.update(
+                surface_temperature=kwargs["surface_temperature"].assign(
+                    grass=lambda frame: np.concatenate([[np.nan], frame["grass"].to_numpy()[1:]])
+                )
+            ),
+            "NaN",
+        ),
     ],
 )
 def test_invalid_input_is_rejected(heat_network, hourly_tedges, diurnal_demand, soil, surface, mutate, message):
@@ -2531,6 +2540,67 @@ def test_invalid_input_is_rejected(heat_network, hourly_tedges, diurnal_demand, 
     mutate(kwargs)
     with pytest.raises(ValueError, match=message):
         heat.source_to_endmember(**kwargs)
+
+
+def test_the_public_surface_holds_at_its_edges(heat_network, soil, surface):
+    """Six shapes of call that are legal, rarely written, and easy to break by accident.
+
+    None of these is a guard: every one already behaves correctly, and the point is that a
+    future change cannot quietly stop it. Reporting at an internal node or at the plant
+    itself, an output grid that does not overlap the input one, a soil table carrying a cover
+    no pipe uses, a mix of finite and infinite surface coefficients, and a surface record that
+    starts well before the period of interest -- which is the usage the docstring recommends
+    and the only one that gives the soil field a developed history.
+    """
+    tedges = pd.date_range("2025-06-01", periods=2 * 24 + 1, freq="h")
+    n = len(tedges) - 1
+    flow = np.full((len(heat_network.endmembers), n), 300.0)
+    common = {
+        "tin": np.full(n, 8.0),
+        "flow": flow,
+        "tedges": tedges,
+        "network": heat_network,
+        "soil": soil,
+        "surface_temperature": surface(tedges, amplitude=2.0),
+    }
+
+    # an internal node, and the source itself: a depth-0 path delivers the source unchanged
+    internal = heat.source_to_endmember(cout_tedges=tedges, nodes=["A"], **common)
+    assert np.isfinite(internal).all()
+    at_source = heat.source_to_endmember(cout_tedges=tedges, nodes=["Plant"], **common)
+    np.testing.assert_array_equal(at_source, np.full((1, n), 8.0))
+
+    # an output grid that the record never reaches: every bin unconstrained, no exception
+    elsewhere = pd.date_range("2025-08-01", periods=25, freq="h")
+    assert np.isnan(heat.source_to_endmember(cout_tedges=elsewhere, nodes=["T1"], **common)).all()
+
+    # a cover class no pipe uses must not change the answer
+    spare = pd.concat([soil, soil.iloc[[0]].rename(index={soil.index[0]: "gravel"})])
+    spare_surface = surface(tedges, amplitude=2.0).assign(gravel=15.0)
+    np.testing.assert_array_equal(
+        heat.source_to_endmember(
+            cout_tedges=tedges, nodes=["T1"], **{**common, "soil": spare, "surface_temperature": spare_surface}
+        ),
+        heat.source_to_endmember(cout_tedges=tedges, nodes=["T1"], **common),
+    )
+
+    # a prescribed-temperature surface over one cover and a film over the other
+    mixed = soil.copy()
+    mixed.loc["paved", "eta"] = np.inf
+    assert np.isfinite(heat.source_to_endmember(cout_tedges=tedges, nodes=["T1"], **{**common, "soil": mixed})).all()
+
+    # the recommended usage: a surface record reaching back before the period of interest
+    long_tedges = pd.date_range("2025-05-02", periods=32 * 24 + 1, freq="h")
+    early = heat.source_to_endmember(
+        cout_tedges=tedges,
+        nodes=["T1"],
+        surface_tedges=long_tedges,
+        **{**common, "surface_temperature": surface(long_tedges, amplitude=2.0)},
+    )
+    assert np.isfinite(early).all()
+    assert not np.allclose(early, heat.source_to_endmember(cout_tedges=tedges, nodes=["T1"], **common)), (
+        "a developed soil history has to change the answer, or the argument does nothing"
+    )
 
 
 def test_missing_geometry_columns_are_reported(heat_network, hourly_tedges, diurnal_demand, soil, surface):
