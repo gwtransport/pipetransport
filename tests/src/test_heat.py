@@ -272,6 +272,31 @@ def test_soil_temperature_holds_the_pre_history_before_the_surface_record():
     assert out[-1] > 9.0
 
 
+@pytest.mark.parametrize(
+    "surface_freq",
+    ["12h", "D"],
+    ids=["finer than the output grid", "coarser than the output grid"],
+)
+def test_soil_temperature_rejects_a_surface_grid_of_a_different_width(surface_freq):
+    """The superposition is a convolution only while both grids share one bin width.
+
+    The lag of an (output edge, surface step) pair is then a function of their index
+    difference alone, which is what turns a quadratic matrix product into a transform. A
+    surface record on its own spacing has to be resampled by the caller, who knows whether
+    interpolating or bin-averaging it is the right thing to do.
+    """
+    tedges = pd.date_range("2025-01-01", periods=25, freq="h")
+    surface_tedges = pd.date_range("2025-01-01", periods=5, freq=surface_freq)
+    with pytest.raises(ValueError, match="uniform bin width"):
+        heat.soil_temperature(
+            surface_temperature=np.full(len(surface_tedges) - 1, 20.0),
+            tedges=tedges,
+            surface_tedges=surface_tedges,
+            depth=1.0,
+            **GRASS,
+        )
+
+
 # ============================================================================
 # Kernels: the halo
 # ============================================================================
@@ -841,6 +866,31 @@ def test_batched_nodes_of_mixed_depth_agree_with_single_node_calls(heat_network,
         alone = _build_operator(heat_network, demand, short_tedges, rates, nodes=[node])
         np.testing.assert_allclose(apply_segment_targets(alone, targets)[0], batched_bias[row], rtol=1e-13)
         np.testing.assert_array_equal(alone.valid_out[0], batched.valid_out[row])
+
+
+def test_target_terms_carry_only_the_rows_still_on_a_path(heat_network, short_tedges, diurnal_demand):
+    """The per-depth factors are stored ragged, over the rows that reach that depth.
+
+    A row padded out to a deeper path's width contributes an exact zero at its trailing
+    slots, and the bias operator is ``O(max_depth**2 * n_rows * n_cin)``, so carrying them
+    is both the depth loop's and the operator's largest avoidable cost. The row order is an
+    implementation detail; the counts are the contract.
+    """
+    demand = heat_network.flow_array(diurnal_demand(heat_network, short_tedges))
+    rates = _rate(heat_network, depth=heat_network.segments["depth"]).to_numpy()
+    nodes = ["A", "B", "T4"]  # paths of depth 1, 2 and 3
+    terms = _build_operator(heat_network, demand, short_tedges, rates, nodes=nodes).target_terms
+
+    depths = np.array([len(heat_network.paths[node]) for node in nodes])
+    for depth, offset in enumerate(terms.row_offset):
+        expected = int(np.count_nonzero(depths > depth))
+        for name in ("mean_shift", "bin_entry", "bin_exit", "gap"):
+            assert len(getattr(terms, name)[depth]) == expected, f"{name}[{depth}]"
+        assert len(offset) == expected
+        # Stage ``d + 1`` is also depth ``d + 1``'s entry piece, so it carries depth d's rows.
+        assert len(terms.mean_down[depth + 1]) == expected
+    assert len(terms.mean_down) == len(terms.row_offset) + 1
+    assert min(len(slab) for slab in terms.mean_shift) < len(nodes), "no depth was compacted"
 
 
 # ============================================================================
@@ -1466,7 +1516,7 @@ def test_inert_copy_makes_the_entry_row_the_same_water(heat_network, short_tedge
     )
     rng = np.random.default_rng(41)
     tin = 9.0 + rng.normal(0.0, 1.0, system.n_bins)
-    t_int = heat._internal_pass(system, tin, system.t_inf)
+    t_int = heat._internal_pass(system, heat._apply(system.internal, tin), system.t_inf)
     n_seg = len(heat_network.segments)
     entry, delivered = t_int[:n_seg], t_int[n_seg:]
 
@@ -1545,7 +1595,10 @@ def test_wall_flux_vanishes_without_a_temperature_difference(heat_network, hourl
         film_coefficient=None,
         spinup="constant",
     )
-    targets = heat._update_targets(system, heat._internal_pass(system, np.full(system.n_bins, 14.0), system.t_inf))
+    uniform = np.full(system.n_bins, 14.0)
+    targets = heat._update_targets(
+        system, heat._internal_pass(system, heat._apply(system.internal, uniform), system.t_inf)
+    )
     np.testing.assert_allclose(targets, system.t_inf, atol=1e-11)
 
 
@@ -1687,6 +1740,44 @@ def test_the_fixed_point_does_not_depend_on_how_long_the_record_runs(heat_pipe):
     # And the halo really is still developing over those 90 days, so the agreement above is
     # not the trivial one of a signal that has already settled.
     assert abs(float(np.nanmean(longest[-24:]) - np.nanmean(short[-24:]))) > 0.1
+
+
+def test_an_over_cap_branch_does_not_void_the_warm_start_of_the_whole_network(soil, surface):
+    """One branch too long to warm-start must cost only itself its padding.
+
+    ``_build_system`` takes its warm start over every endmember path, so a single branch
+    behind a volume large enough to trip the padding cap used to leave the entire call on
+    strict validity -- including nodes whose own history is a few hours long. Unlike the
+    forward transport module the failure is unconditional here: there is no request order to
+    notice it by.
+    """
+    segments = pd.DataFrame(
+        {
+            "from": ["Plant", "A", "A"],
+            "to": ["A", "T1", "T2"],
+            "length": [1000.0, 200.0, 2.0e5],
+            "diameter": [0.3, 0.15, 1.0],
+            "cover": ["grass", "grass", "grass"],
+        },
+        index=["Plant-A", "A-T1", "A-T2"],
+    )
+    network = PipeNetwork(segments=segments, source="Plant")
+    tedges = pd.date_range("2025-06-01", periods=4 * 24 + 1, freq="h")
+    n = len(tedges) - 1
+    shared = dict(
+        tin=np.full(n, 9.0),
+        flow=pd.DataFrame({"T1": np.full(n, 400.0), "T2": np.full(n, 300.0)}),
+        tedges=tedges,
+        cout_tedges=tedges,
+        network=network,
+        soil=soil,
+        surface_temperature=surface(tedges),
+    )
+
+    out = heat.source_to_endmember(nodes=["T1", "T2"], **shared)
+
+    assert not np.isnan(out[0]).any(), "T1 sits behind 74 m3 and is warm-startable"
+    assert np.all(np.isnan(out[1])), "T2 sits behind 1.6e5 m3, well over a year of transit"
 
 
 def test_halo_memory_converges_under_bin_refinement():
@@ -1913,7 +2004,13 @@ def test_a_year_of_hourly_data_converges_and_stays_physical(heat_network, soil, 
 
 
 def test_strict_validity_marks_the_same_bins_as_transport(heat_network, hourly_tedges, diurnal_demand, soil, surface):
-    """``spinup=None`` invalidates exactly the bins the conservative model invalidates."""
+    """``spinup=None`` invalidates exactly the bins the conservative model invalidates.
+
+    Not run at ``max_sweeps=1``, tempting as that is for a test that compares only NaN
+    masks: ``spinup=None`` is what makes non-finite entries reach ``_update_targets``, so
+    this is the one test in the file that exercises the halo's NaN scrub, and skipping the
+    sweeps would leave that line unguarded.
+    """
     n = len(hourly_tedges) - 1
     strict = heat.source_to_endmember(
         tin=np.full(n, 8.0),
@@ -1968,7 +2065,12 @@ def test_a_multi_year_sub_daily_grid_counts_as_uniform(heat_pipe, freq, periods)
 
 
 def test_output_grid_may_differ_from_the_input_grid(heat_network, hourly_tedges, diurnal_demand, soil, surface):
-    """``cout_tedges`` is free in alignment and resolution."""
+    """``cout_tedges`` is free in alignment and resolution.
+
+    Run at ``max_sweeps=1``: the targets are iterated on the *internal* operator, which is
+    built on ``tedges`` whatever the output grid is, so the sweeps cannot reach the assertion
+    and the shape is settled by the reporting operator alone.
+    """
     n = len(hourly_tedges) - 1
     cout_tedges = pd.date_range(hourly_tedges[0], hourly_tedges[-1], freq="6h")
     out = heat.source_to_endmember(
@@ -1979,6 +2081,7 @@ def test_output_grid_may_differ_from_the_input_grid(heat_network, hourly_tedges,
         network=heat_network,
         soil=soil,
         surface_temperature=surface(hourly_tedges),
+        max_sweeps=1,
     )
     assert out.shape == (len(heat_network.endmembers), len(cout_tedges) - 1)
 

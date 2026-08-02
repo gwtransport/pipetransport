@@ -13,6 +13,7 @@ import pandas as pd
 import pytest
 from _oracle import OraclePath
 
+from pipetransport._transfer import network_transfer
 from pipetransport.network import PipeNetwork
 from pipetransport.transport import endmember_to_source, source_to_endmember
 from pipetransport.utils import tedges_to_days
@@ -474,6 +475,39 @@ def test_spinup_none_marks_the_leading_bins_nan(network, hourly_tedges, constant
         np.testing.assert_allclose(strict[i][both], warm[i][both], rtol=0.0, atol=1e-12)
 
 
+def test_an_over_cap_endmember_does_not_suppress_the_warm_start_of_its_siblings(hourly_tedges):
+    """The padding cap is a per-path judgement; one huge branch must not void the other rows.
+
+    Beyond a certain length a constant history stops being a meaningful assumption and the
+    warm start is dropped in favour of strict validity. Deciding that on the maximum over the
+    requested paths makes the whole call fall back together, so which nodes a caller asks for
+    silently changes the coverage the others get -- the same invariant a stagnant leading
+    segment already has to respect.
+    """
+    segments = pd.DataFrame(
+        {"from": ["Plant", "A", "A"], "to": ["A", "T1", "T2"], "volume": [300.0, 40.0, 2.0e6]},
+        index=["Plant-A", "A-T1", "A-T2"],
+    )
+    network = PipeNetwork(segments=segments, source="Plant")
+    n_bins = len(hourly_tedges) - 1
+    demand = np.array([[400.0], [300.0]]) * np.ones((2, n_bins))
+    shared = {
+        "cin": np.ones(n_bins),
+        "flow": demand,
+        "tedges": hourly_tedges,
+        "cout_tedges": hourly_tedges,
+        "network": network,
+    }
+
+    solo = source_to_endmember(nodes=["T1"], **shared)
+    both = source_to_endmember(nodes=["T1", "T2"], **shared)
+
+    assert not np.isnan(solo[0]).any(), "T1 sits behind 340 m3 and is warm-startable on its own"
+    assert np.isnan(both[1]).any(), "T2 sits behind 2e6 m3 and cannot be warm-started at all"
+    np.testing.assert_array_equal(np.isnan(both[0]), np.isnan(solo[0]))
+    np.testing.assert_allclose(both[0], solo[0], rtol=0.0, atol=1e-12)
+
+
 # ============================================================================
 # Reverse direction
 # ============================================================================
@@ -516,6 +550,108 @@ def test_round_trip_recovers_the_source_signal(network, hourly_tedges, diurnal_d
         unarrived &= ~np.isfinite(_arrival_days(network=network, demand=demand, node=node, tedges=hourly_tedges)[:-1])
     assert unarrived.any()
     assert np.array_equal(np.isnan(recovered), unarrived)
+
+
+def test_a_production_spell_comes_back_nan_not_zero(single_pipe_35):
+    """Source bins the plant produces nothing in are unconstrained, and must say so.
+
+    With every tap shut the plant delivers no water at all in those bins, so no measurement
+    anywhere can carry information about their quality. The plateau separation that keeps the
+    volume-to-time inversion single-valued leaks a sliver of label width into exactly those
+    cells; read against a bare ``> 0`` the sliver reads as "constrained" and the solve targets
+    the column at zero, so four hours of a reconstruction come back as clean water instead of
+    NaN -- indistinguishable, to a caller, from a real reading.
+    """
+    n_bins = 96
+    tedges = pd.date_range("2025-06-01", periods=n_bins + 1, freq="h")
+    demand = np.full((1, n_bins), 600.0)
+    shut = slice(33, 37)
+    demand[0, shut] = 0.0
+    cin = _reverse_signal(n_bins)
+    shared = {"flow": demand, "tedges": tedges, "cout_tedges": tedges, "network": single_pipe_35}
+
+    cout = source_to_endmember(cin=cin, **shared)
+    recovered = endmember_to_source(cout=cout, **shared)
+
+    # The spell is the only thing lost besides the tail the record ends before delivering:
+    # the transit is under two hours, so everything else arrives and is recovered.
+    unarrived = ~np.isfinite(_arrival_days(network=single_pipe_35, demand=demand, node="T1", tedges=tedges)[:-1])
+    lost = np.zeros(n_bins, dtype=bool)
+    lost[shut] = True
+    assert np.array_equal(np.isnan(recovered), lost | unarrived)
+    interior = slice(24, -24)
+    np.testing.assert_allclose(recovered[interior][~lost[interior]], cin[interior][~lost[interior]], atol=1e-6)
+
+
+def test_a_branch_closed_at_the_junction_leaves_the_crossing_bins_unconstrained(hourly_tedges):
+    """Water that passes a junction while a branch is shut delivers nothing to that branch.
+
+    Mass conservation makes the delivery exactly zero -- all of it goes to the sibling -- so
+    with only the shut branch measured those source bins carry no information either, even
+    though the plant is producing throughout. This is the routine version of the failure: a
+    works branch idle overnight, sampled at its own endmember.
+    """
+    segments = pd.DataFrame(
+        {"from": ["Plant", "A", "A"], "to": ["A", "T1", "T2"], "volume": [200.0, 40.0, 60.0]},
+        index=["Plant-A", "A-T1", "A-T2"],
+    )
+    network = PipeNetwork(segments=segments, source="Plant")
+    n_bins = len(hourly_tedges) - 1
+    hour = np.arange(n_bins) % 24
+    idle = (hour >= 19) | (hour < 7)
+    demand = np.vstack([np.full(n_bins, 400.0), np.where(idle, 0.0, 300.0)])
+    cin = _reverse_signal(n_bins)
+    shared = {
+        "flow": demand,
+        "tedges": hourly_tedges,
+        "cout_tedges": hourly_tedges,
+        "network": network,
+        "nodes": ["T2"],
+    }
+
+    cout = source_to_endmember(cin=cin, **shared)
+    recovered = endmember_to_source(cout=cout, **shared)
+
+    # Which source bins those are is settled away from the operator, with the oracle's root
+    # finder: a bin whose water both enters and leaves the junction inside one idle window
+    # goes entirely to the sibling, so no measurement at T2 carries any of it.
+    arrive = _arrival_days(network=network, demand=demand, node="A", tedges=hourly_tedges)
+    crossing = np.floor(arrive * 24.0)
+    inside = np.isfinite(arrive) & (crossing >= 0.0) & (crossing < n_bins)
+    shut_at = np.zeros(len(arrive), dtype=bool)
+    shut_at[inside] = idle[crossing[inside].astype(int)]
+    crossed_shut = (shut_at & inside)[:-1] & (shut_at & inside)[1:]
+
+    assert crossed_shut.sum() > 50, "the closed branch must swallow a large share of the record"
+    assert np.all(np.isnan(recovered[crossed_shut])), "water the branch never received cannot be reconstructed"
+    assert np.isfinite(recovered).any(), "the hours the branch does draw are still constrained"
+
+
+def test_a_long_closure_does_not_inflate_the_operator_band(single_pipe):
+    """The band width tracks the physical spread of a row, not the length of a closure.
+
+    Cells sitting on a closed-valve plateau carry no water but do carry an input-bin index,
+    so reading the band bounds off every cell stretches each row's band across the whole
+    closure. ``band_vals`` is ``(n_nodes, n_cout, full_band)`` and the banded Cholesky scales
+    with that width, so this is a memory and runtime cliff rather than a cosmetic one.
+    """
+    n_bins = 3000
+    tedges = pd.date_range("2025-06-01", periods=n_bins + 1, freq="h")
+    demand = np.full((1, n_bins), 2400.0)  # 100 m3/h through a 100 m3 pipe: one bin of transit
+    demand[0, 300:2700] = 0.0
+
+    _, transfer, _ = network_transfer(
+        network=single_pipe,
+        flow=demand,
+        tedges=tedges,
+        cout_tedges=tedges,
+        nodes=None,
+        decay_rate=0.0,
+        retardation_factor=1.0,
+        spinup=None,
+    )
+
+    assert transfer.band_vals.shape[-1] <= 4, "the physical band is one bin of transit wide"
 
 
 def test_round_trip_tolerates_a_measurement_outage(network, hourly_tedges, diurnal_demand):

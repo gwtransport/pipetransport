@@ -404,6 +404,32 @@ def test_a_stagnant_branch_does_not_suppress_the_warm_start_of_its_siblings(netw
     assert np.isnan(together[1]).any()
 
 
+@pytest.mark.parametrize("start", _SHUTDOWN_STARTS)
+def test_source_bins_inside_a_shutdown_have_no_age(single_pipe, hourly_tedges, start):
+    """No water leaves the plant while every tap is shut, so those bins have nothing to age.
+
+    ``direction="source_to_endmember"`` averages over the water that *departs* in each input
+    bin. In a shutdown no water departs, so the average is over an empty set and the
+    documented answer is NaN. The plateau separation that keeps the volume-to-time inversion
+    single-valued leaves a sliver of label width in exactly those cells, and read against a
+    bare ``> 0`` volume test the sliver reports a finite age for water that does not exist.
+    """
+    n_bins = len(hourly_tedges) - 1
+    duration = 4
+    shut = slice(start, start + duration)
+    demand = _shutdown_demand(n_bins, 500.0, start, duration)
+
+    age = full(flow=demand, tedges=hourly_tedges, network=single_pipe, direction="source_to_endmember")
+
+    assert np.all(np.isnan(age[0, shut])), "a bin that produces nothing has no residence time"
+    # Only the shutdown is lost: departures clear of it still deliver inside the record at
+    # the steady V / Q age. Bins just before the closure age further, because their water
+    # waits out the stagnation before it is delivered.
+    settled = age[0, : start - 12]
+    assert np.all(np.isfinite(settled))
+    np.testing.assert_allclose(settled, 100.0 / 500.0, rtol=1e-12)
+
+
 # ============================================================================
 # API behaviour
 # ============================================================================

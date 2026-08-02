@@ -39,6 +39,13 @@ def single_pipe():
 
 
 @pytest.fixture
+def single_pipe_35():
+    """Return a 35.34 m³ service line: at 600 m³/day the transit is well under two bins."""
+    segments = pd.DataFrame({"from": ["Plant"], "to": ["T1"], "volume": [35.34]}, index=["Plant-T1"])
+    return PipeNetwork(segments=segments, source="Plant")
+
+
+@pytest.fixture
 def two_branch():
     """Plant -> A, then A -> T1 and A -> T2: the smallest network with a flow split."""
     segments = pd.DataFrame(

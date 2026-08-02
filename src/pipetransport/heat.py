@@ -152,6 +152,7 @@ from typing import NamedTuple
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
+from scipy.fft import irfft, next_fast_len, rfft
 from scipy.signal import fftconvolve
 from scipy.special import erfc, erfcx, exp1, j1, y1
 
@@ -159,6 +160,12 @@ from pipetransport._transfer import NetworkTransfer, apply_segment_targets, path
 from pipetransport._validation import _validate_no_nan, _validate_positive, _validate_tedges
 from pipetransport.network import PipeNetwork  # noqa: TC001 -- runtime dependency of the signatures
 from pipetransport.utils import solve_inverse_transport_banded, tedges_to_days
+
+# How far ahead of the outer iterate the reverse direction resolves its inner halo fixed
+# point. The inner solve is inexact while the reconstruction is still moving and exact once it
+# has settled, so the answer is the same to well under ``atol``; at 1e-2 the reverse direction
+# spends about a third of the inner sweeps that a fully resolved inner solve does.
+_INNER_FORCING = 1e-2
 
 
 def _step_response_integral(
@@ -481,9 +488,11 @@ def soil_temperature(
         Uniform soil temperature before the surface record. Defaults to the first surface
         value.
     surface_tedges : pandas.DatetimeIndex or None, optional
-        Bin edges of the surface series; defaults to ``tedges``. Supply a record starting
-        well before the period of interest -- after one year roughly 87 % of a step has
-        arrived at 1 m, so the first months of output lean on ``t_pre``.
+        Bin edges of the surface series; defaults to ``tedges``, and must be uniform with
+        the same bin width, which is what makes the superposition a convolution. It is free
+        to start and end elsewhere: supply a record starting well before the period of
+        interest -- after one year roughly 87 % of a step has arrived at 1 m, so the first
+        months of output lean on ``t_pre``.
 
     Returns
     -------
@@ -494,8 +503,9 @@ def soil_temperature(
     Raises
     ------
     ValueError
-        If a time axis is malformed, the series holds NaN, a parameter is not positive,
-        or only one of ``kappa`` and ``eta`` is given.
+        If a time axis is malformed or the two do not share one uniform bin width, the
+        series holds NaN, a parameter is not positive, or only one of ``kappa`` and ``eta``
+        is given.
 
     See Also
     --------
@@ -524,6 +534,17 @@ def soil_temperature(
     surface_tedges = tedges if surface_tedges is None else pd.DatetimeIndex(surface_tedges)
     _validate_tedges(surface_tedges, surface, tedges_name="surface_tedges", values_name="surface_temperature")
     _validate_tedges(tedges, np.empty(len(tedges) - 1), tedges_name="tedges", values_name="the output")
+    bin_width = tedges[1] - tedges[0]
+    if (
+        np.unique(np.diff(tedges.asi8)).size != 1
+        or np.unique(np.diff(surface_tedges.asi8)).size != 1
+        or surface_tedges[1] - surface_tedges[0] != bin_width
+    ):
+        msg = (
+            "tedges and surface_tedges must share one uniform bin width (the step response depends only on the "
+            "lag, which makes the superposition over surface steps a convolution)"
+        )
+        raise ValueError(msg)
     _validate_no_nan(surface, name="surface_temperature")
     _validate_positive(depth, name="depth")
     _validate_positive(alpha, name="alpha")
@@ -542,15 +563,23 @@ def soil_temperature(
     step_times = tedges_to_days(surface_tedges)[:-1]
     steps = np.diff(surface, prepend=pre)
     out_edges = tedges_to_days(tedges, ref=surface_tedges[0])
-    # Cumulative response integral at every output edge. The (edges x steps) kernel matrix
-    # is built in bounded chunks so a year of hourly data does not materialize N^2 floats.
-    cumulative = np.empty(len(out_edges))
-    chunk = max(1, 8_388_608 // max(len(step_times), 1))
-    for lo in range(0, len(out_edges), chunk):
-        lags = out_edges[lo : lo + chunk, None] - step_times[None, :]
-        kernel = _step_response_integral(lags, depth=depth, alpha=alpha, radiation_length=radiation_length)
-        cumulative[lo : lo + chunk] = kernel @ steps
-    return pre + np.diff(cumulative) / np.diff(out_edges)
+    # The response depends on the lag alone, so on one shared bin width the lags of the
+    # (output edge, surface step) pairs take ``n_out + n_step`` distinct values rather than
+    # their product: the superposition is a convolution over those. A year of hourly forcing
+    # costs 17_560 kernel evaluations instead of 77 million, and a vector instead of an N^2
+    # matrix that had to be chunked to fit.
+    n_out, n_step = len(out_edges) - 1, len(step_times)
+    dt_days = bin_width / pd.Timedelta(days=1)
+    lag = (out_edges[0] - step_times[0]) + (np.arange(n_out + n_step) - (n_step - 1)) * dt_days
+    kernel = _step_response_integral(lag, depth=depth, alpha=alpha, radiation_length=radiation_length)
+    # Differenced to a bin-averaged response before the convolution rather than after it, so
+    # the transform's round-off is not amplified by the 1/dt of the final differencing.
+    response = fftconvolve(np.diff(kernel) / dt_days, steps)[n_step - 1 : n_step - 1 + n_out]
+    # The response is causal, and exactly so: an output bin ending at or before the first
+    # surface step integrates a kernel that is identically zero over its whole span. The
+    # transform blurs that exact zero by its own round-off, so it is restored rather than
+    # approximated -- the pre-history is a value the caller supplied, not a computed one.
+    return pre + np.where(out_edges[1:] <= step_times[0], 0.0, response)
 
 
 def segment_heat_rate(
@@ -708,7 +737,8 @@ class _HeatSystem(NamedTuple):
     n_pad: int
     n_bins: int
     t_inf: npt.NDArray[np.floating]
-    dbar: npt.NDArray[np.floating]
+    dbar_spectrum: npt.NDArray[np.complexfloating]
+    halo_length: int
     seg_flow: npt.NDArray[np.floating]
     length: npt.NDArray[np.floating]
     internal: NetworkTransfer
@@ -829,10 +859,12 @@ def _build_system(
     eta_series = pd.Series(eta_seg, index=segments.index)
     _validate_positive(alpha_seg, name="soil alpha")
 
-    # Spin-up, exactly as network_transfer resolves it: the longest endmember travel time at
-    # the leading flow rate, taken over the paths with a finite one so that a single stagnant
-    # branch does not suppress the padding of the whole call. Every internal node sits on an
-    # endmember path, so those paths bound the internal rows too.
+    # Spin-up, exactly as network_transfer resolves it: each endmember's travel time at the
+    # leading flow rate, with resolve_spinup dropping the paths it cannot warm-start one by
+    # one, so a single stagnant or unreachably deep branch does not suppress the padding of
+    # the whole call. Every internal node sits on an endmember path, so those paths bound the
+    # internal rows too -- and the candidate list is the endmembers whatever ``nodes`` asks
+    # for, so no row's coverage depends on which nodes were requested.
     volume = segments["volume"].to_numpy(dtype=float)
     seg_of = {name: e for e, name in enumerate(segments.index)}
     with np.errstate(divide="ignore"):
@@ -841,8 +873,7 @@ def _build_system(
         np.array([seg_of[name] for name in network.paths[node]], dtype=np.intp) for node in network.endmembers
     ])
     per_path = np.sum(np.where(end_active, ratio[end_paths], 0.0), axis=1)
-    warm_start_days = float(np.max(per_path[np.isfinite(per_path)], initial=0.0))
-    tedges_p, demand_p, n_pad = resolve_spinup(spinup, tedges=tedges, flow=demand, warm_start_days=warm_start_days)
+    tedges_p, demand_p, n_pad = resolve_spinup(spinup, tedges=tedges, flow=demand, warm_start_days=per_path)
 
     tedges_days = tedges_to_days(tedges_p)
     cout_days = tedges_to_days(cout_tedges, ref=tedges_p[0])
@@ -882,6 +913,10 @@ def _build_system(
     r_o = segments["diameter"].to_numpy(dtype=float) / 2.0 + thickness
     d_eff = depth_seg + np.where(np.isposinf(eta_seg), 0.0, kappa_seg / eta_seg)
     dbar = _deficit_kernel(n_bins, dt_days, r_o=r_o, d_eff=d_eff, alpha=alpha_seg, kappa=kappa_seg)
+    # The halo memory convolves this frozen kernel with a new flux history on every sweep, so
+    # the kernel is transformed once here, at the length ``scipy.signal.fftconvolve`` would
+    # have picked itself -- which makes the per-sweep multiply-and-invert bit-identical to it.
+    halo_length = int(next_fast_len(2 * n_bins - 1, real=True))
 
     n_seg = len(segments)
 
@@ -934,7 +969,8 @@ def _build_system(
         n_pad=n_pad,
         n_bins=n_bins,
         t_inf=t_inf,
-        dbar=dbar,
+        dbar_spectrum=rfft(dbar, n=halo_length, axis=1),
+        halo_length=halo_length,
         seg_flow=seg_flow,
         length=segments["length"].to_numpy(dtype=float),
         internal=build(int_paths, int_active, np.vstack([seg_flow, seg_flow]), tedges_days),
@@ -985,7 +1021,9 @@ def _converge_targets(
     initial : ndarray or None, optional
         Starting targets. ``None`` (default) starts from the undisturbed field, which is
         the one-way model; the reverse direction warm-starts from its previous outer
-        iterate instead, which costs a handful of sweeps rather than a full run.
+        iterate instead. That saves only a few per cent of the sweeps until the outer
+        iterate is close, which is why the reverse direction also loosens ``atol`` in step
+        with its own increment.
 
     Returns
     -------
@@ -1004,8 +1042,11 @@ def _converge_targets(
     # 1e20 K passes a relative test on itself -- and it makes the answer depend on whether the
     # caller works in Celsius or in kelvin, which an affine model must not.
     targets = system.t_inf if initial is None else initial
+    # The transport reading of the source series is the same in every sweep; only the bias
+    # follows the iterate.
+    transported = _apply(system.internal, tin_padded)
     for _ in range(max_sweeps - 1):
-        updated = _update_targets(system, _internal_pass(system, tin_padded, targets))
+        updated = _update_targets(system, _internal_pass(system, transported, targets))
         increment = float(np.max(np.abs(updated - targets)))
         targets = updated
         if increment <= atol:
@@ -1015,7 +1056,7 @@ def _converge_targets(
 
 
 def _internal_pass(
-    system: _HeatSystem, tin_padded: npt.NDArray[np.floating], targets: npt.NDArray[np.floating]
+    system: _HeatSystem, transported: npt.NDArray[np.floating], targets: npt.NDArray[np.floating]
 ) -> npt.NDArray[np.floating]:
     """Compute segment entry and delivery temperatures, NaN where the record does not constrain them.
 
@@ -1023,8 +1064,9 @@ def _internal_pass(
     ----------
     system : _HeatSystem
         Prebuilt operators and kernels.
-    tin_padded : ndarray
-        Source temperature on the padded input grid.
+    transported : ndarray
+        Reading of the internal operator on the source series, ``_apply(system.internal,
+        tin_padded)``. It does not depend on the targets, so the sweep loop hoists it out.
     targets : ndarray
         Current per-segment relaxation targets.
 
@@ -1034,7 +1076,7 @@ def _internal_pass(
         Entry temperatures in the first ``n_seg`` rows and delivery temperatures in the
         rest, shape ``(2 * n_seg, n_bins)``.
     """
-    t_int = _apply(system.internal, tin_padded) + apply_segment_targets(system.internal, _extended(targets))
+    t_int = transported + apply_segment_targets(system.internal, _extended(targets))
     t_int[~system.internal.valid_out] = np.nan
     return t_int
 
@@ -1073,8 +1115,8 @@ def _update_targets(system: _HeatSystem, t_int: npt.NDArray[np.floating]) -> npt
     # fabricated hydraulic history, not a flux history, so it feeds the halo nothing.
     psi[:, : system.n_pad] = 0.0
     dpsi = np.diff(psi, axis=1, prepend=0.0)
-    halo = fftconvolve(dpsi, system.dbar, mode="full", axes=1)[:, : system.n_bins]
-    return system.t_inf - halo
+    spectrum = rfft(dpsi, n=system.halo_length, axis=1) * system.dbar_spectrum
+    return system.t_inf - irfft(spectrum, n=system.halo_length, axis=1)[:, : system.n_bins]
 
 
 def source_to_endmember(
@@ -1333,7 +1375,7 @@ def endmember_to_source(
     >>> soil = pd.DataFrame(
     ...     {"alpha": [0.05], "kappa": [0.025], "eta": [0.41]}, index=["grass"]
     ... )
-    >>> tedges = pd.date_range("2025-06-01", "2025-06-15", freq="h")
+    >>> tedges = pd.date_range("2025-06-01", "2025-06-05", freq="h")
     >>> demand = example_demand(tedges=tedges, network=network)
     >>> surface = pd.DataFrame({"grass": np.full(len(tedges) - 1, 25.0)})
     >>> hours = np.arange(len(tedges) - 1)
@@ -1349,8 +1391,9 @@ def endmember_to_source(
     ... )
     >>> measured = source_to_endmember(tin=tin, **shared)
     >>> recovered = endmember_to_source(tout=measured, **shared)
-    >>> inner = slice(48, -48)
-    >>> bool(np.nanmax(np.abs(recovered[inner] - tin[inner])) < 1e-5)
+    >>> inner = slice(24, -24)  # the edges lean on a fabricated input; see Notes
+    >>> residual = float(np.nanmax(np.abs(recovered[inner] - tin[inner])))
+    >>> 5e-7 < residual < 2e-6  # about 1e-6 K unsplit, as the Notes say
     True
     """
     if max_sweeps < 1:
@@ -1417,11 +1460,19 @@ def endmember_to_source(
     # point at every step. Alternating single target sweeps with the deconvolution instead
     # does not contract: the solve carries the inverse operator, which undoes the margin the
     # halo iteration has.
+    #
+    # The inner fixed point is only asked for the accuracy the outer iterate has itself: a
+    # halo resolved to `atol` around a production series still kelvins from its own fixed
+    # point is thrown away on the next step. The forcing shrinks with the outer increment, so
+    # the last inner solve is the exact one, and the outer loop pays one or two extra steps
+    # for it. Seeded at inf, so the first inner solve is a single sweep.
     recovered = solve(system.reporting, system.t_inf)
     converged = max_sweeps == 1
     targets = system.t_inf
+    increment = np.inf
     for _ in range(max_sweeps - 1):
-        targets = _converge_targets(system, filled(recovered), max_sweeps=max_sweeps, atol=atol, initial=targets)
+        inner_atol = max(atol, _INNER_FORCING * increment)
+        targets = _converge_targets(system, filled(recovered), max_sweeps=max_sweeps, atol=inner_atol, initial=targets)
         updated = solve(system.reporting, targets)
         finite = np.isfinite(updated) & np.isfinite(recovered)
         increment = float(np.max(np.abs(updated[finite] - recovered[finite]), initial=0.0))
