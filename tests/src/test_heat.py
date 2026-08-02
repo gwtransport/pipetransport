@@ -2467,6 +2467,64 @@ def test_missing_geometry_columns_are_reported(heat_network, hourly_tedges, diur
         )
 
 
+@pytest.mark.parametrize("factor", [0.5, 1.5])
+def test_a_volume_that_contradicts_length_and_diameter_is_rejected(soil, surface, factor):
+    """The heat pair reads a pipe three ways, and they have to describe the same pipe.
+
+    ``PipeNetwork`` takes the water volume from a ``volume`` column when there is one and only
+    derives it from length and diameter otherwise, because transport reads nothing else. Heat
+    reads all three: the exchange rate from ``diameter``, the wall flux from ``length``, the
+    transit from ``volume``. When they disagree the model describes a pipe that cannot exist,
+    and what a user saw was a convergence failure naming ``max_sweeps`` and ``atol`` -- knobs
+    that cannot reconcile an impossible geometry.
+
+    This is reachable rather than contrived: a network built from volumes calibrated to tracer
+    data, with nominal DN diameters and lengths attached to it so the heat pair will run, is
+    the normal state of an inventory.
+    """
+    n_bins = 96
+    tedges = pd.date_range("2025-06-01", periods=n_bins + 1, freq="h")
+    geometric = np.pi / 4.0 * 0.1**2 * 1000.0
+    segments = pd.DataFrame(
+        {
+            "from": ["Plant"],
+            "to": ["T1"],
+            "length": [1000.0],
+            "diameter": [0.1],
+            "volume": [factor * geometric],
+            "cover": ["grass"],
+        },
+        index=["main"],
+    )
+    network = PipeNetwork(segments=segments, source="Plant")
+
+    with pytest.raises(ValueError, match="reads the pipe three ways") as raised:
+        heat.source_to_endmember(
+            tin=np.full(n_bins, 9.0),
+            flow=np.full((1, n_bins), geometric / (2.0 / 24.0)),
+            tedges=tedges,
+            cout_tedges=tedges,
+            network=network,
+            soil=soil,
+            surface_temperature=surface(tedges, amplitude=3.0),
+        )
+    assert "'main'" in str(raised.value), str(raised.value)
+
+    # A network whose volume really is the geometric one runs, so the guard is about the
+    # contradiction rather than about requiring the column to be absent.
+    consistent = segments.assign(volume=geometric)
+    heat.source_to_endmember(
+        tin=np.full(n_bins, 9.0),
+        flow=np.full((1, n_bins), geometric / (2.0 / 24.0)),
+        tedges=tedges,
+        cout_tedges=tedges,
+        network=PipeNetwork(segments=consistent, source="Plant"),
+        soil=soil,
+        surface_temperature=surface(tedges, amplitude=3.0),
+        max_sweeps=1,
+    )
+
+
 def test_wall_conductivity_requires_the_wall_thickness(heat_pipe):
     """``kappa_pipe`` without a thickness column is a configuration error, not a default."""
     with pytest.raises(ValueError, match="wall_thickness"):

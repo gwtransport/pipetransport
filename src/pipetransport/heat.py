@@ -173,6 +173,10 @@ _INNER_FORCING = 1e-2
 # the iteration needs and it stalls. A depth of five raises on a 400 mm main at a half-hour
 # transit, which ten reconstructs to 1e-9. It buys range, not a guarantee: a pipe past the
 # coupling the divergence test names is out of reach at any depth.
+# How far a segment's volume may sit from the one its length and diameter imply. Wide enough
+# for fittings and for wall-thickness conventions, tight enough to catch a volume that came
+# from somewhere else entirely.
+_GEOMETRY_TOLERANCE = 0.05
 _ANDERSON_DEPTH = 10
 # Consecutive growing outer residuals that mark divergence rather than a slow start.
 _DIVERGENCE_STEPS = 5
@@ -856,6 +860,22 @@ def _build_system(
         if column not in segments.columns:
             msg = f"the heat pair needs the segment column {column!r}"
             raise ValueError(msg)
+    # Transport reads only the volume, so a network may carry one that its length and diameter
+    # do not imply and never notice. Heat reads the pipe three ways and they have to be the
+    # same pipe; where they are not, the water's heat capacity per unit length disagrees with
+    # the area the exchange rate was built from, and what the user used to see was a
+    # convergence failure naming knobs that cannot reconcile a geometry.
+    geometric = np.pi / 4.0 * segments["diameter"].to_numpy(dtype=float) ** 2 * segments["length"].to_numpy(dtype=float)
+    contradicts = np.abs(segments["volume"].to_numpy(dtype=float) - geometric) > _GEOMETRY_TOLERANCE * geometric
+    if contradicts.any():
+        msg = (
+            f"segment(s) {list(segments.index[contradicts])} carry a 'volume' that their 'length' and "
+            f"'diameter' do not imply, by more than {_GEOMETRY_TOLERANCE:.0%}. The heat pair reads the "
+            f"pipe three ways -- the exchange rate from the diameter, the wall flux from the length, the "
+            f"transit from the volume -- so they must describe one pipe. Drop the volume column to have "
+            f"it derived, or reconcile it with pi/4 * diameter**2 * length."
+        )
+        raise ValueError(msg)
     covers = segments["cover"]
     soil_missing = [c for c in covers.unique() if c not in soil.index]
     if soil_missing:
@@ -1346,7 +1366,10 @@ def source_to_endmember(
         the temperature inputs. Default 1e-9, several orders below anything a temperature
         measurement resolves. It is absolute rather than relative so that the answer cannot
         depend on whether the caller works in Celsius or in kelvin, and so that an iterate
-        that is diverging cannot widen its own convergence test.
+        that is diverging cannot widen its own convergence test. The delivered temperature
+        settles to a fraction of it -- measured about 0.4 -- and the sweep count grows only as
+        its logarithm, so there is little to buy by relaxing it: 1e-7 is the loosest value
+        that leaves the package's own tests meaningful, and costs a third of the runtime.
     spinup : {"constant"} or None, optional
         Warm-start policy; see :func:`pipetransport.transport.source_to_endmember`.
 
