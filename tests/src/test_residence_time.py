@@ -483,6 +483,7 @@ def test_spinup_none_leaves_the_first_travel_time_worth_of_bins_nan(
     strict = full(flow=demand, tedges=hourly_tedges, network=network, spinup=None)
     warm = full(flow=demand, tedges=hourly_tedges, network=network, spinup="constant")
 
+    assert not np.isnan(warm).any()
     for i, node in enumerate(network.endmembers):
         expected = analytic_travel_time(network, demand, node)
         missing = np.isnan(strict[i])
@@ -491,4 +492,26 @@ def test_spinup_none_leaves_the_first_travel_time_worth_of_bins_nan(
         assert missing.sum() == n_missing
         assert np.all(missing[:n_missing]), "the unanswered bins must be the leading ones"
         np.testing.assert_allclose(strict[i][~missing], expected, rtol=1e-12)
+        np.testing.assert_allclose(warm[i][~missing], strict[i][~missing], rtol=1e-12)
+
+
+def test_warm_start_reproduces_a_genuinely_constant_history(network, hourly_tedges, diurnal_demand):
+    """``spinup="constant"`` is exact when the record's own pre-history really is constant.
+
+    Hold demand constant over the leading three days of a diurnal record, then truncate the
+    record there: warm-starting the truncated record must reproduce the untruncated,
+    strictly-valid age bin for bin. Under the non-constant demand that follows, this pins the
+    padding rule (repeat the *first* observed demand) and the padding length, which the
+    NaN-pattern test above cannot see.
+    """
+    head = 72
+    diurnal = diurnal_demand(network, hourly_tedges).to_numpy(float).T
+    demand = diurnal.copy()
+    demand[:, :head] = diurnal[:, head][:, None]
+
+    truth = full(flow=demand, tedges=hourly_tedges, network=network, spinup=None)[:, head:]
+    warm = full(flow=demand[:, head:], tedges=hourly_tedges[head:], network=network, spinup="constant")
+
+    assert not np.isnan(warm).any()
+    np.testing.assert_allclose(warm, truth, rtol=0.0, atol=1e-11)
     assert np.all(np.isfinite(warm))
