@@ -2201,7 +2201,7 @@ def test_a_measurement_outage_does_not_corrupt_the_record_around_it():
     np.testing.assert_array_equal(one_holed[both], one_clean[both])
 
 
-def test_the_reverse_accepts_measurements_named_by_node(heat_network, hourly_tedges, diurnal_demand, soil, surface):
+def test_the_reverse_accepts_measurements_named_by_node(heat_network, diurnal_demand, soil, surface):
     """A DataFrame or dict of measurements is matched by node name, not by row order.
 
     Every other way in takes an array whose rows the caller has to keep in the order the
@@ -2210,19 +2210,25 @@ def test_the_reverse_accepts_measurements_named_by_node(heat_network, hourly_ted
     to be an error rather than a shifted row.
     """
     nodes = ["T4", "T1"]  # deliberately not the order the network lists them in
-    n = len(hourly_tedges) - 1
+    # A short record and the one-way reverse on purpose: what is under test is which row goes
+    # with which name, which is settled before any solving starts and which the coupling
+    # cannot affect. The two-way path costs four outer solves here and pins nothing extra.
+    tedges = pd.date_range("2025-06-01", periods=4 * 24 + 1, freq="h")
+    n = len(tedges) - 1
     tin = 9.0 + 2.0 * np.sin(2.0 * np.pi * np.arange(n) / 72.0)
     shared = dict(
-        flow=diurnal_demand(heat_network, hourly_tedges),
-        tedges=hourly_tedges,
-        cout_tedges=hourly_tedges,
+        flow=diurnal_demand(heat_network, tedges),
+        tedges=tedges,
+        cout_tedges=tedges,
         network=heat_network,
         soil=soil,
-        surface_temperature=surface(hourly_tedges, amplitude=3.0),
+        surface_temperature=surface(tedges, amplitude=3.0),
         nodes=nodes,
     )
     measured = heat.source_to_endmember(tin=tin, **shared)
+    shared["max_sweeps"] = 1
     by_array = heat.endmember_to_source(tout=measured, **shared)
+    assert np.isfinite(by_array).any(), "an all-NaN reconstruction would compare equal to anything"
     frame = pd.DataFrame({node: measured[i] for i, node in enumerate(nodes)})
 
     np.testing.assert_array_equal(heat.endmember_to_source(tout=frame, **shared), by_array)
