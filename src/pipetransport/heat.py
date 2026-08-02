@@ -36,9 +36,9 @@ is what keeps the same-bin loop gain small and, decisively, *shrinking* as the b
 measured 0.26 at 6 h bins down to 0.014 at 10 min bins for a 100 mm line. A flux read from an
 enthalpy budget instead is the more accurate one, and its gain runs the other way, to 0.98
 and beyond, where this iteration stops converging to its own fixed point. The price of the
-delivered-water flux is that the halo sees the wall-flux history smeared over one piece
-transit, and that error does *not* vanish as ``tedges`` is refined -- ``theta_max`` is the
-knob that resolves it, and the ``Validity`` notes below put numbers on what is left. The
+delivered-water flux is that the halo sees the wall-flux history smeared over one pipe
+transit, and that error does *not* vanish as ``tedges`` is refined; the ``Validity`` notes
+below put numbers on what is left. The
 whole model stays linear in the produced water temperature and the surface temperatures, so
 the reverse problem reuses the existing banded solver.
 
@@ -84,15 +84,21 @@ Validity
   constant-flux cylinder response would need numerical evaluation, which is why the
   closed form is kept. Its other cost is stiffness: the line source sends
   ``Dbar[0]/R_soil`` to 1 for a wide pipe on short bins (1.0000 for a 400 mm main at
-  hourly bins), and that ratio is what sets the sweep count and what limits how far
-  ``theta_max`` can usefully be lowered on such a pipe.
-- The wall flux of a piece is read off the water it delivers and attributed to the delivery
-  bin, which smears the flux history over one piece transit. Because the first lag bin of
-  the halo already carries most of the steady soil resistance, the memory answers the most
-  recent flux almost in full, so the smear is not a second-order detail: under 24 h diurnal
-  forcing at hourly bins it is worth around 0.5-0.9 K on an unsplit 100 mm line, falling
-  below 0.1 K once the pipe is carried as several pieces. Refining ``tedges`` does not
-  reduce it --- it is a property of the transit, and ``theta_max`` is the knob for it.
+  hourly bins), and that ratio is what sets the sweep count.
+- **One wall-flux history per pipe.** The soil columns along a pipe are independent and the
+  wall flux falls along it like ``exp(-h tau)`` -- by a factor 1.6 over a 2 h transit on a
+  100 mm service line -- but the model gives every parcel in a pipe the same soil memory.
+  That is the model's spatial resolution along a pipe, and it is a stated assumption rather
+  than a parameter: under 24 h diurnal forcing at hourly bins it is worth around 0.5-0.9 K
+  on a 100 mm line. Refining ``tedges`` does not reduce it; it is a property of the transit.
+  The flux itself is read off the water the pipe delivers and attributed to the delivery
+  bin, which additionally smears that history over one transit.
+
+  Declare a pipe as a chain of shorter segments if you need it resolved -- splitting is
+  exact for the transport, which is unchanged to round-off by it -- but check that the
+  answer settles as you refine. It does under continuous flow; under intermittent demand it
+  does not reliably converge, and refining can move the delivered temperature further
+  outside the range of its inputs rather than closer to the truth.
 - The relaxation target is an *effective driving temperature*, not a wall temperature. The
   rate keeps the steady soil resistance, which overstates the resistance while the halo is
   still developing, so the target has to be pushed past the undisturbed soil to reproduce
@@ -107,8 +113,8 @@ Validity
   the soil, settling at a third of the contrast and recurring every duty cycle for as long as
   the duty cycle lasts; at 20-22 h idle it reaches 81-85 %. Splitting does not rescue it --
   on such a branch the criterion below usually declines to split at all, and where it does
-  split the excursion can *grow* (47 % unsplit against 75 % at the default ``theta_max`` on
-  one 12 h-idle line). Only ``max_sweeps=1`` is guaranteed inside the range of its inputs.
+  split the excursion can *grow* (47 % unsplit against 75 % at four pieces on one 12 h-idle
+  line). Only ``max_sweeps=1`` is guaranteed inside the range of its inputs.
   For wide pipes there is a further regime in which this becomes unusable rather than merely
   large; see the bin-width note above.
 - Bins in which a segment has no throughflow contribute zero wall flux to the halo, so the
@@ -140,12 +146,6 @@ from pipetransport._transfer import NetworkTransfer, apply_segment_targets, path
 from pipetransport._validation import _validate_no_nan, _validate_positive, _validate_tedges
 from pipetransport.network import PipeNetwork  # noqa: TC001 -- runtime dependency of the signatures
 from pipetransport.utils import solve_inverse_transport_banded, tedges_to_days
-
-# Ceiling on how many pieces one pipe is split into for the flux and halo passes, whatever
-# ``theta_max`` asks for. The build cost grows with the cube of the split, and past this point
-# the water leaves a pipe at its wall temperature however the flux is distributed along it, so
-# refining further buys nothing the delivered temperature can see.
-_MAX_PIECES = 16
 
 
 def _step_response_integral(
@@ -612,9 +612,8 @@ def segment_heat_rate(
 class _HeatSystem(NamedTuple):
     """Everything the Picard loop reads, built once per call.
 
-    Every per-segment array is indexed by *sub*-segment: each user pipe contributes ``n_sub``
-    consecutive rows carrying the geometry and kernels of their parent unchanged, and only its
-    volume and length divided (see ``theta_max``).
+    Every per-segment array is indexed by the user's own pipes: one row each, carrying one
+    wall-flux history, which is the model's spatial resolution along a pipe.
     """
 
     nodes: tuple[str, ...]
@@ -684,7 +683,6 @@ def _build_system(
     nodes: list[str] | tuple[str, ...] | None,
     kappa_pipe: float | pd.Series | None,
     film_coefficient: float | pd.Series | None,
-    theta_max: float,
     spinup: str | None,
 ) -> _HeatSystem:
     """Validate the shared inputs and build the operators, targets and kernels once.
@@ -707,9 +705,6 @@ def _build_system(
     _validate_tedges(cout_tedges, np.empty(len(cout_tedges) - 1), tedges_name="cout_tedges", values_name="tout")
     if np.unique(np.diff(tedges.asi8)).size != 1:
         msg = "tedges must be uniformly spaced for the heat pair (the halo memory is a convolution over lag bins)"
-        raise ValueError(msg)
-    if not theta_max > 0.0:
-        msg = "theta_max must be positive (inf keeps every pipe whole)"
         raise ValueError(msg)
 
     segments = network.segments
@@ -800,52 +795,30 @@ def _build_system(
     d_eff = depth_seg + np.where(np.isposinf(eta_seg), 0.0, kappa_seg / eta_seg)
     dbar = _deficit_kernel(n_bins, dt_days, r_o=r_o, d_eff=d_eff, alpha=alpha_seg, kappa=kappa_seg)
 
-    # Sub-segmentation. The soil around a pipe is a set of independent columns, and the wall
-    # flux decays along the pipe by exp(-h tau): collapsing that to one segment-average flux
-    # history makes every parcel see one halo memory, which is the model's largest error under
-    # realistic forcing. Each pipe is therefore carried internally as ``n_sub`` pieces of
-    # volume V/n_sub and length L/n_sub at the same flow, the same rate and the same kernels.
-    # The arrival maps compose and the decay exponents add, so ``W`` is unchanged to round-off
-    # and only the relaxation bias is refined; ``network.segments`` keeps the user's own pipes.
-    # The count follows from a cap on how far a piece may equilibrate, so it is set by the
-    # physics rather than guessed -- a stagnant pipe delivers nothing and needs no split. The
-    # statistic reads the caller's own record only: the warm-start prefix repeats the first
-    # flow value, so including it would let the padding decide the split, and the median is a
-    # knife-edge on a two-shift demand where half the bins sit at each level.
-    with np.errstate(divide="ignore", invalid="ignore"):
-        equilibration = rate * volume / np.median(seg_flow[:, n_pad:], axis=1)
-    pieces = np.ceil(np.where(np.isfinite(equilibration), equilibration, 0.0) / theta_max)
-    n_sub = np.clip(pieces, 1.0, _MAX_PIECES).astype(np.intp)
-    parent = np.repeat(np.arange(len(segments)), n_sub)
-    n_subseg = len(parent)
-    start = np.concatenate([[0], np.cumsum(n_sub)])
-    sub_flow = seg_flow[parent]
+    n_seg = len(segments)
 
     def chain(node: str) -> npt.NDArray[np.intp]:
-        """Sub-segment path from the source to ``node``.
+        """Segment path from the source to ``node``.
 
         Returns
         -------
         ndarray of intp
-            Sub-segment rows, source outward; empty for the source node itself.
+            Segment rows, source outward; empty for the source node itself.
         """
-        steps = [np.arange(start[seg_of[name]], start[seg_of[name] + 1]) for name in network.paths[node]]
-        return np.concatenate(steps).astype(np.intp) if steps else np.empty(0, dtype=np.intp)
+        return np.array([seg_of[name] for name in network.paths[node]], dtype=np.intp)
 
-    # Internal rows, two per sub-segment and both binned on that piece's own deliveries: the
+    # Internal rows, two per segment and both binned on that pipe's own deliveries: the
     # temperature it delivers, and the same water's temperature where it entered -- the same
-    # path with the last step replaced by an inert (zero-rate) phantom copy of the piece,
+    # path with the last step replaced by an inert (zero-rate) phantom copy of the pipe,
     # which carries the parcel across without exchanging. Their difference is the per-parcel
-    # heat lost in the piece, attributed to the delivery bin. The phantom copies live as extra
+    # heat lost in the pipe, attributed to the delivery bin. The phantom copies live as extra
     # segment rows sharing the real hydraulics, so the ordinary machinery builds these rows
     # unchanged.
     entry, delivery = [], []
     for e, name in enumerate(segments.index):
-        upstream = chain(str(segments.loc[name, "from"]))
-        for s in range(start[e], start[e + 1]):
-            piece = np.concatenate([upstream, np.arange(start[e], s + 1)]).astype(np.intp)
-            entry.append(np.concatenate([piece[:-1], [n_subseg + s]]).astype(np.intp))
-            delivery.append(piece)
+        path = np.concatenate([chain(str(segments.loc[name, "from"])), [e]]).astype(np.intp)
+        entry.append(np.concatenate([path[:-1], [n_seg + e]]).astype(np.intp))
+        delivery.append(path)
     int_paths, int_active = _pad_paths(entry + delivery)
     rep_paths, rep_active = _pad_paths([chain(node) for node in requested])
     rep_flow = network.node_flow(flow=demand_p, nodes=requested)
@@ -859,9 +832,9 @@ def _build_system(
         return paths_transfer(
             tedges_days=tedges_days,
             cout_tedges_days=cout,
-            segment_volume=np.tile((volume / n_sub)[parent], 2),
-            segment_flow=np.vstack([sub_flow, sub_flow]),
-            segment_decay=np.concatenate([rate[parent], np.zeros(n_subseg)]),
+            segment_volume=np.tile(volume, 2),
+            segment_flow=np.vstack([seg_flow, seg_flow]),
+            segment_decay=np.concatenate([rate, np.zeros(n_seg)]),
             node_flow=node_flow,
             paths_idx=paths_idx,
             active=active,
@@ -872,11 +845,11 @@ def _build_system(
         nodes=requested,
         n_pad=n_pad,
         n_bins=n_bins,
-        t_inf=t_inf[parent],
-        dbar=dbar[parent],
-        seg_flow=sub_flow,
-        length=(segments["length"].to_numpy(dtype=float) / n_sub)[parent],
-        internal=build(int_paths, int_active, np.vstack([sub_flow, sub_flow]), tedges_days),
+        t_inf=t_inf,
+        dbar=dbar,
+        seg_flow=seg_flow,
+        length=segments["length"].to_numpy(dtype=float),
+        internal=build(int_paths, int_active, np.vstack([seg_flow, seg_flow]), tedges_days),
         reporting=build(rep_paths, rep_active, rep_flow, cout_days),
     )
 
@@ -1029,7 +1002,6 @@ def source_to_endmember(
     nodes: list[str] | tuple[str, ...] | None = None,
     kappa_pipe: float | pd.Series | None = None,
     film_coefficient: float | pd.Series | None = None,
-    theta_max: float = 0.25,
     max_sweeps: int = 5000,
     atol: float = 1e-9,
     spinup: str | None = "constant",
@@ -1081,52 +1053,14 @@ def source_to_endmember(
     film_coefficient : float or pandas.Series or None, optional
         Water-side film coefficient [m/day]; see :func:`segment_heat_rate`. Default None
         (film not limiting).
-    theta_max : float, optional
-        Cap on how far one internal piece of a pipe may equilibrate with its wall before the
-        pipe is carried as several pieces with independent wall-flux histories:
-        ``n_sub = ceil(h_e tau_e / theta_max)``, at most 16. Splitting leaves the transport
-        operator, the travel times and the ``h -> 0`` reduction untouched to round-off and
-        refines the soil memory only; under diurnal forcing it is worth about a kelvin on a
-        service line. Default 0.25. ``inf`` keeps every pipe whole.
-
-        ``tau_e`` here is the whole pipe's transit at its **median** throughflow over your
-        record, not the transit of one piece and not the transit while the pipe is running.
-        Two consequences follow, and both bite on exactly the intermittent branches the split
-        exists for. A segment with no throughflow in more than half the bins has a median of
-        zero, so the criterion declines to split it *at any* ``theta_max``: the answer is then
-        bit-identical to ``inf``. And because a median is a step function of the duty cycle,
-        the count can jump the wrong way across that boundary -- on one 2 km service line the
-        correction the split is worth switches between 0 K and about 4 K on one hour a day of
-        demand. Declare such a branch as an explicit chain of shorter segments if you need it
-        resolved; but check convergence when you do, because refining an intermittently
-        stagnant branch does not reliably converge to a better answer and can leave the
-        delivered temperature far outside the range of its inputs.
-
-        The 16-piece cap engages once ``h_e tau_e`` exceeds ``16 * theta_max`` -- above 4 at
-        the default, which a bare 100 mm line reaches at roughly an 18 h transit. It costs
-        almost nothing where it engages: beyond 16 pieces the water already leaves each piece
-        at its wall temperature, and 16 against 32 pieces differ by under 1e-3 K, four orders
-        below what the split itself buys.
-
-        Both the build and every coupled sweep grow with the square of the path depth, and
-        the depth is the sum of the splits along it, so one thin branch sets the price for
-        the whole network: on the example network at hourly bins, 90 days runs in about 14 s
-        at ``inf``, 30 s at 0.5, 62 s at 0.25 and 13 minutes at 0.125. Lowering it also
-        raises the sweep count, and can exhaust ``max_sweeps``.
-
-        Note what the criterion does *not* split: a trunk main, whose water barely
-        equilibrates over its transit however long that transit is. That is deliberate.
-        Those are the pipes whose ``Dbar[0] / R_soil`` sits at 1 on hourly bins, where the
-        same-bin coupling has no margin left, and splitting them drives the iteration to
-        non-convergence rather than to a better answer.
     max_sweeps : int, optional
         Iteration cap. 1 is the one-way model. The sweep count is a property of the physics,
         not of the record length: it is set by how much of the steady soil resistance the
         first lag bin still holds, ``Dbar[0] / R_soil``, which rises toward 1 for wide pipes
         on short bins. A few hundred sweeps is typical (286 on the example network at hourly
         bins, unchanged from 30 days of record to a year), but a 400 mm main on hourly bins
-        needs about 1200, and lowering ``theta_max`` raises the count further. Exceeding the
-        cap raises rather than returning an unconverged answer. Default 5000.
+        needs about 1200. Exceeding the cap raises rather than returning an unconverged
+        answer. Default 5000.
     atol : float, optional
         Convergence tolerance on the relaxation-target increment, absolute and in the unit of
         the temperature inputs. Default 1e-9, several orders below anything a temperature
@@ -1223,7 +1157,6 @@ def source_to_endmember(
         nodes=nodes,
         kappa_pipe=kappa_pipe,
         film_coefficient=film_coefficient,
-        theta_max=theta_max,
         spinup=spinup,
     )
     tin_padded = np.concatenate([np.full(system.n_pad, tin[0]), tin])
@@ -1247,7 +1180,6 @@ def endmember_to_source(
     nodes: list[str] | tuple[str, ...] | None = None,
     kappa_pipe: float | pd.Series | None = None,
     film_coefficient: float | pd.Series | None = None,
-    theta_max: float = 0.25,
     max_sweeps: int = 5000,
     atol: float = 1e-9,
     regularization_strength: float = 1e-10,
@@ -1267,7 +1199,7 @@ def endmember_to_source(
     tout : DataFrame, mapping, or array-like
         Measured temperature at the reporting nodes, constant over each ``cout_tedges``
         bin; a DataFrame or mapping is keyed by node name. NaN marks a gap.
-    flow, tedges, cout_tedges, network, soil, surface_temperature, surface_tedges, nodes, kappa_pipe, film_coefficient, theta_max, max_sweeps, atol, spinup
+    flow, tedges, cout_tedges, network, soil, surface_temperature, surface_tedges, nodes, kappa_pipe, film_coefficient, max_sweeps, atol, spinup
         As in :func:`source_to_endmember`.
     regularization_strength : float, optional
         Tikhonov parameter of each banded solve; see
@@ -1294,15 +1226,10 @@ def endmember_to_source(
 
     Notes
     -----
-    Two things about ``theta_max`` in this direction. It is paid for twice: the halo is brought
-    to its own fixed point inside every outer step, so the split multiplies a cost that is
-    already a product of two iterations --- a week of hourly data on the seven-segment example
-    network runs in seconds at ``theta_max=inf`` and in minutes at the default. And it costs
-    accuracy rather than buying it here: the reconstruction leans on a fabricated input over the
-    bins no measurement constrains (see below), the refined bias is more sensitive to that
-    fabrication, and the round trip closes to about 1e-3 K at the default against 1e-6 K
-    unsplit. Neither is a reason to avoid the split in the forward direction, where it is what
-    the accuracy comes from. Reconstruct with ``theta_max=inf`` unless you have a reason not to.
+    The halo is brought to its own fixed point inside every outer step, so the cost is a
+    product of two iterations rather than a sum. The reconstruction also leans on a
+    fabricated production series over the bins no measurement constrains, and the halo memory
+    carries that forward: a measurement gap perturbs the answer after it as well as inside it.
 
     Examples
     --------
@@ -1331,7 +1258,6 @@ def endmember_to_source(
     ...     soil=soil,
     ...     surface_temperature=surface,
     ...     nodes=["T1", "T4"],
-    ...     theta_max=np.inf,  # see Notes: the split costs the reverse far more than the forward
     ... )
     >>> measured = source_to_endmember(tin=tin, **shared)
     >>> recovered = endmember_to_source(tout=measured, **shared)
@@ -1353,7 +1279,6 @@ def endmember_to_source(
         nodes=nodes,
         kappa_pipe=kappa_pipe,
         film_coefficient=film_coefficient,
-        theta_max=theta_max,
         spinup=spinup,
     )
     cout_tedges = pd.DatetimeIndex(cout_tedges)

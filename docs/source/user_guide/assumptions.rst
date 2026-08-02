@@ -370,53 +370,35 @@ adequacy of the lead-in, the bin width and the trench spacing is your modelling 
 How far along a pipe the wall flux is resolved
 ----------------------------------------------
 
-**Assumption.** The wall flux is uniform along each internal piece of a pipe, and each piece keeps
-its own soil memory. The number of pieces follows from ``theta_max``:
-``n_sub = ceil(h_e tau_e / theta_max)``, capped at 16, with ``tau_e`` the pipe's transit at its
-**median** throughflow over your record.
-
-**The median is why an intermittent branch may not be split at all.** A segment with no throughflow
-in more than half the bins has a median of zero, and the criterion then returns one piece whatever
-``theta_max`` says --- the result is bit-identical to ``theta_max=inf``. Because a median is a step
-function of the duty cycle, the count can also jump the wrong way across that boundary: on one 2 km
-service line the correction the split is worth switches between 0 K and about 4 K on one hour a day
-of demand. This is the case the split matters most for, and the case the criterion is worst at
-detecting.
+**Assumption.** The wall flux is uniform along a pipe, and each pipe keeps one soil memory. That is
+the model's spatial resolution along a pipe; there is no parameter, and nothing is subdivided
+internally.
 
 **Why it matters.** Because the soil columns are independent, the flux is a *local* quantity, and it
 falls along a pipe like :math:`e^{-h_e \tau}` --- by a factor 1.6 over a 2 h transit on a 100 mm
-service line, and 3.8 over 6 h. Charging the whole pipe with one average flux history gives every
-parcel in it the same soil memory, and that is not a bin-resolution question that a finer ``tedges``
-would answer: it is a *spatial* one. Splitting the pipe is exact in the transport it does not
-touch --- ``n_sub`` series pieces of volume :math:`V/n_\text{sub}` at the same flow compose to the
-same arrival map, and their exchange exponents add to the whole pipe's --- so ``W``, the residence
-times and the coverage mask are unchanged to round-off, and only the soil bias is refined.
+service line, and 3.8 over 6 h. Charging the whole pipe with one average flux history therefore gives
+every parcel in it the same soil memory. Under 24 h diurnal forcing at hourly bins that is worth
+about 0.5--0.9 K on a 100 mm line. It is not a bin-resolution question that a finer ``tedges`` would
+answer: it is a *spatial* one.
 
-**What breaks if it is violated.** With ``theta_max=inf`` (no split at all) the delivered temperature
-on the example network is wrong by up to 0.6 K against a well-resolved reference, and on a single
-100 mm line under diurnal forcing by more than a kelvin; the error concentrates on the slowest,
-thinnest branch, which is usually the one the study is about.
+**What you can do.** Declare the pipe as a chain of shorter segments. That is exact in the transport
+it does not touch --- :math:`k` series pieces of volume :math:`V/k` at the same flow compose to the
+same arrival map, and their exchange exponents add to the whole pipe's, so ``W``, the residence times
+and the coverage mask are unchanged to round-off and only the soil memory is refined.
 
-**What the criterion deliberately leaves alone.** A trunk main can have a long transit and still
-barely equilibrate, so ``h_e \tau_e`` is small and it is never split. That is not an oversight. Those
-are the pipes whose first lag bin already holds the whole steady soil resistance ---
-:math:`\bar{D}[0]/R_\text{soil}` is 1.0000 for a 400 mm main on hourly bins --- so the same-bin
-coupling has no margin, and refining them does not converge to a better answer: the fixed-point
-iteration slows toward a stall (measured 254 sweeps unsplit against 1258 at six pieces per pipe on
-the example network, and outright non-convergence beyond that). Resolving the wall flux along a
-trunk main is blocked on a pipe-side kernel that does not send that ratio to 1 --- the constant-flux
-cylinder response, which is tracked separately.
+**Check that it settles when you do.** Under continuous flow it does: on a 2 km / 100 mm line the
+per-doubling steps fall about fourfold (0.21, 0.058, 0.014, 0.0034 K). Under intermittent demand it
+does **not**. On the same pipe drawing 11 h a day the steps are 2.39, 3.14, 2.61, 2.31 K, and deeper
+stagnation diverges outright --- at 2 h a day, 1 against 16 pieces differ by 818 K and the call still
+returns without raising. The mechanism is that :math:`\psi = Q (T_\text{in} - T_\text{out}) / L`
+saturates at the full parcel-to-wall contrast after a stagnation however short the piece is, so
+refining amplifies the flux fed to the halo instead of resolving it. Refine only where the branch
+flows continuously, and read a moving answer as a warning rather than as progress.
 
-**What you can do.** Lower ``theta_max`` until the answer stops moving, and check the cost as you
-go. The build and each coupled sweep grow with the square of the *path* depth, and the depth is the
-sum of the splits along it, so one slow service line sets the price for the whole network: on the
-example network at hourly bins, ``theta_max=inf`` runs 90 days in about 14 s, ``0.5`` in 30 s,
-``0.25`` in 62 s and ``0.125`` in 13 minutes. The default 0.25 is where that curve is still gentle.
+**How it is checked.** Not checked --- there is no parameter to validate. That one flux history per
+pipe is an approximation, and that refining it converges under continuous flow, are pinned by tests
+against an independently written reference which keeps one soil memory per axial cell.
 
-**How it is checked.** ``theta_max`` must be positive, and a split that costs more sweeps than
-``max_sweeps`` allows raises rather than returning an unconverged answer. That the split converges
-where it is applied is a test, not a runtime check --- and the cap of 16 pieces per pipe is a cost
-ceiling, not a physical statement.
 
 .. _assumption-effective-target:
 
@@ -439,14 +421,14 @@ fall outside the range of its own inputs**, and there is no general bound on by 
 A step in the produced temperature into a *continuously flowing* pipe is the mild case: 20 % of the
 instantaneous plant-to-soil contrast --- 4.7 K on a 100 mm line after a 24 K step --- peaking 1.9
 transits after the step and back inside the range after about nine days. Splitting the pipe
-(:ref:`assumption-uniform-wall-flux`) cuts that to 1--4 % depending on ``theta_max``.
+(:ref:`assumption-uniform-wall-flux`) into a chain of shorter segments cuts that to 1--4 %.
 
 Intermittent demand is the case to watch, and it is far worse. A 100 mm line idle 16 hours a day
 delivers water 66 % of the contrast past the soil, and it does not decay: it settles at about a third
 of the contrast and recurs once per duty cycle for as long as the duty cycle lasts. At 20--22 hours
 idle it reaches 81--85 %. Splitting does not rescue it, in two separate ways --- on a branch idle in
 more than half the bins the criterion declines to split at all, and where it does split the excursion
-can *grow* (measured 47 % unsplit against 75 % at the default ``theta_max`` on one 12 h-idle line).
+can *grow* (measured 47 % for one pipe against 75 % for the same pipe as four, on a 12 h-idle line).
 
 The one-way model (``max_sweeps=1``) has a fixed target and is the only variant guaranteed inside the
 range of its inputs.
@@ -454,7 +436,7 @@ range of its inputs.
 **What you can do.** Treat any delivered temperature outside the hull of your inputs as carrying this
 overshoot rather than as a physical prediction, and compare against ``max_sweeps=1`` when you need a
 bound that cannot leave the hull. Be most suspicious on branches with a strong duty cycle, where the
-effect is largest, persistent, and least helped by ``theta_max``.
+effect is largest, persistent, and least helped by refining the pipe.
 
 **How it is checked.** Not at runtime --- the invariant a runtime check would assert is false, and a
 guard that fires on correct physics is worse than none. Its *size* is pinned by a test.
