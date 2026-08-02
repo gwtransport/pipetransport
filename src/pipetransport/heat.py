@@ -158,7 +158,14 @@ from scipy.fft import irfft, next_fast_len, rfft
 from scipy.signal import fftconvolve, lfilter
 from scipy.special import erfc, erfcx, exp1, j1, y1
 
-from pipetransport._transfer import NetworkTransfer, apply_segment_targets, paths_transfer, resolve_spinup
+from pipetransport._transfer import (
+    NetworkTransfer,
+    apply_banded,
+    apply_segment_targets,
+    pad_paths,
+    paths_transfer,
+    resolve_spinup,
+)
 from pipetransport._validation import _validate_no_nan, _validate_positive, _validate_tedges
 from pipetransport.network import PipeNetwork  # noqa: TC001 -- runtime dependency of the signatures
 from pipetransport.utils import solve_inverse_transport_banded, tedges_to_days
@@ -603,7 +610,7 @@ def segment_heat_rate(
     network: PipeNetwork,
     kappa: float | pd.Series,
     depth: float | pd.Series = 1.0,
-    eta: float | pd.Series | None = None,
+    eta: float | pd.Series = np.inf,
     kappa_pipe: float | pd.Series | None = None,
     film_coefficient: float | pd.Series | None = None,
 ) -> pd.Series:
@@ -639,9 +646,10 @@ def segment_heat_rate(
         the guard the pipe is: 0.01 % for a 100 mm service line and 0.4 % for a 400 mm main
         at a metre, 5.3 % at ``d_eff = 2 r_o``, 24 % for a DN1600 there, and 117 % for a
         DN2000 -- leaving the default depth on a transmission main is the mis-entry to watch.
-    eta : float or pandas.Series or None, optional
-        Surface film coefficient [m/day]. ``None`` (default) or ``inf`` is a
-        prescribed-temperature surface (no displacement).
+    eta : float or pandas.Series, optional
+        Surface film coefficient [m/day]. ``inf`` (default) is a prescribed-temperature
+        surface: the radiation length ``kappa / eta`` is then zero and the surface displaces
+        the effective depth by nothing.
     kappa_pipe : float or pandas.Series or None, optional
         Pipe wall conductivity over the water heat capacity [m²/day]. ``None`` (default)
         omits the wall term -- the bare-pipe limit, which also reads the soil resistance from
@@ -709,7 +717,7 @@ def segment_heat_rate(
     depth_seg = per_segment(depth, "depth")
     _validate_positive(kappa_seg, name="kappa")
     _validate_positive(depth_seg, name="depth")
-    eta_seg = None if eta is None else per_segment(eta, "eta")
+    eta_seg = per_segment(eta, "eta")
     if eta_seg is not None and not np.all((eta_seg > 0.0) | np.isposinf(eta_seg)):
         msg = "eta must be positive (inf is a prescribed-temperature surface)"
         raise ValueError(msg)
@@ -728,7 +736,7 @@ def segment_heat_rate(
         r_o = r_i + thickness
         wall_resistance = np.log(r_o / r_i) / (2.0 * np.pi * kappa_pipe_seg)
 
-    d_eff = depth_seg if eta_seg is None else depth_seg + kappa_seg / eta_seg
+    d_eff = depth_seg + kappa_seg / eta_seg  # kappa/inf is exactly zero: no branch needed
     if not np.all(d_eff > r_o):
         msg = "burial depth must exceed the pipe radius (d_eff > r_o); the line-source geometry needs d >> r"
         raise ValueError(msg)
@@ -773,50 +781,6 @@ class _HeatSystem(NamedTuple):
     segment_names: tuple[str, ...]
     internal: NetworkTransfer
     reporting: NetworkTransfer
-
-
-def _apply(transfer: NetworkTransfer, values: npt.NDArray[np.floating]) -> npt.NDArray[np.floating]:
-    """Apply a banded operator to a padded input series, rows in band layout.
-
-    Parameters
-    ----------
-    transfer : NetworkTransfer
-        Operator whose rows are to be applied.
-    values : ndarray
-        Input series on the operator's padded input grid.
-
-    Returns
-    -------
-    ndarray
-        One value per operator row and output bin, shape ``(n_rows, n_cout)``.
-    """
-    columns = np.clip(transfer.col_start[..., None] + np.arange(transfer.band_vals.shape[-1]), 0, len(values) - 1)
-    return np.einsum("nkb,nkb->nk", transfer.band_vals, values[columns])
-
-
-def _pad_paths(chains: list[npt.NDArray[np.intp]]) -> tuple[npt.NDArray[np.intp], npt.NDArray[np.bool_]]:
-    """Stack ragged path chains into the padded index matrix the operator builder takes.
-
-    Parameters
-    ----------
-    chains : list of ndarray
-        Segment rows of each path, source outward; may differ in length and may be empty
-        (a row reporting at the source itself).
-
-    Returns
-    -------
-    paths_idx : ndarray of intp
-        Segment row of each path step, shape ``(len(chains), max_depth)``.
-    active : ndarray of bool
-        Which slots of ``paths_idx`` are real path steps.
-    """
-    lengths = np.array([chain.size for chain in chains], dtype=np.intp)
-    max_depth = int(lengths.max(initial=0))
-    active = np.arange(max_depth) < lengths[:, None]
-    paths_idx = np.zeros((len(chains), max_depth), dtype=np.intp)
-    if max_depth:
-        paths_idx[active] = np.concatenate(chains)
-    return paths_idx, active
 
 
 def _build_system(
@@ -915,7 +879,7 @@ def _build_system(
     seg_of = {name: e for e, name in enumerate(segments.index)}
     with np.errstate(divide="ignore"):
         ratio = volume / network.segment_flow(flow=demand)[:, 0]
-    end_paths, end_active = _pad_paths([
+    end_paths, end_active = pad_paths([
         np.array([seg_of[name] for name in network.paths[node]], dtype=np.intp) for node in network.endmembers
     ])
     per_path = np.sum(np.where(end_active, ratio[end_paths], 0.0), axis=1)
@@ -942,8 +906,8 @@ def _build_system(
             tedges=tedges_p,
             depth=depth,
             alpha=float(soil.loc[cover, "alpha"]),
-            kappa=None if np.isposinf(eta_cover) else float(soil.loc[cover, "kappa"]),
-            eta=None if np.isposinf(eta_cover) else eta_cover,
+            kappa=float(soil.loc[cover, "kappa"]),
+            eta=eta_cover,
             surface_tedges=surface_grid,
         )
 
@@ -957,7 +921,7 @@ def _build_system(
     ).to_numpy(dtype=float)
     thickness = segments["wall_thickness"].to_numpy(dtype=float) if kappa_pipe is not None else np.zeros(len(segments))
     r_o = segments["diameter"].to_numpy(dtype=float) / 2.0 + thickness
-    d_eff = depth_seg + np.where(np.isposinf(eta_seg), 0.0, kappa_seg / eta_seg)
+    d_eff = depth_seg + kappa_seg / eta_seg
     dbar = _deficit_kernel(n_bins, dt_days, r_o=r_o, d_eff=d_eff, alpha=alpha_seg, kappa=kappa_seg)
     # The halo memory convolves this frozen kernel with a new flux history on every sweep, so
     # the kernel is transformed once here, at the length ``scipy.signal.fftconvolve`` would
@@ -983,8 +947,8 @@ def _build_system(
     # reads its own source series across an empty path.
     entry_chains = [chain(str(segments.loc[name, "from"])) for name in segments.index]
     delivery = [np.concatenate([up, [e]]).astype(np.intp) for e, up in enumerate(entry_chains)]
-    int_paths, int_active = _pad_paths(delivery + delivery + entry_chains)
-    rep_paths, rep_active = _pad_paths([chain(node) for node in requested])
+    int_paths, int_active = pad_paths(delivery + delivery + entry_chains)
+    rep_paths, rep_active = pad_paths([chain(node) for node in requested])
     rep_flow = network.node_flow(flow=demand_p, nodes=requested)
 
     def build(
@@ -1113,7 +1077,7 @@ def _converge_targets(
     targets = system.t_inf if initial is None else initial
     # The transport reading of the source series is the same in every sweep; only the bias
     # follows the iterate.
-    transported = _apply(system.internal, tin_padded)
+    transported = apply_banded(system.internal, tin_padded)
     for _ in range(max_sweeps - 1):
         updated = _update_targets(system, _internal_pass(system, transported, targets), targets, tin_padded, fabricated)
         increment = float(np.max(np.abs(updated - targets)))
@@ -1166,7 +1130,7 @@ def _internal_pass(
     system : _HeatSystem
         Prebuilt operators and kernels.
     transported : ndarray
-        Reading of the internal operator on the source series, ``_apply(system.internal,
+        Reading of the internal operator on the source series, ``apply_banded(system.internal,
         tin_padded)``. It does not depend on the targets, so the sweep loop hoists it out.
     targets : ndarray
         Current per-segment relaxation targets.
@@ -1465,7 +1429,7 @@ def source_to_endmember(
     tin_padded = np.concatenate([np.full(system.n_pad, tin[0]), tin])
 
     targets = _converge_targets(system, tin_padded, max_sweeps=max_sweeps, atol=atol)
-    out = _apply(system.reporting, tin_padded) + apply_segment_targets(system.reporting, targets)
+    out = apply_banded(system.reporting, tin_padded) + apply_segment_targets(system.reporting, targets)
     out[~system.reporting.valid_out] = np.nan
     return out
 
@@ -1750,7 +1714,7 @@ def endmember_to_source(
     # the bins it moves by more than ``gap_atol`` are the ones the record does not support.
     # The one-way reverse needs none of this: with a fixed target it is exactly local.
     if not covered.all():
-        reads_invented = _apply(system.internal, (~covered).astype(float)) > 0.0
+        reads_invented = apply_banded(system.internal, (~covered).astype(float)) > 0.0
         n_seg = len(system.length)
         honest = converge(reads_invented[:n_seg] | reads_invented[n_seg : 2 * n_seg] | reads_invented[2 * n_seg :])
         with np.errstate(invalid="ignore"):

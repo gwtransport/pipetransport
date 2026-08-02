@@ -320,6 +320,50 @@ def _interp_rows(
     return out
 
 
+def apply_banded(transfer: NetworkTransfer, values: npt.NDArray[np.floating]) -> npt.NDArray[np.floating]:
+    """Apply a banded operator to a padded input series, rows in band layout.
+
+    Parameters
+    ----------
+    transfer : NetworkTransfer
+        Operator whose rows are to be applied.
+    values : ndarray
+        Input series on the operator's padded input grid.
+
+    Returns
+    -------
+    ndarray
+        One value per operator row and output bin, shape ``(n_rows, n_cout)``.
+    """
+    columns = np.clip(transfer.col_start[..., None] + np.arange(transfer.band_vals.shape[-1]), 0, len(values) - 1)
+    return np.einsum("nkb,nkb->nk", transfer.band_vals, values[columns])
+
+
+def pad_paths(chains: list[npt.NDArray[np.intp]]) -> tuple[npt.NDArray[np.intp], npt.NDArray[np.bool_]]:
+    """Stack ragged path chains into the padded index matrix the operator builder takes.
+
+    Parameters
+    ----------
+    chains : list of ndarray
+        Segment rows of each path, source outward; may differ in length and may be empty
+        (a row reporting at the source itself).
+
+    Returns
+    -------
+    paths_idx : ndarray of intp
+        Segment row of each path step, shape ``(len(chains), max_depth)``.
+    active : ndarray of bool
+        Which slots of ``paths_idx`` are real path steps.
+    """
+    lengths = np.array([chain.size for chain in chains], dtype=np.intp)
+    max_depth = int(lengths.max(initial=0))
+    active = np.arange(max_depth) < lengths[:, None]
+    paths_idx = np.zeros((len(chains), max_depth), dtype=np.intp)
+    if max_depth:
+        paths_idx[active] = np.concatenate(chains)
+    return paths_idx, active
+
+
 def paths_transfer(
     *,
     tedges_days: npt.NDArray[np.floating],
@@ -845,13 +889,7 @@ def network_transfer(
     volume = retardation_factor * network.segments["volume"].to_numpy(dtype=float)
     # Padded per-node path matrix: row n holds the segment rows of node n's path, source
     # outward; `active` marks the real slots.
-    paths = [network.segments.index.get_indexer(list(network.paths[node])) for node in requested]
-    lengths = np.array([path.size for path in paths], dtype=np.intp)
-    max_depth = int(lengths.max(initial=0))
-    active = np.arange(max_depth) < lengths[:, None]
-    paths_idx = np.zeros((len(requested), max_depth), dtype=np.intp)
-    if max_depth:
-        paths_idx[active] = np.concatenate(paths)
+    paths_idx, active = pad_paths([network.segments.index.get_indexer(list(network.paths[node])) for node in requested])
 
     # Warm-start length: each path's source-to-node travel time at the leading flow rate.
     # resolve_spinup discards the paths it cannot warm-start one by one -- a stagnant segment

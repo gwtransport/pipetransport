@@ -41,7 +41,7 @@ import numpy as np
 import numpy.typing as npt
 import pandas as pd
 
-from pipetransport._transfer import network_transfer
+from pipetransport._transfer import apply_banded, network_transfer
 from pipetransport._validation import _validate_no_nan, _validate_tedges
 from pipetransport.network import PipeNetwork  # noqa: TC001 -- runtime dependency of the signatures
 from pipetransport.utils import solve_inverse_transport_banded
@@ -182,8 +182,7 @@ def source_to_endmember(
     # The warm start extends the record backwards at the first observed quality.
     cin = np.concatenate([np.full(n_pad, cin[0]), cin])
 
-    columns = np.clip(transfer.col_start[..., None] + np.arange(transfer.band_vals.shape[-1]), 0, len(cin) - 1)
-    out = np.einsum("nkb,nkb->nk", transfer.band_vals, cin[columns])
+    out = apply_banded(transfer, cin)
     out[~transfer.valid_out] = np.nan
     return out
 

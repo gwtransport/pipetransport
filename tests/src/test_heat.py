@@ -25,7 +25,7 @@ from scipy.linalg import solve_banded
 from scipy.special import erfc, erfcx, exp1, j1, kve, y1
 
 from pipetransport import heat, transport
-from pipetransport._transfer import apply_segment_targets, paths_transfer
+from pipetransport._transfer import apply_banded, apply_segment_targets, paths_transfer
 from pipetransport.network import PipeNetwork
 from pipetransport.utils import tedges_to_days
 
@@ -1264,7 +1264,7 @@ def test_one_way_model_is_the_first_iterate(heat_network, hourly_tedges, diurnal
         spinup="constant",
     )
     padded = np.concatenate([np.full(system.n_pad, tin[0]), tin])
-    expected = heat._apply(system.reporting, padded) + apply_segment_targets(system.reporting, system.t_inf)
+    expected = apply_banded(system.reporting, padded) + apply_segment_targets(system.reporting, system.t_inf)
     expected[~system.reporting.valid_out] = np.nan
 
     np.testing.assert_array_equal(np.isnan(one_way), np.isnan(expected))
@@ -1683,7 +1683,7 @@ def test_the_inflow_rows_read_the_water_the_parent_delivered(heat_network, short
     )
     rng = np.random.default_rng(41)
     tin = 9.0 + rng.normal(0.0, 1.0, system.n_bins)
-    t_int = heat._internal_pass(system, heat._apply(system.internal, tin), system.t_inf)
+    t_int = heat._internal_pass(system, apply_banded(system.internal, tin), system.t_inf)
     n_seg = len(heat_network.segments)
     delivered, weighted, inflow = t_int[:n_seg], t_int[n_seg : 2 * n_seg], t_int[2 * n_seg :]
 
@@ -1726,7 +1726,7 @@ def test_leaf_delivery_rows_agree_with_the_transport_module(heat_network, short_
     # The rates the operator was built with, per cover class; what they should be is pinned
     # separately, and reusing them here keeps this test about the operator rows alone.
     rates = pd.Series(system.internal.target_terms.segment_rate[:n_seg], index=heat_network.segments.index)
-    bare = heat._apply(system.internal, tin) + apply_segment_targets(system.internal, np.zeros((n_seg, n)))
+    bare = apply_banded(system.internal, tin) + apply_segment_targets(system.internal, np.zeros((n_seg, n)))
     bare = np.where(system.internal.valid_out, bare, np.nan)
 
     checked = 0
@@ -1772,7 +1772,7 @@ def test_wall_flux_vanishes_without_a_temperature_difference(heat_network, hourl
     uniform = np.full(system.n_bins, 14.0)
     targets = heat._update_targets(
         system,
-        heat._internal_pass(system, heat._apply(system.internal, uniform), system.t_inf),
+        heat._internal_pass(system, apply_banded(system.internal, uniform), system.t_inf),
         system.t_inf,
         uniform,
     )
@@ -1870,14 +1870,14 @@ def test_declaring_a_pipe_as_series_segments_leaves_the_transport_operator_alone
     assert len(whole.length) == len(heat_network.segments), "one flux history per pipe"
 
     tin = np.random.default_rng(7).normal(10.0, 2.0, whole.n_bins)
-    reference = heat._apply(whole.reporting, tin)
+    reference = apply_banded(whole.reporting, tin)
     # The deviation is round-off in the composed displacement maps and grows with the record
     # (about 64 ulps of the cumulative volume over the per-bin node volume), so it is pinned
     # absolutely rather than bit-exactly; it measures ~2e-13 K on these ten days.
     for k in (2, 3, 4):
         split = system(chained(k))
         assert len(split.length) == k * len(heat_network.segments)
-        np.testing.assert_allclose(heat._apply(split.reporting, tin), reference, atol=1e-11)
+        np.testing.assert_allclose(apply_banded(split.reporting, tin), reference, atol=1e-11)
         np.testing.assert_array_equal(split.reporting.valid_out, whole.reporting.valid_out)
         np.testing.assert_allclose(
             split.reporting.residence_time_out, whole.reporting.residence_time_out, rtol=1e-10, equal_nan=True
