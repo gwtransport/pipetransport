@@ -385,11 +385,14 @@ def solve_inverse_transport_banded(
     # survives to observation k, so a constant source c is observed as c * row_survival[k];
     # dividing by the plain column sums would evaluate the target at the delivered quality and
     # pull the answer toward it as lambda grows. Weighting the denominator the same way makes
-    # a constant reproduce itself for any decay and any lambda, so the truth annihilates both
-    # terms of the objective and stays the exact minimizer. Without decay every covered row
-    # sums to one up to round-off, so this reduces to the plain column sum to within 1e-13 --
-    # a shift of the target, not of the operator, and 1e-13 of it. The sliver
-    # 0 < surv_sum <= _EPSILON_COEFF_SUM is left untargeted (filled with 0).
+    # a constant reproduce itself for any lambda wherever the column is targeted at all, so
+    # the truth annihilates both terms of the objective and stays the exact minimizer.
+    # Without decay a covered row sums to one within the coverage tolerance the operator
+    # admits, so this reduces to the plain column sum to that order -- a shift of the target,
+    # not of the operator. The sliver 0 < surv_sum <= _EPSILON_COEFF_SUM is left untargeted
+    # (filled with 0); because surv_sum carries the survival, that floor is reached at a
+    # survival around 1e-5 rather than 1e-10 -- a regime where the observation retains
+    # essentially nothing of the source and no target is meaningful.
     row_survival = np.where(in_range, band_vals, 0.0).sum(axis=1)
     surv_sum = np.bincount(
         cols_clipped[in_range], weights=(band_vals * row_survival[:, None])[in_range], minlength=n_output

@@ -1393,7 +1393,7 @@ def endmember_to_source(
     >>> recovered = endmember_to_source(tout=measured, **shared)
     >>> inner = slice(24, -24)  # the edges lean on a fabricated input; see Notes
     >>> residual = float(np.nanmax(np.abs(recovered[inner] - tin[inner])))
-    >>> 1e-7 < residual < 5e-7  # a Tikhonov floor, not a stopping-rule artefact
+    >>> residual < 1e-8  # the Tikhonov pull, O(lambda) once the target preserves constants
     True
     """
     if max_sweeps < 1:
