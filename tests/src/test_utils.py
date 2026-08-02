@@ -400,12 +400,15 @@ class TestSolveInverseTransportBanded:
         np.testing.assert_allclose(errors[1] / errors[0], 100.0, rtol=1e-3)
 
     def test_matches_a_dense_tikhonov_reference_on_an_ill_posed_operator(self):
-        # Plain 3-wide moving average, deliberately rank-deficient (22 rows for 24 unknowns), so
+        # 3-wide moving average, deliberately rank-deficient (22 rows for 24 unknowns), so
         # lambda genuinely shapes the answer and the regularization target semantics are
-        # exercised rather than washed out.
+        # exercised rather than washed out. Each row additionally carries its own surviving
+        # fraction: with rows summing to exactly one the two normalizations of the target are
+        # bit-identical, and the reference would agree with either convention.
         n = 24
         n_obs = n - 2
-        band_vals = np.full((n_obs, 3), 1.0 / 3.0)
+        survival = np.exp(-0.05 * np.arange(n_obs))
+        band_vals = np.full((n_obs, 3), 1.0 / 3.0) * survival[:, None]
         col_start = np.arange(n_obs, dtype=np.intp)
         dense = _dense_from_banded(band_vals, col_start, n)
         x_true = 2.0 + np.cos(0.9 * np.arange(n))
@@ -421,10 +424,11 @@ class TestSolveInverseTransportBanded:
         )
 
         # Independent dense assembly of (WᵀW + lambda I) x = Wᵀ observed + lambda x_target with
-        # x_target the transpose-and-normalize of W applied to observed.
-        col_sum = dense.sum(axis=0)
-        assert np.all(col_sum > 0.0)
-        x_target = (dense.T @ observed) / col_sum
+        # x_target the transpose-and-normalize of W applied to observed, normalized by the
+        # survival-weighted column totals so that it preserves constants.
+        surv_sum = dense.T @ dense.sum(axis=1)
+        assert np.all(surv_sum > 0.0)
+        x_target = (dense.T @ observed) / surv_sum
         lhs = dense.T @ dense + lam * np.eye(n)
         expected = np.linalg.solve(lhs, dense.T @ observed + lam * x_target)
 
@@ -432,6 +436,10 @@ class TestSolveInverseTransportBanded:
         # The reference is not simply x_true: the ill-posed inverse is visibly regularized, so
         # agreement above is a real check on the solver rather than on the data.
         assert np.max(np.abs(expected - x_true)) > 1e-3
+        # ... and the two normalizations really do differ here, so the assertion above
+        # discriminates the convention instead of passing under either.
+        stale = np.linalg.solve(lhs, dense.T @ observed + lam * (dense.T @ observed) / dense.sum(axis=0))
+        assert np.max(np.abs(stale - expected)) > 1e-6
 
     def test_regularization_target_is_reached_when_the_data_are_uninformative(self):
         # A single observation over three columns leaves two directions unconstrained. The
@@ -451,6 +459,34 @@ class TestSolveInverseTransportBanded:
 
         np.testing.assert_allclose(recovered, [5.0, 5.0, 5.0], rtol=1e-12)
         np.testing.assert_allclose(band_vals @ recovered, observed, rtol=1e-12)
+
+    @pytest.mark.parametrize("survival", [1.0, 0.6, 0.2])
+    @pytest.mark.parametrize("lam", [1e-10, 1e-4, 1e-2, 1.0])
+    def test_a_constant_input_survives_a_decayed_operator_at_every_lambda(self, survival, lam):
+        """A decayed operator must not drag the answer toward the value it delivered.
+
+        ``W = s I`` is the whole defect in one row: every row sums to the surviving fraction
+        ``s``, so a constant input ``c`` is observed as ``s c``. Normalizing the regularization
+        target by the plain column sums evaluates it at ``s c`` -- the *delivered* quality --
+        and the solve returns ``c s (s + lam) / (s**2 + lam)``, which equals ``c`` for every
+        ``lam`` only at ``s = 1``. At ``s = 0.2, lam = 1`` that is ``0.23 c``. The target has to
+        preserve constants for the truth to annihilate both terms of the objective, which is
+        what makes it the exact minimizer independently of ``lam``.
+        """
+        n = 50
+        constant = 3.7
+        band_vals = np.full((n, 1), survival)
+        col_start = np.arange(n, dtype=np.intp)
+
+        recovered = solve_inverse_transport_banded(
+            band_vals=band_vals,
+            col_start=col_start,
+            observed=np.full(n, survival * constant),
+            n_output=n,
+            regularization_strength=lam,
+        )
+
+        np.testing.assert_allclose(recovered, constant, rtol=0.0, atol=1e-12)
 
     def test_stacked_operators_with_unsorted_rows(self):
         # Two operators with different bandwidths and different col_start conventions, stacked
