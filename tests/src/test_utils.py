@@ -452,6 +452,34 @@ class TestSolveInverseTransportBanded:
         np.testing.assert_allclose(recovered, [5.0, 5.0, 5.0], rtol=1e-12)
         np.testing.assert_allclose(band_vals @ recovered, observed, rtol=1e-12)
 
+    @pytest.mark.parametrize("survival", [1.0, 0.6, 0.2])
+    @pytest.mark.parametrize("lam", [1e-10, 1e-4, 1e-2, 1.0])
+    def test_a_constant_input_survives_a_decayed_operator_at_every_lambda(self, survival, lam):
+        """A decayed operator must not drag the answer toward the value it delivered.
+
+        ``W = s I`` is the whole defect in one row: every row sums to the surviving fraction
+        ``s``, so a constant input ``c`` is observed as ``s c``. Normalizing the regularization
+        target by the plain column sums evaluates it at ``s c`` -- the *delivered* quality --
+        and the solve returns ``c s (s + lam) / (s**2 + lam)``, which equals ``c`` for every
+        ``lam`` only at ``s = 1``. At ``s = 0.2, lam = 1`` that is ``0.23 c``. The target has to
+        preserve constants for the truth to annihilate both terms of the objective, which is
+        what makes it the exact minimizer independently of ``lam``.
+        """
+        n = 50
+        constant = 3.7
+        band_vals = np.full((n, 1), survival)
+        col_start = np.arange(n, dtype=np.intp)
+
+        recovered = solve_inverse_transport_banded(
+            band_vals=band_vals,
+            col_start=col_start,
+            observed=np.full(n, survival * constant),
+            n_output=n,
+            regularization_strength=lam,
+        )
+
+        np.testing.assert_allclose(recovered, constant, rtol=0.0, atol=1e-12)
+
     def test_stacked_operators_with_unsorted_rows(self):
         # Two operators with different bandwidths and different col_start conventions, stacked
         # into one system and then row-shuffled. The result must be permutation invariant and

@@ -320,8 +320,11 @@ def solve_inverse_transport_banded(
 
     The regularization target is the transpose-and-normalize of ``W`` applied to ``observed``:
     every input bin is pulled toward the contribution-weighted average of the output bins it
-    fed. Columns with no forward contribution are decoupled (unit diagonal) so the system
-    stays symmetric positive definite, and are returned as NaN.
+    fed, normalized by the *survival-weighted* column totals so that a constant input
+    reproduces itself for any decay and any λ -- the truth then annihilates both terms of the
+    objective and remains the exact minimizer however strongly the solve is regularized.
+    Columns with no forward contribution are decoupled (unit diagonal) so the system stays
+    symmetric positive definite, and are returned as NaN.
 
     Parameters
     ----------
@@ -377,10 +380,22 @@ def solve_inverse_transport_banded(
     if not np.any(col_active):
         return np.full(n_output, np.nan)
 
-    # Reverse target: transpose-and-normalize W applied to observed. The sliver
-    # 0 < col_sum <= _EPSILON_COEFF_SUM is left untargeted (filled with 0).
+    # Reverse target: transpose-and-normalize W applied to observed, normalized by the
+    # *survival-weighted* column totals. Row k of W sums to the fraction of the source that
+    # survives to observation k, so a constant source c is observed as c * row_survival[k];
+    # dividing by the plain column sums would evaluate the target at the delivered quality and
+    # pull the answer toward it as lambda grows. Weighting the denominator the same way makes
+    # a constant reproduce itself for any decay and any lambda, so the truth annihilates both
+    # terms of the objective and stays the exact minimizer. Without decay every covered row
+    # sums to one up to round-off, so this reduces to the plain column sum to within 1e-13 --
+    # a shift of the target, not of the operator, and 1e-13 of it. The sliver
+    # 0 < surv_sum <= _EPSILON_COEFF_SUM is left untargeted (filled with 0).
+    row_survival = np.where(in_range, band_vals, 0.0).sum(axis=1)
+    surv_sum = np.bincount(
+        cols_clipped[in_range], weights=(band_vals * row_survival[:, None])[in_range], minlength=n_output
+    )
     with np.errstate(invalid="ignore", divide="ignore"):
-        x_target = np.where(col_sum > _EPSILON_COEFF_SUM, wt_observed / col_sum, 0.0)
+        x_target = np.where(surv_sum > _EPSILON_COEFF_SUM, wt_observed / surv_sum, 0.0)
 
     # Lower-banded WᵀW, one sub-diagonal at a time. Band row d holds WᵀW[j + d, j]; row k of W
     # contributes band_vals[k, b] * band_vals[k, b + d] to column j = col_start[k] + b. Only

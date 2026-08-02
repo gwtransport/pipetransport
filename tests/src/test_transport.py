@@ -598,6 +598,37 @@ def test_round_trip_recovers_the_source_signal(network, hourly_tedges, diurnal_d
     assert np.array_equal(np.isnan(recovered), unarrived)
 
 
+def test_a_constant_source_under_decay_is_recovered_at_a_noise_working_lambda(network, hourly_tedges, diurnal_demand):
+    """Raising lambda to handle noise must not bias the reconstruction toward the delivered quality.
+
+    Under decay the rows of the operator sum to the surviving fraction, so a constant produced
+    signal arrives attenuated. If the regularization target is normalized by the plain column
+    sums it evaluates to that attenuated value, and the Tikhonov pull drags the answer away
+    from the constant as lambda grows -- invisible at the 1e-10 default, material at the
+    ``(noise_std / signal_amplitude)**2`` the docstring recommends. A target that preserves
+    constants makes the truth annihilate both terms of the objective, so the constant comes
+    back exactly, for every lambda and every decay rate.
+    """
+    demand = diurnal_demand(network, hourly_tedges)
+    constant = 2.5
+    cin = np.full(len(hourly_tedges) - 1, constant)
+    shared = {
+        "flow": demand,
+        "tedges": hourly_tedges,
+        "cout_tedges": hourly_tedges,
+        "network": network,
+        "nodes": ["T1", "T4"],
+        "decay_rate": pd.Series(np.linspace(0.1, 0.8, len(network.segments)), index=network.segments.index),
+    }
+
+    measured = source_to_endmember(cin=cin, **shared)
+    assert np.nanmean(measured) < 0.9 * constant, "the operator must actually attenuate, or the test is vacuous"
+    recovered = endmember_to_source(cout=measured, regularization_strength=1e-2, **shared)
+
+    interior = slice(24, -24)
+    np.testing.assert_allclose(recovered[interior], constant, rtol=0.0, atol=1e-9)
+
+
 def test_a_production_spell_comes_back_nan_not_zero(single_pipe_35):
     """Source bins the plant produces nothing in are unconstrained, and must say so.
 
