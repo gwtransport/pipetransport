@@ -741,10 +741,12 @@ def _build_system(
     eta_series = pd.Series(eta_seg, index=segments.index)
     _validate_positive(alpha_seg, name="soil alpha")
 
-    # Spin-up, exactly as network_transfer resolves it: the longest endmember travel time at
-    # the leading flow rate, taken over the paths with a finite one so that a single stagnant
-    # branch does not suppress the padding of the whole call. Every internal node sits on an
-    # endmember path, so those paths bound the internal rows too.
+    # Spin-up, exactly as network_transfer resolves it: each endmember's travel time at the
+    # leading flow rate, with resolve_spinup dropping the paths it cannot warm-start one by
+    # one, so a single stagnant or unreachably deep branch does not suppress the padding of
+    # the whole call. Every internal node sits on an endmember path, so those paths bound the
+    # internal rows too -- and the candidate list is the endmembers whatever ``nodes`` asks
+    # for, so no row's coverage depends on which nodes were requested.
     volume = segments["volume"].to_numpy(dtype=float)
     seg_of = {name: e for e, name in enumerate(segments.index)}
     with np.errstate(divide="ignore"):
@@ -753,8 +755,7 @@ def _build_system(
         np.array([seg_of[name] for name in network.paths[node]], dtype=np.intp) for node in network.endmembers
     ])
     per_path = np.sum(np.where(end_active, ratio[end_paths], 0.0), axis=1)
-    warm_start_days = float(np.max(per_path[np.isfinite(per_path)], initial=0.0))
-    tedges_p, demand_p, n_pad = resolve_spinup(spinup, tedges=tedges, flow=demand, warm_start_days=warm_start_days)
+    tedges_p, demand_p, n_pad = resolve_spinup(spinup, tedges=tedges, flow=demand, warm_start_days=per_path)
 
     tedges_days = tedges_to_days(tedges_p)
     cout_days = tedges_to_days(cout_tedges, ref=tedges_p[0])

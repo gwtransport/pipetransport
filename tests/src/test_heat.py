@@ -1376,6 +1376,44 @@ def test_the_fixed_point_does_not_depend_on_how_long_the_record_runs(heat_pipe):
     assert abs(float(np.nanmean(longest[-24:]) - np.nanmean(short[-24:]))) > 0.1
 
 
+def test_an_over_cap_branch_does_not_void_the_warm_start_of_the_whole_network(soil, surface):
+    """One branch too long to warm-start must cost only itself its padding.
+
+    ``_build_system`` takes its warm start over every endmember path, so a single branch
+    behind a volume large enough to trip the padding cap used to leave the entire call on
+    strict validity -- including nodes whose own history is a few hours long. Unlike the
+    forward transport module the failure is unconditional here: there is no request order to
+    notice it by.
+    """
+    segments = pd.DataFrame(
+        {
+            "from": ["Plant", "A", "A"],
+            "to": ["A", "T1", "T2"],
+            "length": [1000.0, 200.0, 2.0e5],
+            "diameter": [0.3, 0.15, 1.0],
+            "cover": ["grass", "grass", "grass"],
+        },
+        index=["Plant-A", "A-T1", "A-T2"],
+    )
+    network = PipeNetwork(segments=segments, source="Plant")
+    tedges = pd.date_range("2025-06-01", periods=4 * 24 + 1, freq="h")
+    n = len(tedges) - 1
+    shared = dict(
+        tin=np.full(n, 9.0),
+        flow=pd.DataFrame({"T1": np.full(n, 400.0), "T2": np.full(n, 300.0)}),
+        tedges=tedges,
+        cout_tedges=tedges,
+        network=network,
+        soil=soil,
+        surface_temperature=surface(tedges),
+    )
+
+    out = heat.source_to_endmember(nodes=["T1", "T2"], **shared)
+
+    assert not np.isnan(out[0]).any(), "T1 sits behind 74 m3 and is warm-startable"
+    assert np.all(np.isnan(out[1])), "T2 sits behind 1.6e5 m3, well over a year of transit"
+
+
 def test_halo_memory_converges_under_bin_refinement():
     """The bin-averaged deficit convolution converges to the continuous Duhamel integral.
 

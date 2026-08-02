@@ -475,6 +475,39 @@ def test_spinup_none_marks_the_leading_bins_nan(network, hourly_tedges, constant
         np.testing.assert_allclose(strict[i][both], warm[i][both], rtol=0.0, atol=1e-12)
 
 
+def test_an_over_cap_endmember_does_not_suppress_the_warm_start_of_its_siblings(hourly_tedges):
+    """The padding cap is a per-path judgement; one huge branch must not void the other rows.
+
+    Beyond a certain length a constant history stops being a meaningful assumption and the
+    warm start is dropped in favour of strict validity. Deciding that on the maximum over the
+    requested paths makes the whole call fall back together, so which nodes a caller asks for
+    silently changes the coverage the others get -- the same invariant a stagnant leading
+    segment already has to respect.
+    """
+    segments = pd.DataFrame(
+        {"from": ["Plant", "A", "A"], "to": ["A", "T1", "T2"], "volume": [300.0, 40.0, 2.0e6]},
+        index=["Plant-A", "A-T1", "A-T2"],
+    )
+    network = PipeNetwork(segments=segments, source="Plant")
+    n_bins = len(hourly_tedges) - 1
+    demand = np.array([[400.0], [300.0]]) * np.ones((2, n_bins))
+    shared = {
+        "cin": np.ones(n_bins),
+        "flow": demand,
+        "tedges": hourly_tedges,
+        "cout_tedges": hourly_tedges,
+        "network": network,
+    }
+
+    solo = source_to_endmember(nodes=["T1"], **shared)
+    both = source_to_endmember(nodes=["T1", "T2"], **shared)
+
+    assert not np.isnan(solo[0]).any(), "T1 sits behind 340 m3 and is warm-startable on its own"
+    assert np.isnan(both[1]).any(), "T2 sits behind 2e6 m3 and cannot be warm-started at all"
+    np.testing.assert_array_equal(np.isnan(both[0]), np.isnan(solo[0]))
+    np.testing.assert_allclose(both[0], solo[0], rtol=0.0, atol=1e-12)
+
+
 # ============================================================================
 # Reverse direction
 # ============================================================================

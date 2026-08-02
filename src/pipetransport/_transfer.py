@@ -794,16 +794,15 @@ def network_transfer(
     if max_depth:
         paths_idx[active] = np.concatenate(paths)
 
-    # Warm-start length: the longest source-to-node travel time at the leading flow rate. A
-    # stagnant segment makes its own path's warm start infinite; the max runs over the finite
-    # paths so that one closed tap leaves the other nodes their padding, and an empty max is
-    # "no warm start". np.where rather than multiplying by `active`, because inf * 0 is NaN.
+    # Warm-start length: each path's source-to-node travel time at the leading flow rate.
+    # resolve_spinup discards the paths it cannot warm-start one by one -- a stagnant segment
+    # makes its own path's warm start infinite -- so one closed tap leaves the other nodes
+    # their padding. np.where rather than multiplying by `active`, because inf * 0 is NaN.
     with np.errstate(divide="ignore"):
         ratio = volume / network.segment_flow(flow=demand)[:, 0]
     per_path = np.sum(np.where(active, ratio[paths_idx], 0.0), axis=1)
-    warm_start_days = float(np.max(per_path[np.isfinite(per_path)], initial=0.0))
 
-    tedges, demand, n_pad = resolve_spinup(spinup, tedges=tedges, flow=demand, warm_start_days=warm_start_days)
+    tedges, demand, n_pad = resolve_spinup(spinup, tedges=tedges, flow=demand, warm_start_days=per_path)
     transfer = paths_transfer(
         tedges_days=tedges_to_days(tedges),
         cout_tedges_days=tedges_to_days(cout_tedges, ref=tedges[0]),
@@ -822,16 +821,19 @@ def resolve_spinup(
     *,
     tedges: pd.DatetimeIndex,
     flow: npt.NDArray[np.floating],
-    warm_start_days: float,
+    warm_start_days: npt.NDArray[np.floating],
 ) -> tuple[pd.DatetimeIndex, npt.NDArray[np.floating], int]:
     """Validate the ``spinup`` policy and prepend the warm-start bins it implies.
 
-    ``"constant"`` extends the record backwards by ``warm_start_days``, holding every
-    endmember demand at its first observed value, so the earliest output bins are fed by a
-    defined (if assumed) history instead of coming back NaN. It falls back to no padding
-    whenever the warm start is undefined -- a zero or non-finite leading flow, a degenerate
-    first bin, or an implied padding so long that a constant history is not a meaningful
-    assumption -- leaving the strict-validity NaN in place.
+    ``"constant"`` extends the record backwards far enough to cover the longest path that can
+    usefully be warm-started, holding every endmember demand at its first observed value, so
+    the earliest output bins are fed by a defined (if assumed) history instead of coming back
+    NaN. A path is discarded as a candidate when its warm start is undefined -- a zero or
+    non-finite leading flow -- or when the padding it implies is so long that a constant
+    history is not a meaningful assumption; those paths keep their strict-validity NaN. Both
+    judgements are made **per path**, so one stagnant or unreachably deep branch costs only
+    itself its warm start: a node's coverage must not depend on which other nodes the caller
+    happened to ask for, nor on a sibling it shares no pipe with.
 
     Parameters
     ----------
@@ -841,9 +843,10 @@ def resolve_spinup(
         Input bin edges, length ``n_cin + 1``.
     flow : ndarray
         Endmember demand of shape ``(n_endmembers, n_cin)``.
-    warm_start_days : float
-        Duration to cover, normally the longest source-to-node travel time at the leading
-        flow rate.
+    warm_start_days : ndarray
+        Duration to cover for each path, normally its source-to-node travel time at the
+        leading flow rate. Non-positive and non-finite entries are candidates that cannot be
+        warm-started at all.
 
     Returns
     -------
@@ -867,16 +870,21 @@ def resolve_spinup(
 
     bin_width = tedges[1] - tedges[0]
     bin_width_days = bin_width / pd.Timedelta(days=1)
-    if not (np.isfinite(warm_start_days) and warm_start_days > 0.0 and bin_width_days > 0.0):
+    if not bin_width_days > 0.0:
         return tedges, flow, 0
-    # One extra bin so the longest path's source window for the earliest original output bin
-    # lies strictly inside the padded range rather than touching its edge.
-    n_pad_float = np.ceil(warm_start_days / bin_width_days) + 1.0
-    # Beyond this a constant history is not a meaningful warm start (unphysical geometry or a
-    # near-stagnant leading flow), so fall through to strict validity rather than allocate.
-    if n_pad_float > max(10_000, 10 * flow.shape[1]):
+    # One extra bin so each path's source window for the earliest original output bin lies
+    # strictly inside the padded range rather than touching its edge. Beyond the cap a
+    # constant history is not a meaningful warm start (unphysical geometry or a near-stagnant
+    # leading flow), so that path falls through to strict validity rather than allocate; the
+    # padding is the longest of the candidates that survive, and an empty survivor set is
+    # "no warm start".
+    duration = np.asarray(warm_start_days, dtype=float)
+    with np.errstate(invalid="ignore"):
+        implied = np.ceil(duration / bin_width_days) + 1.0
+    usable = (duration > 0.0) & (implied <= max(10_000, 10 * flow.shape[1]))
+    n_pad = int(implied[usable].max(initial=0.0))
+    if n_pad == 0:
         return tedges, flow, 0
-    n_pad = int(n_pad_float)
     offsets = pd.TimedeltaIndex(bin_width * np.arange(n_pad, 0, -1))
     padded_tedges = (tedges[0] - offsets).append(tedges)
     padded_flow = np.concatenate([np.repeat(flow[:, :1], n_pad, axis=1), flow], axis=1)
