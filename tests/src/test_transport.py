@@ -375,10 +375,13 @@ def test_matches_brute_force_oracle_with_per_segment_decay(network, short_tedges
     ).cout(cin=cin, cout_tedges_days=tedges_to_days(cout_tedges, ref=short_tedges[0]))
 
     assert np.array_equal(np.isnan(cout[0]), np.isnan(reference))
-    # Precision floor: the oracle integrates exp(-phi) with scipy.integrate.quad at its default
-    # epsabs = 1.49e-8 per sub-interval, and an output bin here spans about six of them. Set the
-    # decay rates to zero (the test above) and the same comparison closes to 1e-12, which pins
-    # the residual on the reference's quadrature rather than on the operator.
+    # Precision floor of the *reference*, not of the operator: the oracle integrates exp(-phi)
+    # with scipy.integrate.quad at its default epsabs = 1.49e-8 per sub-interval, and an output
+    # bin here spans about six of them. Set the decay rates to zero (the test above) and the
+    # same comparison closes to 1e-12. Tightening this bound means tightening the reference:
+    # at quad(epsabs=1e-14) the worst gap falls to 1.7e-12 -- the operator is three orders
+    # better than the number below -- but the adaptive refinement takes this test from 1 s to
+    # 37 s, the whole unit suite's budget again for one parametrised case.
     np.testing.assert_allclose(cout[0], reference, rtol=0.0, atol=3e-8)
 
 
@@ -506,6 +509,49 @@ def test_an_over_cap_endmember_does_not_suppress_the_warm_start_of_its_siblings(
     assert np.isnan(both[1]).any(), "T2 sits behind 2e6 m3 and cannot be warm-started at all"
     np.testing.assert_array_equal(np.isnan(both[0]), np.isnan(solo[0]))
     np.testing.assert_allclose(both[0], solo[0], rtol=0.0, atol=1e-12)
+
+
+def test_warm_start_reproduces_a_genuinely_constant_history(network, hourly_tedges, diurnal_demand):
+    """``spinup="constant"`` is exact when the record's own pre-history really is constant.
+
+    Hold demand and quality constant over the leading three days of a diurnal record, then
+    truncate the record there: warm-starting the truncated record must reproduce the
+    untruncated, strictly-valid answer bin for bin, which is exactly the physical claim the
+    warm start makes. The decay makes the delivered residual read the travel times of the
+    assumed history, not just its quality: with a conservative tracer any operator whose rows
+    sum to 1 would pass here, because the bins the padding feeds see a constant ``cin`` by
+    construction. This pins the padding rule (repeat the *first* observed demand), the
+    padding length and the ``cin`` warm start together -- none of which the NaN-pattern test
+    above can see.
+    """
+    head = 72
+    diurnal = diurnal_demand(network, hourly_tedges).to_numpy(float).T
+    demand = diurnal.copy()
+    demand[:, :head] = diurnal[:, head][:, None]
+    cin = np.random.default_rng(3).uniform(0.5, 2.5, len(hourly_tedges) - 1)
+    cin[:head] = cin[head]
+
+    truth = source_to_endmember(
+        cin=cin,
+        flow=demand,
+        tedges=hourly_tedges,
+        cout_tedges=hourly_tedges,
+        network=network,
+        decay_rate=1.0,
+        spinup=None,
+    )[:, head:]
+    warm = source_to_endmember(
+        cin=cin[head:],
+        flow=demand[:, head:],
+        tedges=hourly_tedges[head:],
+        cout_tedges=hourly_tedges[head:],
+        network=network,
+        decay_rate=1.0,
+        spinup="constant",
+    )
+
+    assert not np.isnan(warm).any()
+    np.testing.assert_allclose(warm, truth, rtol=0.0, atol=1e-11)
 
 
 # ============================================================================
