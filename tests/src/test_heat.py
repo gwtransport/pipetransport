@@ -660,6 +660,31 @@ def test_batched_nodes_of_mixed_depth_agree_with_single_node_calls(heat_network,
         np.testing.assert_array_equal(alone.valid_out[0], batched.valid_out[row])
 
 
+def test_target_terms_carry_only_the_rows_still_on_a_path(heat_network, short_tedges, diurnal_demand):
+    """The per-depth factors are stored ragged, over the rows that reach that depth.
+
+    A row padded out to a deeper path's width contributes an exact zero at its trailing
+    slots, and the bias operator is ``O(max_depth**2 * n_rows * n_cin)``, so carrying them
+    is both the depth loop's and the operator's largest avoidable cost. The row order is an
+    implementation detail; the counts are the contract.
+    """
+    demand = heat_network.flow_array(diurnal_demand(heat_network, short_tedges))
+    rates = _rate(heat_network, depth=heat_network.segments["depth"]).to_numpy()
+    nodes = ["A", "B", "T4"]  # paths of depth 1, 2 and 3
+    terms = _build_operator(heat_network, demand, short_tedges, rates, nodes=nodes).target_terms
+
+    depths = np.array([len(heat_network.paths[node]) for node in nodes])
+    for depth, offset in enumerate(terms.row_offset):
+        expected = int(np.count_nonzero(depths > depth))
+        for name in ("mean_shift", "bin_entry", "bin_exit", "gap"):
+            assert len(getattr(terms, name)[depth]) == expected, f"{name}[{depth}]"
+        assert len(offset) == expected
+        # Stage ``d + 1`` is also depth ``d + 1``'s entry piece, so it carries depth d's rows.
+        assert len(terms.mean_down[depth + 1]) == expected
+    assert len(terms.mean_down) == len(terms.row_offset) + 1
+    assert min(len(slab) for slab in terms.mean_shift) < len(nodes), "no depth was compacted"
+
+
 # ============================================================================
 # The coupled model
 # ============================================================================

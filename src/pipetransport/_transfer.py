@@ -133,51 +133,66 @@ class TargetTerms(NamedTuple):
     gathers -- the operator is never rebuilt. Cell means of invalid (zero-width) cells are
     zeroed here, so the apply step is NaN-free by construction.
 
+    The per-depth factors are stored **ragged**: a row whose path is shorter than ``max_depth``
+    contributes an exact zero at its trailing slots -- its entry and exit stages are the same
+    floats, so the two target readings cancel and the interior sum is empty -- and carrying
+    those slots is half the depth loop on a network of mixed path depths. Since a path occupies
+    the leading slots of its row, the rows active at depth ``d`` shrink monotonically with
+    ``d``; the rows are therefore stored once in order of decreasing path depth, and depth
+    ``d``'s factors are the leading ``n_d`` rows of their slab rather than a gather. The same
+    ordering is baked into :attr:`cell_weight` and :attr:`flat_cout`, so nothing has to be
+    permuted back.
+
     Attributes
     ----------
-    mean_down : ndarray
-        Cell means of ``exp(-phi_down)``, shape ``(max_depth + 1, n_nodes, n_cells)``.
-        Slot ``0`` holds the mean of ``exp(-phi_total)`` (the surviving fraction of the
-        cell); slot ``d + 1`` the mean over the exponent from the exit of the depth-``d``
-        segment to the node. The depth-``d`` bias reads its entry piece from slot ``d`` and
-        its exit piece from slot ``d + 1``.
-    mean_shift : ndarray
+    mean_down : list of ndarray
+        Cell means of ``exp(-phi_down)``, one slab per path stage, ``max_depth + 1`` of them.
+        Slab ``0`` holds the mean of ``exp(-phi_total)`` (the surviving fraction of the
+        cell); slab ``d + 1`` the mean over the exponent from the exit of the depth-``d``
+        segment to the node. The depth-``d`` bias reads its entry piece from slab ``d`` and
+        its exit piece from slab ``d + 1``, both restricted to depth ``d``'s rows -- so slab
+        ``d + 1`` carries exactly those rows and slab ``d`` at least them.
+    mean_shift : list of ndarray
         Cell means of ``exp(-(k_d (A_exit(s) - tau[bin_exit]) + phi_down(s)))``, the
-        factor of the interior-edge sum, shape ``(max_depth, n_nodes, n_cells)``. The
+        factor of the interior-edge sum, one ``(n_d, n_cells)`` slab per depth. The
         exponent is non-negative by the half-open edge convention, so it never overflows.
-    bin_entry, bin_exit : ndarray of int32
-        Input bin holding the segment entry and exit time of each cell's parcels, shape
-        ``(max_depth, n_nodes, n_cells)``; constant over a cell because the grid seeds the
+    bin_entry, bin_exit : list of ndarray of int32
+        Input bin holding the segment entry and exit time of each cell's parcels, one
+        ``(n_d, n_cells)`` slab per depth; constant over a cell because the grid seeds the
         input edges at every node. Bin numbers are below ``n_cin``, so 32 bits are exact;
-        :func:`apply_segment_targets` adds the segment's row offset to reach the raveled
-        target, and that sum widens to the platform index type on its own.
-    gap : ndarray
+        :func:`apply_segment_targets` adds :attr:`row_offset` to reach the raveled target,
+        and that sum widens to the platform index type on its own.
+    gap : list of ndarray
         ``exp(-k_d dt (bin_exit - bin_entry))``, the factor carrying the forgetting scan from
-        the entry bin to the exit bin, shape ``(max_depth, n_nodes, n_cells)``. It depends
+        the entry bin to the exit bin, one ``(n_d, n_cells)`` slab per depth. It depends
         only on the operator, so it is built once here rather than per applied target set.
+    row_offset : list of ndarray of intp
+        Start of the depth-``d`` segment's row in the raveled target, ``paths_idx * n_cin``,
+        one length-``n_d`` vector per depth. Stored per row rather than per cell so the flat
+        index is never held at operator scale.
     cell_weight : ndarray
         Label width of each cell over the label span of its output slot, shape
-        ``(n_nodes, n_cells)`` -- the same weight the ``W`` scatter uses.
+        ``(n_nodes, n_cells)`` -- the same weight the ``W`` scatter uses, in the stored row
+        order.
     flat_cout : ndarray of intp
         Flattened output slot of each cell in the dustbin layout, shape
-        ``(n_nodes * n_cells,)``.
+        ``(n_nodes * n_cells,)``, in the stored row order. The slot values still name the
+        operator's own rows, so the scatter lands where it did.
     segment_rate : ndarray
         The per-segment rates [1/day] the operator was built with, length ``n_seg``.
-    paths_idx : ndarray of intp
-        Segment row of each path step, shape ``(n_nodes, max_depth)``.
     dt_days : float
         Uniform input-bin width [days] the scan of :func:`apply_segment_targets` assumes.
     """
 
-    mean_down: npt.NDArray[np.floating]
-    mean_shift: npt.NDArray[np.floating]
-    bin_entry: npt.NDArray[np.int32]
-    bin_exit: npt.NDArray[np.int32]
-    gap: npt.NDArray[np.floating]
+    mean_down: list[npt.NDArray[np.floating]]
+    mean_shift: list[npt.NDArray[np.floating]]
+    bin_entry: list[npt.NDArray[np.int32]]
+    bin_exit: list[npt.NDArray[np.int32]]
+    gap: list[npt.NDArray[np.floating]]
+    row_offset: list[npt.NDArray[np.intp]]
     cell_weight: npt.NDArray[np.floating]
     flat_cout: npt.NDArray[np.intp]
     segment_rate: npt.NDArray[np.floating]
-    paths_idx: npt.NDArray[np.intp]
     dt_days: float
 
 
@@ -341,7 +356,8 @@ def paths_transfer(
         source outward. Slots beyond a path's depth are ignored.
     active : ndarray of bool
         Which slots of ``paths_idx`` are real path steps, shape ``(n_nodes, max_depth)``. A
-        node reporting at the source itself is a row of ``False``.
+        path occupies the leading slots of its row, so a node reporting at the source itself
+        is a row of ``False``.
     with_target_terms : bool, optional
         Also build the target-independent factors of the affine relaxation bias (see
         :class:`TargetTerms`); requires uniform ``tedges_days`` spacing, which the scan of
@@ -583,40 +599,49 @@ def paths_transfer(
         # midpoint reads them off; an arrival exactly on the record's final edge is
         # re-labelled to the last real bin by the clip, whose zero-length exit piece makes
         # that exact.
+        #
+        # Every slab is restricted to the rows still on a path at its depth, which the
+        # decreasing-depth row order makes a leading slice (see :class:`TargetTerms`). Slab
+        # ``d`` of mean_down is read as the entry piece at depth d and as the exit piece at
+        # depth d - 1, and the latter needs the more rows, so it is built on those.
         n_cells = grid.shape[1] - 1
-        covered = label_width > 0.0
-        mean_down = np.empty((max_depth + 1, n_nodes, n_cells))
-        mean_shift = np.empty((max_depth, n_nodes, n_cells))
-        bin_entry = np.empty((max_depth, n_nodes, n_cells), dtype=np.int32)
-        bin_exit = np.empty((max_depth, n_nodes, n_cells), dtype=np.int32)
-        gap = np.empty((max_depth, n_nodes, n_cells))
-        mean_down[0] = np.where(covered, cell_survive, 0.0)
+        # Rows in order of decreasing path depth, so "active at depth d" is a leading slice.
+        # Stage l of mean_down is read as depth l's entry piece and as depth l - 1's exit
+        # piece; the latter needs the more rows, so the stage is built on those.
+        path_depth = active.sum(axis=1)
+        order = np.argsort(-path_depth, kind="stable")
+        stage_rows = [order[: int(np.count_nonzero(path_depth > max(stage - 1, 0)))] for stage in range(max_depth + 1)]
+        mean_down = [np.where(carrying[stage_rows[0]], cell_survive[stage_rows[0]], 0.0)]
+        mean_shift, bin_entry, bin_exit, gap, row_offset = [], [], [], [], []
         for depth in range(max_depth):
-            phi_down = quarter_phi - stage_phi[depth + 1].reshape(n_nodes, 2, n_cells)
-            mean_down[depth + 1] = np.where(covered, _surviving_fraction(*_cell_edges(phi_down)), 0.0)
-            entries = stage_arrival[depth].reshape(n_nodes, 2, n_cells)
-            exits = stage_arrival[depth + 1].reshape(n_nodes, 2, n_cells)
-            bin_entry[depth] = np.clip(
-                np.searchsorted(tedges_days, entries.mean(axis=1), side="right") - 1, 0, n_cin - 1
-            )
-            bin_exit[depth] = np.clip(np.searchsorted(tedges_days, exits.mean(axis=1), side="right") - 1, 0, n_cin - 1)
+            rows = stage_rows[depth + 1]
+            here = carrying[rows]
+            phi_down = quarter_phi[rows] - stage_phi[depth + 1].reshape(n_nodes, 2, n_cells)[rows]
+            mean_down.append(np.where(here, _surviving_fraction(*_cell_edges(phi_down)), 0.0))
+            entries = stage_arrival[depth].reshape(n_nodes, 2, n_cells)[rows]
+            exits = stage_arrival[depth + 1].reshape(n_nodes, 2, n_cells)[rows]
+            entry_bin = np.clip(np.searchsorted(tedges_days, entries.mean(axis=1), side="right") - 1, 0, n_cin - 1)
+            exit_bin = np.clip(np.searchsorted(tedges_days, exits.mean(axis=1), side="right") - 1, 0, n_cin - 1)
             # The interior-edge factor, shifted by the exit bin's left edge so the exponent
             # stays non-negative (up to the operator's roundtrip rounding) however long the
             # record is.
-            rate = segment_decay[paths_idx[:, depth], None, None]
-            shift = rate * (exits - tedges_days[bin_exit[depth]][:, None, :]) + phi_down
-            mean_shift[depth] = np.where(covered, _surviving_fraction(*_cell_edges(shift)), 0.0)
-            gap[depth] = np.exp(-rate[:, 0] * float(dt_days[0]) * (bin_exit[depth] - bin_entry[depth]))
+            rate = segment_decay[paths_idx[rows, depth], None, None]
+            shift = rate * (exits - tedges_days[exit_bin][:, None, :]) + phi_down
+            mean_shift.append(np.where(here, _surviving_fraction(*_cell_edges(shift)), 0.0))
+            gap.append(np.exp(-rate[:, 0] * float(dt_days[0]) * (exit_bin - entry_bin)))
+            bin_entry.append(entry_bin.astype(np.int32))
+            bin_exit.append(exit_bin.astype(np.int32))
+            row_offset.append(paths_idx[rows, depth] * n_cin)
         target_terms = TargetTerms(
             mean_down=mean_down,
             mean_shift=mean_shift,
             bin_entry=bin_entry,
             bin_exit=bin_exit,
             gap=gap,
-            cell_weight=label_width / span_all.ravel()[flat_cout].reshape(n_nodes, n_cells),
-            flat_cout=flat_cout,
+            row_offset=row_offset,
+            cell_weight=(label_width / span_all.ravel()[flat_cout].reshape(n_nodes, n_cells))[order],
+            flat_cout=flat_cout.reshape(n_nodes, n_cells)[order].ravel(),
             segment_rate=segment_decay,
-            paths_idx=paths_idx,
             dt_days=float(dt_days[0]),
         )
     return NetworkTransfer(
@@ -674,26 +699,27 @@ def apply_segment_targets(
     for e in np.flatnonzero(steps.any(axis=1)):
         scan[e, 1:] = lfilter([1.0], [1.0, -rho[e]], steps[e])
 
-    # Per depth: entry piece, exit piece and the scanned interior-edge sum of each cell.
-    # Inactive path slots cancel exactly -- their entry and exit stages are the same
-    # floats -- so no masking is needed.
+    # Per depth: entry piece, exit piece and the scanned interior-edge sum of each cell, over
+    # the rows still on a path at that depth -- the leading ``n_rows`` of the stored order,
+    # so every slab is a slice and no row is gathered. The rows the slice drops contribute an
+    # exact zero: their entry and exit stages are the same floats, so the two target readings
+    # cancel and the interior sum spans no bins.
     #
     # The gathers read the raveled target and scan through a flat index, the segment's row
     # offset plus the stored bin. That is the same element ``take_along_axis`` would fetch,
     # but it neither materializes the broadcast index grid that call builds internally nor
     # copies ``target[seg]`` and ``scan[seg]`` first -- together about two thirds of the work
-    # of this loop, which is in turn most of the module's runtime. The offset is formed here
-    # rather than stored so the flat index never has to be held at operator scale.
+    # of this loop, which is in turn most of the module's runtime.
     flat_target, flat_scan = target.ravel(), scan.ravel()
     cell_bias = np.zeros_like(terms.cell_weight)
-    for depth in range(terms.paths_idx.shape[1]):
-        offset = (terms.paths_idx[:, depth] * n_cin)[:, None]
-        at_entry = terms.bin_entry[depth] + offset
-        at_exit = terms.bin_exit[depth] + offset
+    for depth, offset in enumerate(terms.row_offset):
+        n_rows = offset.size
+        at_entry = terms.bin_entry[depth] + offset[:, None]
+        at_exit = terms.bin_exit[depth] + offset[:, None]
         interior = flat_scan[at_exit] - flat_scan[at_entry] * terms.gap[depth]
-        cell_bias += (
+        cell_bias[:n_rows] += (
             flat_target[at_exit] * terms.mean_down[depth + 1]
-            - flat_target[at_entry] * terms.mean_down[depth]
+            - flat_target[at_entry] * terms.mean_down[depth][:n_rows]
             - terms.mean_shift[depth] * interior
         )
 
