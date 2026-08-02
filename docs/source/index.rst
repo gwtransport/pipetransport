@@ -167,6 +167,8 @@ For the label coordinate, the arrival map, and why the flow-weighted average is 
    :caption: Examples
 
    examples/01_Distribution_Network_Water_Quality.nblink
+   examples/02_Network_Temperature.nblink
+   examples/03_Heat_Exchange_Conceptual_Model.nblink
 
 .. toctree::
    :maxdepth: 2

@@ -139,6 +139,8 @@ See [Assumptions](https://gwtransport.github.io/pipetransport/user_guide/assumpt
 - [Core concepts](https://gwtransport.github.io/pipetransport/user_guide/concepts.html) — the label coordinate, the arrival map, and why the flow-weighted average is exact
 - [Assumptions](https://gwtransport.github.io/pipetransport/user_guide/assumptions.html) — when this package fits your network
 - [Water quality in a distribution network](https://gwtransport.github.io/pipetransport/examples/01_Distribution_Network_Water_Quality.html) — the worked example notebook
+- [Temperature at the tap](https://gwtransport.github.io/pipetransport/examples/02_Network_Temperature.html) — the heat pair on a real network, forward and reverse
+- [How the heat model works, in pictures](https://gwtransport.github.io/pipetransport/examples/03_Heat_Exchange_Conceptual_Model.html) — the conceptual model in plain English, with cross-sections
 
 Full documentation: [gwtransport.github.io/pipetransport](https://gwtransport.github.io/pipetransport/)
 
