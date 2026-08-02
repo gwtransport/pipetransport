@@ -449,20 +449,23 @@ instantaneous plant-to-soil contrast --- 4.3 K on a 100 mm line after a 24 K ste
 transits after the step and back inside the range after about nine days. Splitting the pipe
 (:ref:`assumption-uniform-wall-flux`) into a chain of shorter segments cuts that to 1--4 %.
 
-Intermittent demand is the case to watch, and it is far worse. A 100 mm line idle 16 hours a day
-delivers water 59 % of the contrast past the soil, and it does not decay: it settles at about a third
-of the contrast and recurs once per duty cycle for as long as the duty cycle lasts. At 20--22 hours
-idle it reaches 71--75 %. Resolving the pipe does not rescue it and makes it worse: the excursion
-*grows* when you refine (measured 44 % for one pipe against 62 % for the same pipe as four, on a
-12 h-idle line).
+Intermittent demand used to be far worse, and is the case the wall-flux attribution was changed for.
+Booking each parcel's heat over the bins it actually occupied rather than over the single bin it was
+delivered in, a 100 mm line idle 8 hours a day delivers water 7.8 % of the contrast past the soil,
+and resolving the pipe now *helps*: the excursion falls monotonically and is back inside the range at
+two pieces (--3.8 %) and four (--10.3 %). Reading the flux off the delivered water instead put the
+same case at 20--28 % and made refining worse rather than better, and on sharper duty cycles --- a
+main flushed two hours in every 24, a line standing ten days --- it reached 8.8 times the contrast,
+converged and unflagged. Those shapes now come back within about a kelvin of the range of their
+inputs.
 
-The one-way model (``max_sweeps=1``) has a fixed target and is the only variant guaranteed inside the
-range of its inputs.
+The one-way model (``max_sweeps=1``) has a fixed target and is still the only variant guaranteed
+inside the range of its inputs.
 
 **What you can do.** Treat any delivered temperature outside the hull of your inputs as carrying this
 overshoot rather than as a physical prediction, and compare against ``max_sweeps=1`` when you need a
 bound that cannot leave the hull. Be most suspicious on branches with a strong duty cycle, where the
-effect is largest, persistent, and least helped by refining the pipe.
+effect is largest --- though refining the pipe now settles it rather than aggravating it.
 
 **How it is checked.** Not at runtime --- the invariant a runtime check would assert is false, and a
 guard that fires on correct physics is worse than none. Its *size* is pinned by a test.
@@ -470,22 +473,30 @@ guard that fires on correct physics is worse than none. Its *size* is pinned by 
 Stagnation
 ----------
 
-**Assumption.** A segment with no throughflow during a bin exchanges no heat with the soil.
+**Assumption.** None any more: a segment with no throughflow exchanges heat with the soil like any
+other, and this section records what used to be assumed instead.
 
-**Why it matters.** The wall flux is read off the water actually delivered, so a bin that delivers
-nothing reports nothing. The water standing in the pipe still relaxes toward the soil exactly --- the
-transport operator carries it --- but its heat does not enter the halo.
+**Why it matters.** The wall flux of a bin is the segment's own enthalpy budget over it, so a bin
+that delivers nothing still reports the heat the water standing in it gave up ---
+:math:`-h (H - V T_b)`, the same term that drives a flowing bin. An overnight stagnation of a service
+line reaches :math:`h\tau \approx 2`, nearly full equilibration, so this is most of what such a pipe
+does with its day.
 
-**What breaks if it is violated.** An overnight stagnation of a service line reaches
-:math:`h\tau \approx 2`, nearly full equilibration, so the halo the model builds is smaller than the
-real one and the first water delivered the next morning meets soil the model believes undisturbed.
-This is the model's weakest point on dead-end branches with a strong diurnal pattern.
+**What used to break.** The flux was read off the water a pipe *delivered* and charged to the bin it
+was delivered in. A bin that delivered nothing therefore reported nothing, and a whole idle night's
+exchange landed on the few bins of the next morning's flush --- overstated by the ratio of the
+standing time to the transit. On a line idle 8 hours a day that drove the delivered temperature
+20--28 % of the plant-to-soil contrast past the soil and *grew* when the pipe was refined; on sharper
+duty cycles it reached several times the contrast, converged and unflagged. The corresponding
+excursion is now 7.8 %, and refining settles it.
 
-**What you can do.** Treat delivered temperatures immediately after a long stagnation as a lower
-bound on the excursion, and prefer the results for bins that follow sustained flow.
+**What you can do.** Nothing special. The one case still worth attention is the very first bins of a
+record, where the model assumes the pipe starts in equilibrium with undisturbed soil rather than
+carrying a history it cannot know.
 
-**How it is checked.** Not checked; it is a modelling choice made for you, and it is documented here
-because it is not visible in the output.
+**How it is checked.** By the only test in the suite with zero flow anywhere: it pins the excursion
+under a duty cycle and asserts that refining the pipe reduces it monotonically and brings the answer
+back inside the range of its inputs.
 
 Units
 -----

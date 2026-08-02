@@ -34,17 +34,21 @@ the steady buried-pipe rate -- exactly the classical one-way model, returned by
 latest wall-flux history. Two choices make that iteration usable. The relaxation rate keeps
 the *steady* resistance (folding the lag-0 deficit into an early-time resistance -- the
 borehole-model move -- lands 5-20 % below the analytic steady buried-pipe law). And the wall
-flux is read off the *delivered water*: each parcel's heat loss in a segment, attributed to
-its delivery bin, so a target shift can never extract more heat than the parcels carry. That
-is what keeps the same-bin loop gain small and, decisively, *shrinking* as the bins narrow --
-measured 0.26 at 6 h bins down to 0.014 at 10 min bins for a 100 mm line. A flux read from an
-enthalpy budget instead is the more accurate one, and its gain runs the other way, to 0.98
-and beyond, where this iteration stops converging to its own fixed point. The price of the
-delivered-water flux is that the halo sees the wall-flux history smeared over one pipe
-transit, and that error does *not* vanish as ``tedges`` is refined; the ``Validity`` notes
-below put numbers on what is left. The
-whole model stays linear in the produced water temperature and the surface temperatures, so
-the reverse problem reuses the existing banded solver.
+flux of a bin is the segment's own enthalpy budget over it, so each parcel's heat is booked
+into the bins it actually occupied. Water that stands still exchanges heat for as long as it
+stands, and a bin with no throughflow still leaks ``-h (H - V Tb)``; charging that to the
+single bin the water finally left in would overstate it by the ratio of the standing time to
+the transit, which under intermittent demand runs to several times the driving contrast.
+
+That attribution also makes convergence a property of the model rather than of the
+configuration. Every path through the sweep is causal in time and runs upstream to downstream
+within a bin, so the iteration matrix is block lower triangular and its eigenvalues are the
+same-bin gains ``Dbar[0] V (1 - exp(-h dt)) / (L dt)``, strictly below one for every geometry
+and every bin width. The sweep count grows as ``1/(1 - g)`` as the bins narrow -- 58 to 567
+sweeps over the configurations in the ``Validity`` notes -- which is the opposite trade from a
+flux read off the delivered water: that one grew cheaper on fine bins precisely by mis-timing
+the heat of standing water. The whole model stays linear in the produced water temperature
+and the surface temperatures, so the reverse problem reuses the existing banded solver.
 
 Units
 -----
@@ -96,44 +100,41 @@ Validity
   wall flux falls along it like ``exp(-h tau)`` -- by a factor 1.6 over a 2 h transit on a
   100 mm service line -- but the model gives every parcel in a pipe the same soil memory.
   That is the model's spatial resolution along a pipe, and it is a stated assumption rather
-  than a parameter: under 24 h diurnal forcing at hourly bins it is worth around 0.5-0.9 K
-  on a 100 mm line. Refining ``tedges`` does not reduce it; it is a property of the transit.
-  The flux itself is read off the water the pipe delivers and attributed to the delivery
-  bin, which additionally smears that history over one transit.
+  than a parameter. Measured against a reference that keeps one memory per axial cell, it is
+  worth 0.08 K on a 100 mm line at a 2 h transit and 0.53 K at 6 h, under 24 h diurnal
+  forcing at hourly bins. Refining ``tedges`` does not reduce it; it is a property of the
+  transit.
 
   Declare a pipe as a chain of shorter segments if you need it resolved -- splitting is
-  exact for the transport, which is unchanged to round-off by it -- but check that the
-  answer settles as you refine. It does under continuous flow; under intermittent demand it
-  does not reliably converge, and refining can move the delivered temperature further
-  outside the range of its inputs rather than closer to the truth.
+  exact for the transport, which is unchanged to round-off by it. The gap closes steeply at
+  the first refinement (to 0.03-0.05 K at four pieces) and then flattens onto a floor more
+  pieces do not move; issue #32 tracks both removing the assumption and attributing that
+  floor.
 - The relaxation target is an *effective driving temperature*, not a wall temperature. The
   rate keeps the steady soil resistance, which overstates the resistance while the halo is
   still developing, so the target has to be pushed past the undisturbed soil to reproduce
   the faster early exchange -- measured excursions of several times the driving contrast in
   the bins after a sharp change in the wall flux. The delivered temperature is a weighted
-  average of ``tin`` and those targets, so it can leave the range of its own inputs, and
-  there is no general bound on by how much. A step in ``tin`` into a *continuously flowing*
-  pipe is the mild case and the one the figure usually quoted describes: 18 % of the
-  instantaneous plant-to-soil contrast, 1.9 transits after the step, back inside the range
-  after nine days, falling to 1-4 % once the pipe is split. **Intermittent demand is far
-  worse and does not decay.** A line idle 16 h a day delivers water 59 % of the contrast past
-  the soil, settling at a third of the contrast and recurring every duty cycle for as long as
-  the duty cycle lasts; at 20-22 h idle it reaches 71-75 %. Resolving the pipe does not rescue
-  it and makes it worse: declaring one 12 h-idle line as four segments grows the excursion
-  from 44 % to 62 %. Only ``max_sweeps=1`` is guaranteed inside the range of its inputs.
-  Wide pipes on short bins were once worse than any of this -- with the line-source halo a
+  average of ``tin`` and those targets, so it can leave the range of its own inputs. Only
+  ``max_sweeps=1`` is guaranteed inside it. A step in ``tin`` into a *continuously flowing*
+  pipe is the mild case: 18 % of the instantaneous plant-to-soil contrast, 1.9 transits after
+  the step, back inside the range after nine days, falling to 1-4 % once the pipe is split.
+  Intermittent demand is the harder one, and is where the flux attribution earns its keep: a
+  line idle 8 h a day now delivers water 7.8 % of the contrast past the soil, and splitting
+  the pipe brings it back *inside* the range (-3.8 % at two pieces, -10.3 % at four). Reading
+  the flux off the delivered water instead put the same case at 20-28 % and made splitting
+  worse rather than better, and on the shapes in issue #24 -- a main flushed 2 h in every 24,
+  a line standing ten days -- it reached 8.8 times the contrast, converged and unflagged.
+  Those now come back within about a kelvin of the range of their inputs.
+
+  Wide pipes on short bins were once worse than any of this: with the line-source halo a
   400 mm main at a half-hour transit came back spanning -88 to +78 C from water produced at
-  8 C into soil at 22 C, converged and without a warning, and refining ``tedges`` made it
-  worse. The cylinder response closes that regime: the same pipe now delivers 8.2-9.0 C
-  against a one-way 8.15 C, and no bin width reopens it. That is the *continuous-flow* wide
-  pipe only. Intermittent demand on one still reaches several times the contrast, and where
-  the running transit is shorter than a bin it reaches far more -- and because the cylinder
-  kernel contracts where the line source diverged, some of those now return silently instead
-  of raising.
-- Bins in which a segment has no throughflow contribute zero wall flux to the halo, so the
-  soil around a stagnant branch is treated as undisturbed while the water in it goes on
-  relaxing exactly. Overnight stagnation of a service line reaches ``h tau`` of order 2,
-  so the first water delivered afterwards meets a halo the model has not built.
+  8 C into soil at 22 C, and refining ``tedges`` made it worse. The cylinder response closes
+  that regime, and no bin width reopens it.
+- A bin in which a segment has no throughflow still exchanges heat: the water standing in it
+  relaxes toward the soil, and the enthalpy budget books that heat into the bins it happens
+  in. Overnight stagnation of a service line reaches ``h tau`` of order 2, so this is a large
+  part of what such a pipe does, and it is the case the delivered-water flux mis-timed.
 - The bin width must resolve the forcing: a signal varying within a few bins is carried by
   the transport operator exactly but enters the flux memory only as its bin average.
 - The soil around each segment is its own set of independent radial columns -- axial
