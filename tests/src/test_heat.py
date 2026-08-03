@@ -896,6 +896,69 @@ def test_bias_matches_the_brute_force_oracle(heat_network, short_tedges, diurnal
     np.testing.assert_allclose(actual[both], expected[both], atol=1e-11)
 
 
+def test_oracle_tilt_target_is_its_own_splitting_limit():
+    """The oracle's closed-form tilt update against the oracle's own splitting limit.
+
+    Groundwork for the axial-mode model of issue #32: the oracle gains targets linear in
+    position, ``target[j] + slope[j] * (x/L - 1/2)``, delivered by the exact ramp update.
+    Splitting the pipe into sub-segments whose *constant* targets sample the tilt at their
+    midpoints must converge to that closed form at second order -- the midpoint rule -- and
+    the split side exercises only the pre-existing constant-target path, so the two share no
+    arithmetic. Flow varies threefold over the day, so the position map behind the tilt is
+    read well away from the constant-flow case. Measured: 0.142 K at two pieces, 0.034 K at
+    four, ratio 4.2; and a zero slope reproduces the constant-target path bit for bit.
+    """
+    n = 48
+    tedges_days = np.arange(n + 1) / 24.0
+    hours = np.arange(n)
+    flow = 90.0 + 60.0 * np.sin(2.0 * np.pi * hours / 24.0)
+    volume, rate = 12.0, 4.0  # a 2-5 h transit at k*tau ~ 0.5
+    c0 = 15.0 + 3.0 * np.cos(2.0 * np.pi * hours / 24.0)
+    c1 = 4.0 * np.sin(2.0 * np.pi * hours / 16.0)
+    tin = 10.0 + 2.0 * np.sin(2.0 * np.pi * hours / 8.0)
+    shared = dict(tedges_days=tedges_days, node_flow=flow)
+
+    tilt = OraclePath(
+        segment_flow=flow[None],
+        segment_volume=[volume],
+        segment_decay=[rate],
+        segment_target=c0[None],
+        segment_target_slope=c1[None],
+        **shared,
+    ).tout(tin=tin, cout_tedges_days=tedges_days)
+    assert int(np.isfinite(tilt).sum()) > n // 2
+
+    def split(m):
+        mids = (np.arange(m) + 0.5) / m - 0.5
+        return OraclePath(
+            segment_flow=np.tile(flow, (m, 1)),
+            segment_volume=np.full(m, volume / m),
+            segment_decay=np.full(m, rate),
+            segment_target=c0[None] + np.outer(mids, c1),
+            **shared,
+        ).tout(tin=tin, cout_tedges_days=tedges_days)
+
+    coarse, fine = split(2), split(4)
+    assert np.array_equal(np.isfinite(coarse), np.isfinite(tilt))
+    gap_coarse = float(np.nanmax(np.abs(coarse - tilt)))
+    gap_fine = float(np.nanmax(np.abs(fine - tilt)))
+    assert gap_fine < 0.05, gap_fine
+    assert gap_fine < gap_coarse / 3.0, (gap_coarse, gap_fine)
+
+    zeroed = OraclePath(
+        segment_flow=flow[None],
+        segment_volume=[volume],
+        segment_decay=[rate],
+        segment_target=c0[None],
+        segment_target_slope=np.zeros((1, n)),
+        **shared,
+    ).tout(tin=tin, cout_tedges_days=tedges_days)
+    plain = OraclePath(
+        segment_flow=flow[None], segment_volume=[volume], segment_decay=[rate], segment_target=c0[None], **shared
+    ).tout(tin=tin, cout_tedges_days=tedges_days)
+    np.testing.assert_array_equal(zeroed, plain)
+
+
 def test_bias_handles_transits_landing_exactly_on_bin_edges():
     """A segment face crossing exactly at a bin edge is the convention's failure mode.
 

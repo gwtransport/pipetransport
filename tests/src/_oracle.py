@@ -62,15 +62,33 @@ class OraclePath:
         First-order decay rate of each path segment [1/day], length ``m``.
     node_flow : ndarray
         Throughflow past the reporting node, length ``n_bins``.
+    segment_target : ndarray or None, optional
+        Relaxation target of each path segment, piecewise constant on the input bins,
+        shape ``(m, n_bins)``. Required by :meth:`deliver` and :meth:`tout`.
+    segment_target_slope : ndarray or None, optional
+        Linear-in-position component of the target, same shape: the target at volume
+        fraction ``x/L`` through a segment is ``target[j] + slope[j] * (x/L - 1/2)``.
+        ``None`` (default) is the position-uniform target.
     """
 
-    def __init__(self, *, tedges_days, segment_flow, segment_volume, segment_decay, node_flow, segment_target=None):
+    def __init__(
+        self,
+        *,
+        tedges_days,
+        segment_flow,
+        segment_volume,
+        segment_decay,
+        node_flow,
+        segment_target=None,
+        segment_target_slope=None,
+    ):
         self.tedges = np.asarray(tedges_days, dtype=float)
         self.volume = np.asarray(segment_volume, dtype=float)
         self.decay = np.asarray(segment_decay, dtype=float)
         self.pipes = [_Displacement(self.tedges, q) for q in np.atleast_2d(segment_flow)][: len(self.volume)]
         self.node = _Displacement(self.tedges, node_flow)
         self.target = None if segment_target is None else np.atleast_2d(segment_target)[: len(self.volume)]
+        self.slope = None if segment_target_slope is None else np.atleast_2d(segment_target_slope)[: len(self.volume)]
 
     def _cross(self, pipe, volume, known, *, forward):
         """Solve the displacement condition of one pipe for the unknown face time.
@@ -222,6 +240,11 @@ class OraclePath:
         segment's target, exactly, one target bin at a time -- deliberately the naive
         piece-by-piece algorithm, sharing no arithmetic with the package's Abel-summed form.
 
+        With a target slope the target seen by the parcel moves linearly in time inside a
+        piece (its position advances at the bin's constant flow), so the exact update is the
+        ramp particular solution plus the decaying transient; at zero slope it is the
+        constant-target update, same expression.
+
         Parameters
         ----------
         departure : float
@@ -240,7 +263,8 @@ class OraclePath:
             msg = "deliver() needs per-segment relaxation targets; pass segment_target to OraclePath"
             raise ValueError(msg)
         time, temperature = departure, t_source
-        for pipe, volume, decay, target in zip(self.pipes, self.volume, self.decay, self.target, strict=True):
+        for e, (pipe, volume, decay, target) in enumerate(zip(self.pipes, self.volume, self.decay, self.target, strict=True)):
+            entry_volume = pipe(time)
             exit_time = self._cross(pipe, volume, time, forward=True)
             if not np.isfinite(exit_time):
                 return np.nan, np.nan
@@ -249,7 +273,14 @@ class OraclePath:
                 step_end = min(self.tedges[j + 1], exit_time)
                 if step_end <= time:
                     break
-                temperature = target[j] + (temperature - target[j]) * np.exp(-decay * (step_end - time))
+                span = step_end - time
+                tb, ramp = target[j], 0.0
+                if self.slope is not None:
+                    tb += self.slope[e][j] * ((pipe(time) - entry_volume) / volume - 0.5)
+                    ramp = self.slope[e][j] * pipe.rate[j] / volume
+                if decay > 0.0:
+                    settled = tb - ramp / decay  # the ramp particular solution at the current time
+                    temperature = settled + ramp * span + (temperature - settled) * np.exp(-decay * span)
                 time = step_end
             time = exit_time
         return time, temperature
