@@ -174,6 +174,7 @@ from pipetransport._transfer import (
     _e_table,
     _legendre_monomial,
     apply_banded,
+    apply_content_snapshots,
     apply_segment_targets,
     pad_paths,
     paths_transfer,
@@ -998,6 +999,8 @@ def _build_system(
         bin_end_rate: npt.NDArray[np.floating] | None,
         bin_end_power: npt.NDArray[np.integer] | None = None,
         bin_end_integrated: npt.NDArray[np.bool_] | None = None,
+        snapshot_rows: npt.NDArray[np.intp] | None = None,
+        bin_end_scale: npt.NDArray[np.floating] | None = None,
     ) -> NetworkTransfer:
         return paths_transfer(
             tedges_days=tedges_days,
@@ -1013,6 +1016,8 @@ def _build_system(
             bin_end_integrated=bin_end_integrated,
             with_target_terms=True,
             n_target_modes=n_modes,
+            snapshot_rows=snapshot_rows,
+            bin_end_scale=bin_end_scale,
         )
 
     rho = np.exp(-rate * dt_days)
@@ -1050,10 +1055,11 @@ def _build_system(
     # (an idle opening holds no excess anywhere), where the E-family is exactly zero.
     lam = _legendre_monomial(n_modes)
     held = volume * np.einsum("mi,ie->me", lam, _e_table(n_modes - 1, theta))
-    # The time moments of one bin against the exchange: ``m_p = dt**(p+1) E_p(h dt)`` is
-    # the weight mass of the p-th time-moment readings, and ``dt m_p - m_{p+1}`` the mass
-    # of their running integrals.
-    bin_moment = float(dt_days) ** np.arange(1, n_modes + 2)[:, None] * _e_table(n_modes, rate * dt_days)
+    # The advected time moments of one bin: the internal operator's kernels carry
+    # ``((t_end - t) q_bin / V)**p``, so the mass of the p-th reading over a bin is
+    # ``theta**p dt E_p(h dt)`` -- the ``theta**p`` joins per bin in the update, and this
+    # holds the base ``dt E_p``. The running integrals' base is its first difference.
+    bin_moment = float(dt_days) * _e_table(n_modes, rate * dt_days)
     nmat = np.zeros((n_modes, n_modes))
     for m in range(n_modes):
         for i in range(m):
@@ -1079,7 +1085,7 @@ def _build_system(
         theta=seg_flow * dt_days / volume[:, None],
         nmat=nmat,
         bin_moment=bin_moment[: n_modes + 1],
-        bin_integrated=dt_days * bin_moment[:n_modes] - bin_moment[1 : n_modes + 1],
+        bin_integrated=dt_days * (bin_moment[:n_modes] - bin_moment[1 : n_modes + 1]),
         parent=parent,
         held_slope=held * entry_slope,
         held_offset=held * (entry_offset - t_inf[:, 0]),
@@ -1095,6 +1101,10 @@ def _build_system(
             weight_rate,
             weight_power,
             weight_integrated,
+            # The plain delivery rows lead the layout, one per segment: the content
+            # snapshots that restart the moment recursions are built on their cells.
+            snapshot_rows=np.arange(n_seg, dtype=np.intp),
+            bin_end_scale=np.tile(volume, len(specs) + len(entry_specs)),
         ),
         reporting=build(rep_paths, rep_active, rep_flow, cout_days, None),
     )
@@ -1360,10 +1370,13 @@ def _update_targets(
     # weighted readings are the field times each kernel's weight mass. The entry faces
     # read the parent's field; a root segment's entry rows are always constrained.
     parent_field = system.t_inf[np.maximum(system.parent, 0)]
-    moment_mass = system.bin_moment[:n_modes] / dt
-    integral_mass = system.bin_integrated[: n_modes - 1] / dt
+    theta_raw = [np.ones_like(system.theta)]
+    for _ in range(n_modes):
+        theta_raw.append(theta_raw[-1] * system.theta)
+    moment_mass = [theta_raw[p] * (system.bin_moment[p][:, None] / dt) for p in range(n_modes)]
+    integral_mass = [theta_raw[p] * (system.bin_integrated[p][:, None] / dt) for p in range(n_modes - 1)]
     for block_set, field, masses in (
-        ((plain_out,), system.t_inf, np.ones((1, n_seg))),
+        ((plain_out,), system.t_inf, [np.ones_like(system.theta)]),
         (mom_out, system.t_inf, moment_mass),
         (g_out, system.t_inf, integral_mass),
         (mom_in, parent_field, moment_mass),
@@ -1372,7 +1385,7 @@ def _update_targets(
         for block, mass in zip(block_set, masses, strict=True):
             hole = ~np.isfinite(block)
             if hole.any():
-                block[hole] = (field * mass[:, None])[hole]
+                block[hole] = (field * mass)[hole]
 
     # A split leaves temperature unchanged and both flows are constant over a bin, so the
     # water entering a pipe is what its parent delivered; a root segment is fed the source.
@@ -1404,15 +1417,15 @@ def _update_targets(
     # the reference times the bin width, and the modes' own storage with the kernel's
     # weight mass. The advective parts carry the flow, so a standing bin keeps only the
     # storage leak; NaN outside the usable region is masked before it can propagate.
-    def drivers(face_out: list, face_in: list, masses: npt.NDArray[np.floating]) -> npt.NDArray[np.floating]:
+    def drivers(face_out: list, face_in: list, masses: list) -> npt.NDArray[np.floating]:
         """Assemble ``B_p[m]`` for one kernel family.
 
         Parameters
         ----------
         face_out, face_in : list of ndarray
-            Weighted readings of the two faces, one array per kernel order.
-        masses : ndarray
-            Weight mass of each kernel per segment, shape ``(n_kernels, n_seg)``.
+            Advected-kernel readings of the two faces, one array per kernel order.
+        masses : list of ndarray
+            Weight mass of each kernel per segment and bin, over the bin width.
 
         Returns
         -------
@@ -1421,20 +1434,35 @@ def _update_targets(
         """
         out = np.empty((len(face_out), n_modes, n_seg, blocks.shape[-1]))
         for p in range(len(face_out)):
-            fo = np.where(flowing, system.seg_flow * (dt * face_out[p] - t_ref * masses[p][:, None]), 0.0)
-            fi = np.where(flowing, system.seg_flow * (dt * face_in[p] - t_ref * masses[p][:, None]), 0.0)
-            storage = np.where(usable, rate * vol * masses[p][:, None] * ctil, 0.0)
+            fo = np.where(flowing, system.seg_flow * dt * (face_out[p] - t_ref * masses[p]), 0.0)
+            fi = np.where(flowing, system.seg_flow * dt * (face_in[p] - t_ref * masses[p]), 0.0)
+            storage = np.where(usable, rate * vol * dt * masses[p] * ctil, 0.0)
             for m in range(n_modes):
                 out[p, m] = -fo + pi0[m] * fi + norm[m] * storage[m]
         return out
 
-    drive = drivers(mom_out, mom_in, system.bin_moment[:n_modes])
-    drive_int = drivers(g_out, g_in, system.bin_integrated)
+    drive = drivers(mom_out, mom_in, moment_mass)
+    drive_int = drivers(g_out, g_in, integral_mass)
 
     # The exact bin update, mode by mode: the coupling is strictly lower triangular, so
     # each mode reads only already-updated histories and is one forgetting scan. The
     # record opens with the pipes holding the warm start's own settled water, seeded per
     # mode; with no warm start there is no prior state to carry.
+    # The content snapshots at the chunk anchors: the recursions restart from them, so
+    # a rounding error in the state can never ride the advective shear coupling for more
+    # than one chunk -- the polynomial error growth that coupling composes to over the
+    # decay memory is what set the old high-mode noise floor. The corrections propagate
+    # through plain forgetting factors only, because each mode is corrected before the
+    # next one's coupling reads it. Anchors inside the warm-start prefix, or whose
+    # in-pipe water the record does not fully cover, keep the free-running state.
+    terms = system.internal.target_terms
+    snap_abs, snap_unit = apply_content_snapshots(system.internal, modes, tin_padded)
+    snapshot = snap_abs - t_ref[None] * snap_unit
+    snap_valid = terms.snapshots.anchor_valid & (np.arange(snapshot.shape[-1])[None, :] > system.n_pad)
+    chunk_start = terms.chunk_edge[:, 1:].astype(np.intp)
+    into_end = terms.rho_into[:, 1:]
+    into_start = into_end / system.rho[:, None]
+
     theta_gated = np.where(flowing, system.theta, 0.0)
     theta_pow = [np.ones_like(theta_gated)]
     for _ in range(1, n_modes):
@@ -1447,29 +1475,31 @@ def _update_targets(
         for p in range(n_modes):
             for i in range(n_modes):
                 if npow[p][m, i] != 0.0:
-                    forcing += (npow[p][m, i] / factorial[p]) * q_over_v_dt**p * drive[p, i]
+                    forcing += (npow[p][m, i] / factorial[p]) * drive[p, i]
         for p in range(1, m + 1):
             for i in range(n_modes):
                 if npow[p][m, i] != 0.0:
                     forcing += system.rho[:, None] * (npow[p][m, i] / factorial[p]) * theta_pow[p] * y_start[i]
         if system.n_pad:
             forcing[:, system.n_pad - 1] += system.held_slope[m] * tin_padded[0] + system.held_offset[m]
+        free = np.empty((n_seg, blocks.shape[-1]))
         for e in range(n_seg):
-            y_end[m, e] = lfilter([1.0], [1.0, -system.rho[e]], forcing[e])
-        y_start[m, :, 1:] = y_end[m, :, :-1]
+            free[e] = lfilter([1.0], [1.0, -system.rho[e]], forcing[e])
+        free_edge = np.concatenate([np.zeros((n_seg, 1)), free], axis=1)
+        delta = np.where(snap_valid, free_edge - snapshot[m], 0.0)
+        delta_start = np.take_along_axis(delta, chunk_start, axis=1)
+        y_end[m] = free - into_end * delta_start
+        y_start[m] = free_edge[:, :-1] - into_start * delta_start
 
     # The bins' time-integrated content, from the same drivers against the running
     # integrals of the kernels: every term bounded, no small-denominator assembly.
     int_y = np.zeros_like(y_end)
+    gated_mass = [np.where(flowing, dt * moment_mass[p], 0.0) if p else dt * moment_mass[0] for p in range(n_modes)]
     for m in range(n_modes):
         for p in range(n_modes - 1):
             for i in range(n_modes):
                 if npow[p][m, i] != 0.0:
-                    int_y[m] += (
-                        (npow[p][m, i] / factorial[p])
-                        * q_over_v_dt**p
-                        * (system.bin_moment[p][:, None] * y_start[i] + drive_int[p, i])
-                    )
+                    int_y[m] += (npow[p][m, i] / factorial[p]) * (gated_mass[p] * y_start[i] + drive_int[p, i])
 
     # The flux moments telescope; their increments convolve with the deficit kernel into
     # the next target modes. The prefix sets the state the record opens from and is not
@@ -1507,7 +1537,7 @@ def source_to_endmember(
     film_coefficient: float | pd.Series | None = None,
     n_modes: int = 6,
     max_sweeps: int = 5000,
-    atol: float = 1e-9,
+    atol: float = 1e-7,
     spinup: str | None = "constant",
 ) -> npt.NDArray[np.floating]:
     """Compute the delivered water temperature at each reporting node.
@@ -1579,13 +1609,16 @@ def source_to_endmember(
         a network of this size is comfortable, and a network ten times larger is not.
     atol : float, optional
         Convergence tolerance on the relaxation-target increment, absolute and in the unit of
-        the temperature inputs. Default 1e-9, several orders below anything a temperature
-        measurement resolves. It is absolute rather than relative so that the answer cannot
-        depend on whether the caller works in Celsius or in kelvin, and so that an iterate
-        that is diverging cannot widen its own convergence test. The delivered temperature
-        settles to a fraction of it -- measured about 0.4 -- and the sweep count grows only as
-        its logarithm, so there is little to buy by relaxing it: 1e-7 is the loosest value
-        that leaves the package's own tests meaningful, and costs a third of the runtime.
+        the temperature inputs. Default 1e-7, several orders below anything a temperature
+        measurement resolves and below the model's own axial truncation by more. It is
+        absolute rather than relative so that the answer cannot depend on whether the caller
+        works in Celsius or in kelvin, and so that an iterate that is diverging cannot widen
+        its own convergence test. The delivered temperature settles to a fraction of it --
+        measured about 0.4 -- and the sweep count grows only as its logarithm. The floor is
+        the sweep map's own round-off: evaluating six Legendre modes of an effective-target
+        profile that swings by tens of kelvin leaves a few 1e-8 of noise on segments whose
+        transit is shorter than a bin, so tolerances below that are reachable only on
+        well-resolved geometries or fewer modes.
     spinup : {"constant"} or None, optional
         Warm-start policy; see :func:`pipetransport.transport.source_to_endmember`.
 
@@ -1708,7 +1741,7 @@ def endmember_to_source(
     film_coefficient: float | pd.Series | None = None,
     n_modes: int = 6,
     max_sweeps: int = 5000,
-    atol: float = 1e-9,
+    atol: float = 1e-7,
     regularization_strength: float = 1e-10,
     gap_atol: float = 1e-3,
     spinup: str | None = "constant",
