@@ -177,20 +177,31 @@ from pipetransport.utils import solve_inverse_transport_banded, tedges_to_days
 # has settled, so the answer is the same to well under ``atol``; at 1e-2 the reverse direction
 # spends about a third of the inner sweeps that a fully resolved inner solve does.
 _INNER_FORCING = 1e-2
-# Anderson window on the reverse outer iterate. Truncated Anderson is truncated GMRES, so
-# the window is not a tuning knob with a free choice: too short a memory drops the directions
-# the iteration needs and it stalls. A depth of five raises on a 400 mm main at a half-hour
-# transit, which ten reconstructs to 1e-9. It buys range, not a guarantee: a pipe past the
-# coupling the divergence test names is out of reach at any depth.
 # How far a segment's volume may sit from the one its length and diameter imply. Wide enough
 # for fittings and for wall-thickness conventions, tight enough to catch a volume that came
 # from somewhere else entirely.
 _GEOMETRY_TOLERANCE = 0.05
+# Anderson window on the reverse outer iterate. Truncated Anderson is truncated GMRES, so
+# the window is not a tuning knob with a free choice: too short a memory drops the directions
+# the iteration needs and it stalls. A depth of five raises on a 400 mm main at a half-hour
+# transit, which ten reconstructs to 1e-9. It buys range, not a guarantee: a pipe past the
+# regimes the divergence test names is out of reach at any depth.
 _ANDERSON_DEPTH = 10
 # Consecutive growing outer residuals that mark divergence rather than a slow start.
 _DIVERGENCE_STEPS = 5
-# Consecutive growing outer residuals that mark divergence rather than a slow start.
-_DIVERGENCE_STEPS = 5
+# Where the reverse two-way fixed point stops being reachable, measured by power iteration on
+# the outer affine map for a single observed pipe at constant flow -- the worst case -- in
+# issue #40. Two axes put the spectral radius past one independently, and the radius is a
+# property of the configuration, not of the iteration: unchanged from 6 to 24 days of record
+# and from 30-minute to 2-hour bins at fixed coupling. Coupling: at transits of a few bins or
+# more the radius crosses one near h*tau = 0.7 (0.92 at 0.50 and 1.10 at 0.75 on a 100 mm
+# main; a 400 mm main crosses nearer 1.0), the excess is broad-band, and no Anderson window
+# recovers it. Transit: a segment that empties in about a bin leaves the deconvolution nearly
+# singular at the fastest alternation the record carries whatever the coupling -- radius 21 at
+# h*tau = 0.11 for a 100 mm main at a half-bin transit -- while transits of 1.5 bins and more
+# leave only isolated resonant modes above one, which the extrapolation still reaches.
+_COUPLING_LIMIT = 0.7
+_SHORT_TRANSIT_BINS = 1.5
 
 
 def _step_response_integral(
@@ -720,7 +731,7 @@ def segment_heat_rate(
     _validate_positive(kappa_seg, name="kappa")
     _validate_positive(depth_seg, name="depth")
     eta_seg = per_segment(eta, "eta")
-    if eta_seg is not None and not np.all((eta_seg > 0.0) | np.isposinf(eta_seg)):
+    if not np.all((eta_seg > 0.0) | np.isposinf(eta_seg)):
         msg = "eta must be positive (inf is a prescribed-temperature surface)"
         raise ValueError(msg)
 
@@ -1106,19 +1117,44 @@ def _diverged_message(system: _HeatSystem, previous: float, increment: float, ex
     Returns
     -------
     str
-        Message naming the regime, the segment driving it, and the variant that works.
+        Message naming the regime, the segment driving it, and the remedy that works there.
     """
+    ran_out = f" within max_sweeps={exhausted}" if exhausted is not None else ""
+    head = (
+        f"the reverse two-way fixed point did not converge{ran_out}: the outer residual went "
+        f"{previous:.3e} -> {increment:.3e}. "
+    )
     worst = int(np.nanargmax(system.h_tau)) if np.isfinite(system.h_tau).any() else 0
     coupling = float(system.h_tau[worst])
-    ran_out = f" within max_sweeps={exhausted}" if exhausted is not None else ""
-    return (
-        f"the reverse two-way fixed point did not converge{ran_out}: the outer residual went "
-        f"{previous:.3e} -> {increment:.3e}. The strongest coupling is segment "
-        f"{system.segment_names[worst]!r} at h*tau = {coupling:.2f}, and past about 0.7 the "
-        f"reverse problem is ill-conditioned rather than merely slow -- water that equilibrates "
-        f"over its transit carries little of the produced temperature to the endmember, so no "
-        f"cap, tolerance or regularization recovers it. Use max_sweeps=1 for the one-way "
-        f"reverse, which stays well-posed, or shorten the segment."
+    if coupling > _COUPLING_LIMIT:
+        return head + (
+            f"The strongest coupling is segment {system.segment_names[worst]!r} at "
+            f"h*tau = {coupling:.2f}, and past about {_COUPLING_LIMIT} the reverse problem is "
+            f"ill-conditioned rather than merely slow -- water that equilibrates over its transit "
+            f"carries little of the produced temperature to the endmember, so no cap, tolerance or "
+            f"regularization recovers it. Use max_sweeps=1 for the one-way reverse, which stays "
+            f"well-posed, or shorten the segment."
+        )
+    # h*tau = rate * volume / flow and rho = exp(-rate * dt), so the ratio is
+    # volume / (flow * dt): how many bins the median flow takes to empty the pipe.
+    transit_bins = system.h_tau / -np.log(system.rho)
+    shortest = int(np.nanargmin(transit_bins)) if np.isfinite(transit_bins).any() else 0
+    span = float(transit_bins[shortest])
+    if span < _SHORT_TRANSIT_BINS:
+        return head + (
+            f"Segment {system.segment_names[shortest]!r} empties in {span:.2f} bins at its median "
+            f"flow, and a transit that spans about a bin or less leaves the deconvolution nearly "
+            f"singular at the fastest alternation the record carries while the halo coupling still "
+            f"feeds that alternation back -- at couplings far below the h*tau boundary. The bin "
+            f"width fails here, not the physics: refine tedges until every segment's transit spans "
+            f"a few bins, or use max_sweeps=1 for the one-way reverse, which stays well-posed."
+        )
+    return head + (
+        f"The strongest coupling is segment {system.segment_names[worst]!r} at "
+        f"h*tau = {coupling:.2f} and the shortest transit is segment "
+        f"{system.segment_names[shortest]!r} at {span:.2f} bins, both inside the range where the "
+        f"iteration normally converges; this configuration is worth a report. max_sweeps=1 is the "
+        f"one-way reverse, which stays well-posed."
     )
 
 
@@ -1510,8 +1546,10 @@ def endmember_to_source(
         If the fixed point diverges or has not converged within ``max_sweeps``. Past a
         ``h*tau`` of about 0.7 -- a pipe that equilibrates appreciably over its transit --
         the coupled inverse is ill-conditioned rather than slow, and this is how it shows;
-        the message names the segment responsible. ``max_sweeps=1`` is the one-way reverse,
-        which stays well-posed.
+        the message names the segment responsible. A transit that spans about a bin or less
+        fails the same way at any coupling, and there the message points at the remedy that
+        works: ``tedges`` fine enough for every transit to span a few bins. ``max_sweeps=1``
+        is the one-way reverse, which stays well-posed.
 
     See Also
     --------
@@ -1522,8 +1560,25 @@ def endmember_to_source(
     The halo is brought to its own fixed point inside every outer step, so the cost is a
     product of two iterations rather than a sum. The outer step extrapolates over its last few
     iterates rather than simply repeating, which reaches pipes plain repetition cannot -- but
-    only so far: the extrapolation is truncated, and past a coupling of roughly
-    ``h*tau = 0.7`` nothing reaches the fixed point, which is what the RuntimeError reports.
+    only so far: the extrapolation is truncated, and two regimes sit beyond it, measured by
+    power iteration on the outer map for a single observed pipe at constant flow -- the worst
+    case; a network observing several nodes under varying demand can reach further. The
+    spectral radius is a property of the configuration, not of the iteration: it is unchanged
+    from 6 to 24 days of record and from 30-minute to 2-hour bins at fixed coupling, so a
+    longer record or a deeper Anderson window buys nothing past it. **Coupling**: at transits
+    of a few bins or more the radius crosses one near ``h*tau = 0.7`` (measured 0.92 at 0.50
+    and 1.10 at 0.75 on a 100 mm main; a 400 mm main crosses nearer 1.0), the excess is
+    broad-band, and nothing reaches the fixed point -- a 40 mm service line at a 1 h transit
+    already sits at ``h*tau = 1.12``, which is why the two-way reverse is unavailable on fast
+    service lines however short their transit sounds. **Transit**: a segment that empties in
+    about a bin or less is nearly singular at the fastest alternation the record carries
+    whatever its coupling -- radius 21 at ``h*tau = 0.11`` for a 100 mm main at a half-bin
+    transit. That one is a resolution problem rather than a physics problem: the same pipe on
+    15-minute bins, where the transit spans two, reconstructs to 2e-4 K. Between the two,
+    transits near 1.5-2.5 bins put only isolated resonant modes above one, which the
+    extrapolation still reaches at a reconstruction error that grows as the transit shortens
+    (2e-4 K at a 1.5-bin transit against 2e-2 K at half a bin on a 400 mm main whose coupling
+    is negligible). The RuntimeError names whichever regime applies.
 
     The reconstruction leans on a fabricated production series over the bins no measurement
     constrains, and the coupling carries that invention into bins the record *does* constrain
@@ -1651,10 +1706,11 @@ def endmember_to_source(
     # for it. Seeded at inf, so the first inner solve is a single sweep.
     # The outer map is affine, so plain repetition converges only where its own spectral
     # radius happens to be under one -- and a pipe that equilibrates appreciably over its
-    # transit puts it over. Extrapolating over the last few iterates instead (Anderson, which
-    # on an affine map is a Krylov method) reaches configurations plain repetition cannot,
-    # though with a truncated window it carries no guarantee: past a coupling of roughly
-    # h*tau = 0.7 it stops reaching them and the divergence test below is what answers. The
+    # transit puts it over, as does one that empties in about a bin. Extrapolating over the
+    # last few iterates instead (Anderson, which on an affine map is a Krylov method) reaches
+    # configurations plain repetition cannot, though with a truncated window it carries no
+    # guarantee: past the regimes _diverged_message names it stops reaching them and the
+    # divergence test below is what answers. The
     # residual is
     # measured on the bins the operator covers; that set is a property of the operator, not of
     # the iterate, so it is fixed once and asserted to stay fixed.
