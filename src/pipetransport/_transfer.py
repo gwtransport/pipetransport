@@ -471,8 +471,10 @@ def _e_table(n_max: int, x: npt.NDArray[np.floating]) -> npt.NDArray[np.floating
 
     downward = np.empty_like(upward)
     downward[n_max] = seed
-    for n in range(n_max, 0, -1):
-        downward[n - 1] = (x * downward[n] + decay) / n
+    # x = inf lands entirely in the upward branch (exactly 0); its inf * 0 here is unread.
+    with np.errstate(invalid="ignore"):
+        for n in range(n_max, 0, -1):
+            downward[n - 1] = (x * downward[n] + decay) / n
 
     n_axis = np.arange(n_max + 1).reshape((n_max + 1, *([1] * x.ndim)))
     return np.where(n_axis <= x, upward, downward)
@@ -560,7 +562,9 @@ class _CellBasis:
             The mean, shape ``(n_rows, n_cells)``.
         """
         if coef.shape[0] > self.moments.shape[0]:
-            self.moments = self.scale * _e_table(coef.shape[0] - 1, self.delta)
+            # Grown geometrically: the power tables raise the degree one multiply at a
+            # time, and regrowing per degree would rebuild the table quadratically often.
+            self.moments = self.scale * _e_table(max(coef.shape[0], 2 * self.moments.shape[0]) - 1, self.delta)
         return np.einsum("k...,k...->...", coef, self.moments[: coef.shape[0]])
 
 
