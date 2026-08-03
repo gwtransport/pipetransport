@@ -1378,24 +1378,23 @@ def _series_pipe(n_sub, *, transit_hours, tin, tedges, film_coefficient=0.454):
     )[0]
 
 
-@pytest.mark.parametrize(("transit_hours", "n_slug", "tolerance"), [(2.0, 8, 0.60), (6.0, 12, 1.15)])
+@pytest.mark.parametrize(("transit_hours", "n_slug", "tolerance"), [(2.0, 8, 0.012), (6.0, 12, 0.08)])
 def test_two_way_model_agrees_with_the_local_fine_step_reference(transit_hours, n_slug, tolerance):
     """The coupled fixed point against an independently integrated local reference.
 
-    The reference keeps one soil memory per axial cell; the package keeps one per pipe. The
-    gap between them is therefore that one modelling difference, and the test that they are
-    the same physics rather than two answers that happen to land near each other is that the
-    gap *closes* as the pipe is modelled as more series pieces.
+    The reference keeps one soil memory per axial cell; the package keeps the mean and the
+    tilt of one flux profile per pipe (issue #32). The gap between them is therefore the
+    truncation of the axial dimension to those two moments, plus the comparison's own time
+    discretisation -- the reference sub-steps at CFL 1 inside the package's bins, and the
+    sibling test below shows that part collapsing once the two share one grid.
 
-    It used to close at first order, because a second and larger error sat on top of the
-    axial one: the flux of a piece was read off the water it delivered, which smeared the flux
-    history over one piece transit and shrank only as fast as the pieces did. With the flux
-    booked over the residence time that term is gone, the unsplit gap falls several-fold, and
-    what is left drops steeply at the first refinement and then flattens onto a floor that
-    more pieces do not move -- so the assertions below pin the drop and the floor rather than
-    a rate. The floor is the comparison's own time discretisation, not the model's: the
-    reference sub-steps at CFL 1 inside the package's bins, and the sibling test below shows
-    the gap collapsing once the two share one grid (issue #32).
+    Before the axial modes this gap was 0.066 K at the 2 h transit and 0.51 K at 6 h, and
+    the recommended remedy was declaring the pipe as series pieces. The two-mode model
+    resolves it unsplit: measured 0.0080 K and 0.054 K -- at 2 h transit already inside the
+    matched-grid floor, at 6 h the truncation's own size, matching the mode-truncated
+    prototype's 0.0051/0.057 K. Splitting is no longer a remedy and must no longer be
+    needed: the split gaps sit at the same floor rather than below the unsplit one, which is
+    what the second assertion pins.
 
     A film resistance is supplied deliberately. At the bare-pipe limit the reference's
     closed-form per-step solve is singular and it diverges below about 2 % of the soil
@@ -1425,11 +1424,10 @@ def test_two_way_model_agrees_with_the_local_fine_step_reference(transit_hours, 
                 np.abs(_series_pipe(n_sub, transit_hours=transit_hours, tin=tin, tedges=tedges) - reference)[settled]
             )
         )
-        for n_sub in (1, 4, 8)
+        for n_sub in (1, 4)
     ]
-    assert gaps[0] < tolerance, gaps
-    assert gaps[1] < 0.4 * gaps[0], gaps  # measured 0.05-0.15 of the unsplit gap
-    assert gaps[2] <= gaps[1], gaps  # the floor: measured 0.36-0.92, never a rise
+    assert gaps[0] < tolerance, gaps  # measured 0.0080 K at 2 h, 0.054 K at 6 h
+    assert gaps[1] < 0.012, gaps  # split or not, what remains is the shared-grid floor
 
 
 def test_the_agreement_floor_is_the_two_time_discretisations():
@@ -1510,10 +1508,13 @@ def test_the_quasi_steady_limit_is_the_steady_buried_pipe_law_across_the_geometr
     decays like ``3-5 / t`` in days, so a record that reaches the quasi-steady limit is a few
     thousand bins on a daily grid and a hundred thousand on an hourly one.
 
-    The tolerance is one-sided as well as two-sided. The remaining deficit still lets a
-    little more heat through than a fully developed halo would, so the fixed point sits just
-    *past* the law and never short of it --- which is the direction that discriminates: the
-    rejected early-time-resistance split lands several percent below.
+    The tolerance still discriminates what it always did: the rejected early-time-resistance
+    split lands several percent below the law. The two-mode fixed point itself sits a few
+    millikelvin *below* it -- the axial truncation's own quasi-steady residue, whose sign the
+    mode-truncated reference reproduces (-1.9e-3 K against the package's -2.1e-3 K on the
+    100 mm / 2-day case), where the exact per-cell physics sits just above (+7e-6 K). So the
+    check is two-sided at the same 2e-3, three orders above the truncation and three below
+    the failure mode it rejects.
     """
     tedges = pd.date_range("2025-01-01", periods=1501, freq="D")
     segments = pd.DataFrame(
@@ -1526,8 +1527,6 @@ def test_the_quasi_steady_limit_is_the_steady_buried_pipe_law_across_the_geometr
 
     delivered = float(_uniform_case(network, tedges, tin=8.0, sol_air=20.0, flow=flow)[0, -1])
     expected = 20.0 + (8.0 - 20.0) * np.exp(-_rate(network)["Plant-T1"] * transit_bins)
-    assert delivered > expected
-    # The worst measured excess over the nine cases is 9.4e-4, so 1e-3 would be 6 % of margin.
     np.testing.assert_allclose(delivered, expected, rtol=2e-3)
 
 
@@ -1914,14 +1913,17 @@ def test_the_model_is_linear_in_every_temperature_input(heat_network, hourly_ted
     )
     np.testing.assert_allclose(scaled, 2.0 * base, rtol=1e-12, atol=1e-7, equal_nan=True)
 
-    tight = dict(shared, atol=1e-11)
+    # The moment pass assembles readings scaled by 1/(h tau), which lifts the sweep's
+    # round-off floor to about 1e-10 on the wide trunk; 1e-10 is the tightest tolerance the
+    # iteration can still cross.
+    tight = dict(shared, atol=1e-10)
     base = heat.source_to_endmember(
         tin=np.full(n, 9.0), surface_temperature=surface(hourly_tedges, amplitude=4.0), **tight
     )
     scaled = heat.source_to_endmember(
         tin=np.full(n, 18.0), surface_temperature=2.0 * surface(hourly_tedges, amplitude=4.0), **tight
     )
-    np.testing.assert_allclose(scaled, 2.0 * base, rtol=1e-12, atol=1e-9, equal_nan=True)
+    np.testing.assert_allclose(scaled, 2.0 * base, rtol=1e-12, atol=1e-8, equal_nan=True)
 
 
 def test_the_answer_does_not_depend_on_the_temperature_origin(
@@ -1955,14 +1957,15 @@ def test_the_answer_does_not_depend_on_the_temperature_origin(
 
 
 def test_the_inflow_rows_read_the_water_the_parent_delivered(heat_network, short_tedges, diurnal_demand, surface):
-    """With nothing to exchange, the three readings of a segment must collapse onto two.
+    """With nothing to exchange, the readings of a segment must collapse onto each other.
 
-    The flux pass reads each pipe three ways: what it delivers, that reading weighted toward
-    the bin end, and the weighted reading of what *enters* it. The weight is the pipe's own
-    exchange rate, so driving every rate to zero must collapse the weighted delivery onto the
-    plain one, and must leave the inflow row reading exactly what the pipe upstream delivered
-    -- the source series itself for a segment fed by the plant. If the inflow rows were wired
-    to the wrong path, or the weight applied at the wrong end, neither would hold.
+    The flux pass reads each pipe five ways: what it delivers, that reading weighted toward
+    the bin end, the same with the ramp factor, and the two weighted readings of what
+    *enters* it. The weight is the pipe's own exchange rate, so driving every rate to zero
+    must collapse the weighted delivery onto the plain one, and must leave the inflow row
+    reading exactly what the pipe upstream delivered -- the source series itself for a
+    segment fed by the plant. If the inflow rows were wired to the wrong path, or the weight
+    applied at the wrong end, neither would hold.
     """
     heat_network.segments["cover"] = "grass"
     inert = pd.DataFrame([{"alpha": GRASS["alpha"], "kappa": 1e-9, "eta": GRASS["eta"]}], index=["grass"])
@@ -1981,9 +1984,10 @@ def test_the_inflow_rows_read_the_water_the_parent_delivered(heat_network, short
     )
     rng = np.random.default_rng(41)
     tin = 9.0 + rng.normal(0.0, 1.0, system.n_bins)
-    t_int = heat._internal_pass(system, apply_banded(system.internal, tin), system.t_inf)
+    t_int = heat._internal_pass(system, apply_banded(system.internal, tin), system.t_inf, np.zeros_like(system.t_inf))
     n_seg = len(heat_network.segments)
-    delivered, weighted, inflow = t_int[:n_seg], t_int[n_seg : 2 * n_seg], t_int[2 * n_seg :]
+    delivered, weighted = t_int[:n_seg], t_int[n_seg : 2 * n_seg]
+    inflow = t_int[3 * n_seg : 4 * n_seg]
 
     both = np.isfinite(delivered) & np.isfinite(weighted)
     assert both.sum() > 0.5 * delivered.size
@@ -2068,13 +2072,16 @@ def test_wall_flux_vanishes_without_a_temperature_difference(heat_network, hourl
         spinup="constant",
     )
     uniform = np.full(system.n_bins, 14.0)
-    targets = heat._update_targets(
+    no_tilt = np.zeros_like(system.t_inf)
+    targets, tilts = heat._update_targets(
         system,
-        heat._internal_pass(system, apply_banded(system.internal, uniform), system.t_inf),
+        heat._internal_pass(system, apply_banded(system.internal, uniform), system.t_inf, no_tilt),
         system.t_inf,
+        no_tilt,
         uniform,
     )
     np.testing.assert_allclose(targets, system.t_inf, atol=1e-11)
+    np.testing.assert_allclose(tilts, 0.0, atol=1e-11)
 
 
 def test_pre_history_transient_decays_with_a_longer_lead_in(heat_pipe):
@@ -2571,11 +2578,12 @@ def test_the_warm_start_prefix_drives_no_wall_flux(heat_pipe, soil, surface):
     assert system.n_pad > 0, "the configuration must actually warm-start, or this pins nothing"
 
     padded = np.concatenate([np.full(system.n_pad, tin[0]), tin])
-    targets = heat._converge_targets(system, padded, max_sweeps=5000, atol=1e-12)
+    targets, tilts = heat._converge_targets(system, padded, max_sweeps=5000, atol=1e-10)
     # A target that never moved from the undisturbed field over the prefix is what "no flux
     # was booked there" looks like from outside: the halo is a causal convolution, so any
     # prefix flux would have shifted these bins first.
     np.testing.assert_allclose(targets[:, : system.n_pad], system.t_inf[:, : system.n_pad], rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(tilts[:, : system.n_pad], 0.0, rtol=0.0, atol=1e-12)
     assert np.max(np.abs(targets[:, system.n_pad :] - system.t_inf[:, system.n_pad :])) > 1e-3, (
         "the record itself must build a halo, or the assertion above is vacuous"
     )
