@@ -130,8 +130,9 @@ def network(
         Network to draw.
     values : pandas.Series or None, optional
         Per-segment quantity driving the line colour, indexed by segment name. Defaults to the
-        segment water volume. Pass e.g. ``network.segment_flow(flow=demand).mean(axis=1)`` as a
-        Series to colour by mean throughflow instead.
+        segment water volume. Pass e.g.
+        ``pd.Series(network.segment_flow(flow=demand).mean(axis=1), index=network.segments.index)``
+        to colour by mean throughflow instead.
     value_label : str, optional
         Colorbar label describing ``values``.
     node_positions : dict or None, optional

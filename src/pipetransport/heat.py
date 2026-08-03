@@ -177,15 +177,15 @@ from pipetransport.utils import solve_inverse_transport_banded, tedges_to_days
 # has settled, so the answer is the same to well under ``atol``; at 1e-2 the reverse direction
 # spends about a third of the inner sweeps that a fully resolved inner solve does.
 _INNER_FORCING = 1e-2
+# How far a segment's volume may sit from the one its length and diameter imply. Wide enough
+# for fittings and for wall-thickness conventions, tight enough to catch a volume that came
+# from somewhere else entirely.
+_GEOMETRY_TOLERANCE = 0.05
 # Anderson window on the reverse outer iterate. Truncated Anderson is truncated GMRES, so
 # the window is not a tuning knob with a free choice: too short a memory drops the directions
 # the iteration needs and it stalls. A depth of five raises on a 400 mm main at a half-hour
 # transit, which ten reconstructs to 1e-9. It buys range, not a guarantee: a pipe past the
 # regimes the divergence test names is out of reach at any depth.
-# How far a segment's volume may sit from the one its length and diameter imply. Wide enough
-# for fittings and for wall-thickness conventions, tight enough to catch a volume that came
-# from somewhere else entirely.
-_GEOMETRY_TOLERANCE = 0.05
 _ANDERSON_DEPTH = 10
 # Consecutive growing outer residuals that mark divergence rather than a slow start.
 _DIVERGENCE_STEPS = 5
@@ -731,7 +731,7 @@ def segment_heat_rate(
     _validate_positive(kappa_seg, name="kappa")
     _validate_positive(depth_seg, name="depth")
     eta_seg = per_segment(eta, "eta")
-    if eta_seg is not None and not np.all((eta_seg > 0.0) | np.isposinf(eta_seg)):
+    if not np.all((eta_seg > 0.0) | np.isposinf(eta_seg)):
         msg = "eta must be positive (inf is a prescribed-temperature surface)"
         raise ValueError(msg)
 
