@@ -263,7 +263,9 @@ class OraclePath:
             msg = "deliver() needs per-segment relaxation targets; pass segment_target to OraclePath"
             raise ValueError(msg)
         time, temperature = departure, t_source
-        for e, (pipe, volume, decay, target) in enumerate(zip(self.pipes, self.volume, self.decay, self.target, strict=True)):
+        for e, (pipe, volume, decay, target) in enumerate(
+            zip(self.pipes, self.volume, self.decay, self.target, strict=True)
+        ):
             entry_volume = pipe(time)
             exit_time = self._cross(pipe, volume, time, forward=True)
             if not np.isfinite(exit_time):

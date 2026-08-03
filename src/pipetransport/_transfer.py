@@ -93,6 +93,14 @@ once (:func:`paths_transfer` with ``with_target_terms=True``) and applied to con
 series by :func:`apply_segment_targets`, whose only sequential work is one exponentially
 forgetting scan per segment.
 
+A target may additionally carry a component linear in position along its segment -- the
+first axial mode of a relaxation field that varies along the pipe (issue #32). The same
+integration by parts then leaves only two new kinds of factor, both still closed-form on
+the cells: jumps weighted by the crossing edge's position in the pipe, and the parcel's own
+entry position, which is affine across a cell and integrates against the exponential factors
+as a ramp mean. Everything else reuses the factors above; see
+:func:`apply_segment_targets`.
+
 This file is part of pipetransport which is released under AGPL-3.0 license.
 See the ./LICENSE file or go to https://github.com/gwtransport/pipetransport/blob/main/LICENSE for full license details.
 """
@@ -123,6 +131,12 @@ _COVERAGE_TOLERANCE = 1e-8
 # segment on the path) and the 16-ulp plateau separation in _make_strictly_monotone. At
 # 1.4e-14 relative it is far below any physically meaningful volume.
 _ROUNDTRIP_ULPS = 64.0
+
+# Where _ramp_surviving_fraction switches from the closed form of E1 to its series: the
+# closed form loses a factor 1/delta**2 of precision to cancellation, the five-term series
+# an O(delta**5) truncation, and at 1e-2 both sit near 1e-13 relative. A floating-point
+# evaluation choice, not a model threshold: the two branches agree to round-off there.
+_RAMP_SERIES_CROSSOVER = 1e-2
 
 
 class TargetTerms(NamedTuple):
@@ -166,6 +180,22 @@ class TargetTerms(NamedTuple):
         ``exp(-k_d dt (bin_exit - bin_entry))``, the factor carrying the forgetting scan from
         the entry bin to the exit bin, one ``(n_d, n_cells)`` slab per depth. It depends
         only on the operator, so it is built once here rather than per applied target set.
+    entry_shift : list of ndarray
+        Cell means of the entry position ``C_d(A_entry)/V_d`` times the interior-edge
+        factor of :attr:`mean_shift`, one ``(n_d, n_cells)`` slab per depth. The entry
+        position is affine across a cell (the entry time stays inside one flow bin, where
+        the cumulative volume is linear), so the mean is the closed form of
+        :func:`_ramp_surviving_fraction`. It carries the parcel-dependent part of the
+        tilt's interior-edge sum; see :func:`apply_segment_targets`.
+    edge_fraction : ndarray
+        Cumulative segment throughflow at every input-bin edge over the segment volume,
+        shape ``(n_seg, n_cin + 1)`` -- the fraction of the pipe a parcel entering at
+        volume zero has traversed by each edge. The tilt's edge-weighted jump series is
+        built from its interior columns at apply time.
+    tilt_scale : ndarray
+        ``q_e[j] / (k_e V_e)``, shape ``(n_seg, n_cin)``, zero where the rate is zero: the
+        factor turning a tilt series into the traversal series whose mode-0 reading is the
+        ``(1/V) int c1 q exp(-k (b - t)) dt`` term of the tilt bias.
     row_offset : list of ndarray of intp
         Start of the depth-``d`` segment's row in the raveled target, ``paths_idx * n_cin``,
         one length-``n_d`` vector per depth. Stored per row rather than per cell so the flat
@@ -189,6 +219,9 @@ class TargetTerms(NamedTuple):
     bin_entry: list[npt.NDArray[np.int32]]
     bin_exit: list[npt.NDArray[np.int32]]
     gap: list[npt.NDArray[np.floating]]
+    entry_shift: list[npt.NDArray[np.floating]]
+    edge_fraction: npt.NDArray[np.floating]
+    tilt_scale: npt.NDArray[np.floating]
     row_offset: list[npt.NDArray[np.intp]]
     cell_weight: npt.NDArray[np.floating]
     flat_cout: npt.NDArray[np.intp]
@@ -261,6 +294,47 @@ def _surviving_fraction(phi_lo: npt.NDArray[np.floating], phi_hi: npt.NDArray[np
     with np.errstate(invalid="ignore", divide="ignore"):
         ramp = np.where(spread > 0.0, -np.expm1(-spread) / spread, 1.0)
     return np.exp(-np.minimum(phi_lo, phi_hi)) * ramp
+
+
+def _ramp_surviving_fraction(
+    phi_lo: npt.NDArray[np.floating],
+    phi_hi: npt.NDArray[np.floating],
+    ramp_lo: npt.NDArray[np.floating],
+    ramp_hi: npt.NDArray[np.floating],
+) -> npt.NDArray[np.floating]:
+    """Label-averaged ``ramp * exp(-phi)`` over a cell on which both factors are affine.
+
+    Anchored at the lower-exponent end so nothing overflows: with ``d = |phi_hi - phi_lo|``
+    and the ramp read from that end (``near``) toward the other (``far``), the mean is
+    ``exp(-min(phi)) * (near * E0 + (far - near) * E1)`` with ``E0 = (1 - e^-d)/d`` and
+    ``E1 = (1 - (1 + d) e^-d)/d**2``. ``E1``'s closed form loses a factor ``1/d**2`` to
+    cancellation, so below ``d = 0.01`` it is evaluated by its series, whose fifth term is
+    already below 1e-13 there; both arrangements agree to round-off at the crossover, so
+    the switch is a floating-point evaluation choice, not a model threshold.
+
+    Parameters
+    ----------
+    phi_lo, phi_hi : ndarray
+        Non-negative exponent at the two cell boundaries.
+    ramp_lo, ramp_hi : ndarray
+        The affine factor at the same two boundaries.
+
+    Returns
+    -------
+    ndarray
+        Mean of ``ramp * exp(-phi)`` over the cell, elementwise. Exactly the plain affine
+        average times ``exp(-phi)`` where the exponents coincide.
+    """
+    delta = np.abs(phi_hi - phi_lo)
+    swap = phi_hi < phi_lo
+    near = np.where(swap, ramp_hi, ramp_lo)
+    far = np.where(swap, ramp_lo, ramp_hi)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        e0 = np.where(delta > 0.0, -np.expm1(-delta) / delta, 1.0)
+        closed = (1.0 - (1.0 + delta) * np.exp(-delta)) / np.square(delta)
+    series = 0.5 - delta / 3.0 + np.square(delta) / 8.0 - delta**3 / 30.0 + delta**4 / 144.0
+    e1 = np.where(delta < _RAMP_SERIES_CROSSOVER, series, closed)
+    return np.exp(-np.minimum(phi_lo, phi_hi)) * (near * e0 + (far - near) * e1)
 
 
 def _cell_edges(
@@ -691,7 +765,7 @@ def paths_transfer(
             ).astype(np.int32)
             for stage in range(max_depth + 1)
         ]
-        mean_shift, bin_entry, bin_exit, gap, row_offset = [], [], [], [], []
+        mean_shift, bin_entry, bin_exit, gap, entry_shift, row_offset = [], [], [], [], [], []
         for depth in range(max_depth):
             rows = stage_rows[depth + 1]
             here = carrying[rows]
@@ -704,17 +778,40 @@ def paths_transfer(
             # record is.
             rate = segment_decay[paths_idx[rows, depth], None, None]
             shift = rate * (exits - tedges_days[exit_bin][:, None, :]) + phi_down
-            mean_shift.append(np.where(here, _surviving_fraction(*_cell_edges(shift)), 0.0))
+            shift_lo, shift_hi = _cell_edges(shift)
+            mean_shift.append(np.where(here, _surviving_fraction(shift_lo, shift_hi), 0.0))
             gap.append(np.exp(-rate[:, 0] * float(dt_days[0]) * (exit_bin - entry_bin)))
             bin_entry.append(entry_bin)
             bin_exit.append(exit_bin)
+            # The entry position of a cell's parcels, as the fraction of the segment already
+            # displaced at their entry time. The entry time stays inside one flow bin (the
+            # grid seeds tedges at every node), where the cumulative volume is linear, so the
+            # fraction is affine across the cell and pairs with the interior-edge factor in
+            # the closed ramp mean.
+            entries = stage_arrival[depth].reshape(n_nodes, 2, n_cells)[rows]
+            frac = (
+                _interp_rows(
+                    entries.reshape(rows.size, -1), tedges_days, segment_cumulative[paths_idx[rows, depth]]
+                ).reshape(rows.size, 2, n_cells)
+                / segment_volume[paths_idx[rows, depth], None, None]
+            )
+            entry_shift.append(np.where(here, _ramp_surviving_fraction(shift_lo, shift_hi, *_cell_edges(frac)), 0.0))
             row_offset.append(paths_idx[rows, depth] * n_cin)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            tilt_scale = np.where(
+                segment_decay[:, None] > 0.0,
+                segment_flow / (segment_decay[:, None] * segment_volume[:, None]),
+                0.0,
+            )
         target_terms = TargetTerms(
             mean_down=mean_down,
             mean_shift=mean_shift,
             bin_entry=bin_entry,
             bin_exit=bin_exit,
             gap=gap,
+            entry_shift=entry_shift,
+            edge_fraction=segment_cumulative / segment_volume[:, None],
+            tilt_scale=tilt_scale,
             row_offset=row_offset,
             cell_weight=(label_width / span_all.ravel()[flat_cout].reshape(n_nodes, n_cells))[order],
             flat_cout=flat_cout.reshape(n_nodes, n_cells)[order].ravel(),
@@ -727,7 +824,10 @@ def paths_transfer(
 
 
 def apply_segment_targets(
-    transfer: NetworkTransfer, segment_target: npt.NDArray[np.floating]
+    transfer: NetworkTransfer,
+    segment_target: npt.NDArray[np.floating],
+    *,
+    segment_tilt: npt.NDArray[np.floating] | None = None,
 ) -> npt.NDArray[np.floating]:
     """Apply concrete per-segment relaxation targets to a prebuilt operator's bias factors.
 
@@ -740,6 +840,20 @@ def apply_segment_targets(
     all, so its scan is skipped -- which is most of them when the caller carries inert copies
     of its segments.
 
+    With ``segment_tilt`` the target of segment ``e`` gains a component linear in position,
+    ``tilt_e(t) * (x/L - 1/2)`` at volume fraction ``x/L`` -- the first axial mode of a
+    relaxation field that varies along the pipe. A parcel reads the tilt through its own
+    traversal, and integrating by parts exactly as for the uniform target leaves four
+    closed-form pieces: the two boundary readings with halved coefficients (the parcel
+    enters at ``-1/2`` and leaves at ``+1/2``), the interior-edge sum with each jump
+    weighted by the edge's own :attr:`~TargetTerms.edge_fraction`, the entry-position
+    correction carried by :attr:`~TargetTerms.entry_shift`, and the traversal term
+    ``(1/V) int tilt q exp(-k (b - t)) dt``, which is the uniform-target machinery applied
+    to ``tilt * tilt_scale``. A zero-rate segment's tilt is zeroed first -- a pipe that
+    does not exchange has nothing to relax toward -- which is also what makes the
+    ``k -> 0`` limit of the ``1/k`` in :attr:`~TargetTerms.tilt_scale` exact with no
+    separate code path.
+
     Parameters
     ----------
     transfer : NetworkTransfer
@@ -747,6 +861,11 @@ def apply_segment_targets(
     segment_target : ndarray
         Relaxation target of every segment [same unit as the source signal], piecewise
         constant on the input bins, shape ``(n_seg, n_cin)``.
+    segment_tilt : ndarray or None, optional
+        Linear-in-position component of the target, same shape and unit: the target at
+        volume fraction ``x/L`` through segment ``e`` is
+        ``segment_target[e] + segment_tilt[e] * (x/L - 1/2)``. ``None`` (default) is the
+        position-uniform target, bit-identical to not passing the argument.
 
     Returns
     -------
@@ -776,6 +895,27 @@ def apply_segment_targets(
     for e in np.flatnonzero(steps.any(axis=1)):
         scan[e, 1:] = lfilter([1.0], [1.0, -rho[e]], steps[e])
 
+    tilt = None
+    if segment_tilt is not None:
+        tilt = np.where(terms.segment_rate[:, None] > 0.0, np.asarray(segment_tilt, dtype=float), 0.0)
+        traversal = tilt * terms.tilt_scale
+        steps_tilt, steps_traversal = np.diff(tilt, axis=1), np.diff(traversal, axis=1)
+        # Each interior jump of the tilt is read at the crossing edge's own position, so the
+        # edge-weighted series scans jumps times the edge fraction; the plain series carries
+        # the entry-position correction, whose parcel-dependent factor lives in entry_shift.
+        weighted = steps_tilt * (terms.edge_fraction[:, 1:-1] - 0.5)
+        scan_tilt, scan_edge, scan_traversal = np.zeros((3, n_seg, n_cin))
+        for e in np.flatnonzero(steps_tilt.any(axis=1) | steps_traversal.any(axis=1)):
+            scan_tilt[e, 1:] = lfilter([1.0], [1.0, -rho[e]], steps_tilt[e])
+            scan_edge[e, 1:] = lfilter([1.0], [1.0, -rho[e]], weighted[e])
+            scan_traversal[e, 1:] = lfilter([1.0], [1.0, -rho[e]], steps_traversal[e])
+        flat_tilt, flat_traversal = tilt.ravel(), traversal.ravel()
+        flat_scan_tilt, flat_scan_edge, flat_scan_traversal = (
+            scan_tilt.ravel(),
+            scan_edge.ravel(),
+            scan_traversal.ravel(),
+        )
+
     # Per depth: entry piece, exit piece and the scanned interior-edge sum of each cell, over
     # the rows still on a path at that depth -- the leading ``n_rows`` of the stored order,
     # so every slab is a slice and no row is gathered. The rows the slice drops contribute an
@@ -799,6 +939,16 @@ def apply_segment_targets(
             - flat_target[at_entry] * terms.mean_down[depth][:n_rows]
             - terms.mean_shift[depth] * interior
         )
+        if tilt is not None:
+            interior_tilt = flat_scan_tilt[at_exit] - flat_scan_tilt[at_entry] * terms.gap[depth]
+            interior_edge = flat_scan_edge[at_exit] - flat_scan_edge[at_entry] * terms.gap[depth]
+            interior_trav = flat_scan_traversal[at_exit] - flat_scan_traversal[at_entry] * terms.gap[depth]
+            cell_bias[:n_rows] += (
+                (0.5 * flat_tilt[at_exit] - flat_traversal[at_exit]) * terms.mean_down[depth + 1]
+                + (0.5 * flat_tilt[at_entry] + flat_traversal[at_entry]) * terms.mean_down[depth][:n_rows]
+                + terms.entry_shift[depth] * interior_tilt
+                - terms.mean_shift[depth] * (interior_edge - interior_trav)
+            )
 
     out_slots = n_nodes * (n_cout + 2)
     bias = np.bincount(terms.flat_cout, weights=(cell_bias * terms.cell_weight).ravel(), minlength=out_slots).reshape(

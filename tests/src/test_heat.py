@@ -896,6 +896,57 @@ def test_bias_matches_the_brute_force_oracle(heat_network, short_tedges, diurnal
     np.testing.assert_allclose(actual[both], expected[both], atol=1e-11)
 
 
+@pytest.mark.parametrize("node", ["T4", "B"])
+def test_tilt_bias_matches_the_brute_force_oracle(heat_network, short_tedges, diurnal_demand, node):
+    """Targets linear in position, against the oracle's exact ramp update.
+
+    The tilt reading decomposes by parts into halved boundary readings, an interior sum
+    whose jumps are weighted by the crossing edge's own position, an entry-position ramp
+    mean, and the traversal series ``tilt * q/(k V)`` read through the uniform-target
+    machinery. The oracle instead walks each parcel with the closed ramp update and shares
+    none of that arithmetic; the demand split is non-proportional, so entry positions and
+    edge crossings move between bins and the comparison exercises every term at once.
+    """
+    demand = heat_network.flow_array(diurnal_demand(heat_network, short_tedges))
+    rng = np.random.default_rng(29)
+    n_seg, n_bins = len(heat_network.segments), len(short_tedges) - 1
+    rates = _rate(heat_network, depth=heat_network.segments["depth"]).to_numpy()
+    targets = rng.uniform(8.0, 24.0, size=(n_seg, n_bins))
+    tilts = rng.uniform(-6.0, 6.0, size=(n_seg, n_bins))
+    tin = rng.uniform(6.0, 14.0, size=n_bins)
+
+    transfer = _build_operator(heat_network, demand, short_tedges, rates, nodes=[node])
+    columns = np.clip(transfer.col_start[..., None] + np.arange(transfer.band_vals.shape[-1]), 0, n_bins - 1)
+    actual = np.einsum("nkb,nkb->nk", transfer.band_vals, tin[columns])[0]
+    actual += apply_segment_targets(transfer, targets, segment_tilt=tilts)[0]
+    actual = np.where(transfer.valid_out[0], actual, np.nan)
+
+    rows = heat_network.segments.index.get_indexer(list(heat_network.paths[node]))
+    days = tedges_to_days(short_tedges)
+    expected = OraclePath(
+        tedges_days=days,
+        segment_flow=heat_network.segment_flow(flow=demand)[rows],
+        segment_volume=heat_network.segments["volume"].to_numpy(dtype=float)[rows],
+        segment_decay=rates[rows],
+        node_flow=heat_network.node_flow(flow=demand, nodes=[node])[0],
+        segment_target=targets[rows],
+        segment_target_slope=tilts[rows],
+    ).tout(tin=tin, cout_tedges_days=days)
+
+    both = np.isfinite(actual) & np.isfinite(expected)
+    assert both.sum() > 0.5 * len(actual)
+    np.testing.assert_allclose(actual[both], expected[both], atol=1e-11)
+
+    # A zero tilt must not move a bit, and a zero-rate segment's tilt must not act at all.
+    plain = apply_segment_targets(transfer, targets)
+    np.testing.assert_array_equal(apply_segment_targets(transfer, targets, segment_tilt=np.zeros_like(tilts)), plain)
+    conservative = _build_operator(heat_network, demand, short_tedges, np.zeros(n_seg), nodes=[node])
+    np.testing.assert_array_equal(
+        apply_segment_targets(conservative, targets, segment_tilt=tilts),
+        apply_segment_targets(conservative, targets),
+    )
+
+
 def test_oracle_tilt_target_is_its_own_splitting_limit():
     """The oracle's closed-form tilt update against the oracle's own splitting limit.
 
