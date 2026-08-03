@@ -113,6 +113,7 @@ import numpy as np
 import numpy.typing as npt
 import pandas as pd
 from scipy.signal import lfilter
+from scipy.special import gammainc, gammaln
 
 from pipetransport._validation import _validate_non_negative, _validate_retardation_factor, _validate_tedges
 from pipetransport.utils import cumulative_flow_volume, tedges_to_days
@@ -132,100 +133,139 @@ _COVERAGE_TOLERANCE = 1e-8
 # 1.4e-14 relative it is far below any physically meaningful volume.
 _ROUNDTRIP_ULPS = 64.0
 
-# Where _ramp_surviving_fraction switches from the closed form of E1 to its series: the
-# closed form loses a factor 1/delta**2 of precision to cancellation, the five-term series
-# an O(delta**5) truncation, and at 1e-2 both sit near 1e-13 relative. A floating-point
-# evaluation choice, not a model threshold: the two branches agree to round-off there.
-_RAMP_SERIES_CROSSOVER = 1e-2
+# Where the incomplete reading kernels switch from their power series in the exponent to
+# their incomplete-gamma closed forms. Below the crossover the series terms fall factorially
+# and the closed form cancels; above it the closed form's alternating sum is bounded because
+# the exponent itself bounds the offending ratios. Both branches hold round-off accuracy in
+# an overlapping decade around 2, so this is a floating-point evaluation choice, not a model
+# threshold. The series length is what full float64 accuracy at the crossover takes.
+_SERIES_CROSSOVER = 2.0
+
+# Chunk length of the position frames, in pipe volumes of throughflow. Any value strictly
+# above one volume plus round-off keeps a traversal inside two consecutive chunks; 1.5
+# leaves that margin wide without stretching the in-frame positions the scans carry.
+_CHUNK_VOLUMES = 1.5
 
 
 class TargetTerms(NamedTuple):
     """Target-independent factors of the affine bias, built alongside the operator.
 
     Everything a per-sweep :func:`apply_segment_targets` call needs, precomputed on the
-    refined cell grid so that applying a new target series costs one scan per segment plus
-    gathers -- the operator is never rebuilt. Cell means of invalid (zero-width) cells are
-    zeroed here, so the apply step is NaN-free by construction.
+    refined cell grid so that applying a new target series costs a few scans per segment
+    plus gathers -- the operator is never rebuilt. Cell means of invalid (zero-width)
+    cells are zeroed here, so the apply step is NaN-free by construction.
 
-    The per-depth factors are stored **ragged**: a row whose path is shorter than ``max_depth``
-    contributes an exact zero at its trailing slots -- its entry and exit stages are the same
-    floats, so the two target readings cancel and the interior sum is empty -- and carrying
-    those slots is half the depth loop on a network of mixed path depths. Since a path occupies
+    A parcel's bias from one segment splits at the input-bin edges of its traversal into
+    an entry piece, full interior bins, and an exit piece. The interior pieces are what
+    the chunk-anchored scans of :func:`apply_segment_targets` sum; the two partial pieces
+    and the position weights of the interior sum are per-cell closed forms stored here.
+    Every per-cell quantity involved is affine in one of two per-cell exponents -- the
+    exit-side lag ``s = k_d (A_exit - tau[bin_exit])`` and the entry-side lag
+    ``s' = k_d (tau[bin_entry + 1] - A_entry)`` -- so every slab is a combination of
+    cell means of powers of ``s`` or ``s'`` against the reading weight and the
+    downstream decay, and no stored exponent can overflow.
+
+    The record of each segment is chunked wherever at least 1.5 pipe volumes have flowed
+    through since the last chunk started. A traversal displaces exactly one volume, so a
+    parcel's interior bins span at most one chunk boundary, and every position that
+    enters a stored slab or a scan is measured within a chunk -- bounded by the chunk
+    span plus a bin, however long the record. That bound is what keeps the high modes at
+    round-off accuracy: no power of a record-scale cumulative volume ever forms.
+
+    The per-depth factors are stored **ragged**: a row whose path is shorter than
+    ``max_depth`` contributes an exact zero at its trailing slots, and carrying those
+    slots is half the depth loop on a network of mixed path depths. Since a path occupies
     the leading slots of its row, the rows active at depth ``d`` shrink monotonically with
     ``d``; the rows are therefore stored once in order of decreasing path depth, and depth
-    ``d``'s factors are the leading ``n_d`` rows of their slab rather than a gather. The same
-    ordering is baked into :attr:`cell_weight` and :attr:`flat_cout`, so nothing has to be
-    permuted back.
+    ``d``'s factors are the leading ``n_d`` rows of their slab rather than a gather. The
+    same ordering is baked into :attr:`cell_weight` and :attr:`flat_cout`, so nothing has
+    to be permuted back.
 
     Attributes
     ----------
-    mean_down : list of ndarray
-        Cell means of ``exp(-phi_down)``, one slab per path stage, ``max_depth + 1`` of them.
-        Slab ``0`` holds the mean of ``exp(-phi_total)`` (the surviving fraction of the
-        cell); slab ``d + 1`` the mean over the exponent from the exit of the depth-``d``
-        segment to the node. The depth-``d`` bias reads its entry piece from slab ``d`` and
-        its exit piece from slab ``d + 1``, both restricted to depth ``d``'s rows -- so slab
-        ``d + 1`` carries exactly those rows and slab ``d`` at least them.
-    mean_shift : list of ndarray
-        Cell means of ``exp(-(k_d (A_exit(s) - tau[bin_exit]) + phi_down(s)))``, the
-        factor of the interior-edge sum, one ``(n_d, n_cells)`` slab per depth. The
-        exponent is non-negative by the half-open edge convention, so it never overflows.
+    exit_read : list of ndarray
+        Per depth, shape ``(n_modes, n_d, n_cells)``: the exit partial piece per unit of
+        the monomial series ``v_i`` read at the exit bin -- the cell mean of the
+        incomplete kernel ``I_i(s) = integral_0^s (1 - lam q/(k V))**i e**-lam dlam``
+        times the reading weight and ``exp(-phi_down)``.
+    entry_read : list of ndarray
+        Per depth, same shape: the entry partial piece per unit of ``v_i`` read at the
+        entry bin, with the decay from the entry bin's right edge to the parcel's
+        delivery folded into the stored exponent.
+    position_exit : list of ndarray
+        Per depth, shape ``(n_modes, n_d, n_cells)``: cell means of ``alpha_x**u`` times
+        the interior factor ``exp(-(s + phi_down))`` and the reading weight, with
+        ``alpha_x`` the parcel's volume fraction offset from its exit chunk's frame
+        origin. Multiplies the chunked scans gathered at the exit edge.
+    position_mid : list of ndarray
+        Per depth, same shape: the previous chunk's counterpart -- the frame offset
+        continued across the one chunk boundary a traversal can span, times the decay
+        from that boundary to the exit edge. Zero for cells whose traversal stays inside
+        one chunk. Multiplies the scans gathered at the chunk-start edge.
+    position_entry : list of ndarray
+        Per depth, same shape: cell means of ``alpha_e**u`` (the entry-side frame offset)
+        times the interior factor continued through to the entry bin's right edge.
+        Multiplies the scans' entry cutoff.
     bin_entry, bin_exit : list of ndarray of int32
         Input bin holding the segment entry and exit time of each cell's parcels, one
-        ``(n_d, n_cells)`` slab per depth; constant over a cell because the grid seeds the
-        input edges at every node. Bin numbers are below ``n_cin``, so 32 bits are exact;
-        :func:`apply_segment_targets` adds :attr:`row_offset` to reach the raveled target,
-        and that sum widens to the platform index type on its own.
-    gap : list of ndarray
-        ``exp(-k_d dt (bin_exit - bin_entry))``, the factor carrying the forgetting scan from
-        the entry bin to the exit bin, one ``(n_d, n_cells)`` slab per depth. It depends
-        only on the operator, so it is built once here rather than per applied target set.
-    entry_shift : list of ndarray
-        Cell means of the entry position ``C_d(A_entry)/V_d`` times the interior-edge
-        factor of :attr:`mean_shift`, one ``(n_d, n_cells)`` slab per depth. The entry
-        position is affine across a cell (the entry time stays inside one flow bin, where
-        the cumulative volume is linear), so the mean is the closed form of
-        :func:`_ramp_surviving_fraction`. It carries the parcel-dependent part of the
-        tilt's interior-edge sum; see :func:`apply_segment_targets`.
-    edge_fraction : ndarray
-        Cumulative segment throughflow at every input-bin edge over the segment volume,
-        shape ``(n_seg, n_cin + 1)`` -- the fraction of the pipe a parcel entering at
-        volume zero has traversed by each edge. The tilt's edge-weighted jump series is
-        built from its interior columns at apply time.
-    tilt_scale : ndarray
-        ``q_e[j] / (k_e V_e)``, shape ``(n_seg, n_cin)``, zero where the rate is zero: the
-        factor turning a tilt series into the traversal series whose mode-0 reading is the
-        ``(1/V) int c1 q exp(-k (b - t)) dt`` term of the tilt bias.
-    row_offset : list of ndarray of intp
-        Start of the depth-``d`` segment's row in the raveled target, ``paths_idx * n_cin``,
-        one length-``n_d`` vector per depth. Stored per row rather than per cell so the flat
-        index is never held at operator scale.
+        ``(n_d, n_cells)`` slab per depth; constant over a cell because the grid seeds
+        the input edges at every node.
+    bin_mid : list of ndarray of int32
+        Chunk-start edge of each cell's exit chunk, one ``(n_d, n_cells)`` slab per
+        depth: where the :attr:`position_mid` scans are gathered.
+    segment_of : list of ndarray of intp
+        Segment row of each depth-``d`` path step, one length-``n_d`` vector per depth,
+        in the stored row order.
     cell_weight : ndarray
         Label width of each cell over the label span of its output slot, shape
-        ``(n_nodes, n_cells)`` -- the same weight the ``W`` scatter uses, in the stored row
-        order.
+        ``(n_nodes, n_cells)`` -- the same weight the ``W`` scatter uses, in the stored
+        row order.
     flat_cout : ndarray of intp
         Flattened output slot of each cell in the dustbin layout, shape
         ``(n_nodes * n_cells,)``, in the stored row order. The slot values still name the
         operator's own rows, so the scatter lands where it did.
     segment_rate : ndarray
         The per-segment rates [1/day] the operator was built with, length ``n_seg``.
+    theta : ndarray
+        Segment volume fractions displaced per bin ``q dt / V``, shape ``(n_seg, n_cin)``.
+    theta_in : ndarray
+        Each bin's left-edge volume fraction within its own chunk's frame, shape
+        ``(n_seg, n_cin)``, bounded by the chunk span -- the position factor the scans
+        carry.
+    chunk_edge : ndarray of int32
+        Chunk-start edge of the chunk holding each edge's preceding bin, shape
+        ``(n_seg, n_cin + 1)``.
+    rho_into : ndarray
+        ``exp(-k dt (J - chunk_edge[J]))`` per edge, same shape: the decay across each
+        edge's own chunk, closing the scans' chunk cutoff.
+    etilde : ndarray
+        ``integral_0^1 z**r exp(-k dt (1 - z)) dz`` per segment, shape
+        ``(n_modes, n_seg)``: the position moments of one fully traversed bin, anchored
+        at its downstream end.
+    n_modes : int
+        Number of axial modes the slabs were built for.
     dt_days : float
-        Uniform input-bin width [days] the scan of :func:`apply_segment_targets` assumes.
+        Uniform input-bin width [days] the scans of :func:`apply_segment_targets` assume.
     """
 
-    mean_down: list[npt.NDArray[np.floating]]
-    mean_shift: list[npt.NDArray[np.floating]]
+    exit_read: list[npt.NDArray[np.floating]]
+    entry_read: list[npt.NDArray[np.floating]]
+    position_exit: list[npt.NDArray[np.floating]]
+    position_mid: list[npt.NDArray[np.floating]]
+    position_entry: list[npt.NDArray[np.floating]]
     bin_entry: list[npt.NDArray[np.int32]]
     bin_exit: list[npt.NDArray[np.int32]]
-    gap: list[npt.NDArray[np.floating]]
-    entry_shift: list[npt.NDArray[np.floating]]
-    edge_fraction: npt.NDArray[np.floating]
-    tilt_scale: npt.NDArray[np.floating]
-    row_offset: list[npt.NDArray[np.intp]]
+    bin_mid: list[npt.NDArray[np.int32]]
+    segment_of: list[npt.NDArray[np.intp]]
     cell_weight: npt.NDArray[np.floating]
     flat_cout: npt.NDArray[np.intp]
     segment_rate: npt.NDArray[np.floating]
+    theta: npt.NDArray[np.floating]
+    theta_in: npt.NDArray[np.floating]
+    chunk_edge: npt.NDArray[np.int32]
+    rho_into: npt.NDArray[np.floating]
+    etilde: npt.NDArray[np.floating]
+    n_modes: int
     dt_days: float
 
 
@@ -296,64 +336,326 @@ def _surviving_fraction(phi_lo: npt.NDArray[np.floating], phi_hi: npt.NDArray[np
     return np.exp(-np.minimum(phi_lo, phi_hi)) * ramp
 
 
-def _ramp_surviving_fraction(
-    phi_lo: npt.NDArray[np.floating],
-    phi_hi: npt.NDArray[np.floating],
-    ramp_lo: npt.NDArray[np.floating] | float,
-    ramp_hi: npt.NDArray[np.floating] | float,
-    pair_lo: npt.NDArray[np.floating] | float = 1.0,
-    pair_hi: npt.NDArray[np.floating] | float = 1.0,
-) -> npt.NDArray[np.floating]:
-    """Label-averaged ``ramp * pair * exp(-phi)`` over a cell on which all three are affine.
+def _e_table(n_max: int, x: npt.NDArray[np.floating]) -> npt.NDArray[np.floating]:
+    """``E_n(x) = integral_0^1 s**n exp(-x s) ds`` for ``n = 0..n_max``, elementwise in ``x``.
 
-    Anchored at the lower-exponent end so nothing overflows: with ``d = |phi_hi - phi_lo|``
-    and both affine factors read from that end, the mean is
-    ``exp(-min(phi)) * (a0 b0 E0 + (a0 db + b0 da) E1 + da db E2)`` with
-    ``En = integral_0^1 x^n e^{-d x} dx``. A constant factor of 1 collapses its terms, so
-    the single-ramp and plain means are the same expression, not special cases. ``E1`` and
-    ``E2`` lose factors ``1/d**2`` and ``1/d**3`` to cancellation in their closed forms, so
-    below ``d = 0.01`` both are evaluated by their series, whose truncation sits below
-    1e-13 there; the arrangements agree to round-off at the crossover, a floating-point
-    evaluation choice rather than a model threshold.
+    The one moment family everything in this module integrates against. The recurrence
+    ``E_n = (n E_{n-1} - exp(-x)) / x`` runs upward from the closed ``E_0``, which is
+    stable exactly while ``n <= x``; above that the same recurrence runs downward from a
+    seed at ``n_max``, stable exactly while ``n > x``, so each entry is read from the
+    branch that is stable there. The seed is the closed form ``n! P(n+1, x) / x**(n+1)``
+    (``P`` the regularized lower incomplete gamma) in log space for ``x >= 1``, and the
+    alternating series -- whose terms fall factorially, truncated at the float64 floor --
+    below, where the closed form's power of ``x`` cancels. ``x = 0`` returns exactly
+    ``1/(n+1)`` and ``x = inf`` exactly 0. Only one special-function evaluation per ``x``
+    for the whole table, which is what keeps large tables affordable.
 
     Parameters
     ----------
-    phi_lo, phi_hi : ndarray
-        Non-negative exponent at the two cell boundaries.
-    ramp_lo, ramp_hi : ndarray or float
-        The first affine factor at the same two boundaries.
-    pair_lo, pair_hi : ndarray or float, optional
-        A second affine factor; the default 1 reduces to the single-ramp mean exactly.
+    n_max : int
+        Highest moment order.
+    x : ndarray
+        Non-negative exponents, any shape.
 
     Returns
     -------
     ndarray
-        Mean of ``ramp * pair * exp(-phi)`` over the cell, elementwise. Exactly the mean of
-        the affine product times ``exp(-phi)`` where the exponents coincide.
+        ``E_n(x)`` of shape ``(n_max + 1, *x.shape)``.
     """
-    delta = np.abs(phi_hi - phi_lo)
-    swap = phi_hi < phi_lo
-    a0 = np.where(swap, ramp_hi, ramp_lo)
-    da = np.where(swap, ramp_lo, ramp_hi) - a0
-    b0 = np.where(swap, pair_hi, pair_lo)
-    db = np.where(swap, pair_lo, pair_hi) - b0
-    with np.errstate(invalid="ignore", divide="ignore"):
-        e0 = np.where(delta > 0.0, -np.expm1(-delta) / delta, 1.0)
-        e1_closed = (1.0 - (1.0 + delta) * np.exp(-delta)) / np.square(delta)
-        e2_closed = (2.0 - (np.square(delta) + 2.0 * delta + 2.0) * np.exp(-delta)) / delta**3
-    small = delta < _RAMP_SERIES_CROSSOVER
-    e1 = np.where(
-        small,
-        0.5 - delta / 3.0 + np.square(delta) / 8.0 - delta**3 / 30.0 + delta**4 / 144.0,
-        e1_closed,
-    )
-    e2 = np.where(
-        small,
-        1.0 / 3.0 - delta / 4.0 + np.square(delta) / 10.0 - delta**3 / 36.0 + delta**4 / 168.0 - delta**5 / 960.0,
-        e2_closed,
-    )
-    mean = a0 * b0 * e0 + (a0 * db + b0 * da) * e1 + da * db * e2
-    return np.exp(-np.minimum(phi_lo, phi_hi)) * mean
+    x = np.asarray(x, dtype=float)
+    decay = np.exp(-x)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        first = np.where(x > 0.0, -np.expm1(-x) / x, 1.0)
+        inverse = np.where(x > 0.0, 1.0 / x, 0.0)
+    if n_max == 0:
+        return first[None]
+
+    upward = np.empty((n_max + 1, *x.shape))
+    upward[0] = first
+    # The upward recurrence is only read where n <= x; past that it runs away (to inf for
+    # small x, harmlessly, hence the errstate) and the downward branch is read instead.
+    with np.errstate(over="ignore", invalid="ignore"):
+        for n in range(1, n_max + 1):
+            upward[n] = (n * upward[n - 1] - decay) * inverse
+
+    small = x < 1.0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_x = np.log(np.where(small, 1.0, x))
+        seed = np.exp(gammaln(n_max + 1.0) - (n_max + 1.0) * log_x) * gammainc(n_max + 1.0, x)
+    xs = np.where(small, x, 0.0)
+    series = np.zeros(x.shape)
+    power = np.ones(x.shape)
+    for j in range(20):
+        if j:
+            power *= -xs / j
+        series += power / (n_max + j + 1)
+    seed = np.where(small, series, seed)
+
+    downward = np.empty_like(upward)
+    downward[n_max] = seed
+    for n in range(n_max, 0, -1):
+        downward[n - 1] = (x * downward[n] + decay) / n
+
+    n_axis = np.arange(n_max + 1).reshape((n_max + 1, *([1] * x.ndim)))
+    return np.where(n_axis <= x, upward, downward)
+
+
+def _affine_multiply(
+    coef: npt.NDArray[np.floating],
+    offset: npt.NDArray[np.floating],
+    slope: npt.NDArray[np.floating],
+) -> npt.NDArray[np.floating]:
+    """Multiply a coefficient stack by the affine factor ``offset + slope * x``.
+
+    Parameters
+    ----------
+    coef : ndarray
+        Polynomial coefficients over the leading axis, shape ``(d + 1, ...)``.
+    offset, slope : ndarray
+        The affine factor's value at ``x = 0`` and its slope, broadcastable to the
+        trailing shape.
+
+    Returns
+    -------
+    ndarray
+        Coefficients of the product, shape ``(d + 2, ...)``.
+    """
+    shape = np.broadcast_shapes(coef.shape[1:], np.shape(offset), np.shape(slope))
+    out = np.zeros((coef.shape[0] + 1, *shape))
+    out[:-1] = coef * offset
+    out[1:] += coef * slope
+    return out
+
+
+class _CellBasis:
+    """Moments of one anchored exponent over every cell, and contractions against them.
+
+    Every closed form in the target machinery is the cell mean of ``P(x) exp(-phi(x))``
+    with ``P`` a polynomial in the cell coordinate and ``phi`` affine across the cell. The
+    mean is anchored at the lower-exponent end -- the coordinate is reversed where
+    ``phi_hi < phi_lo`` -- so the moments ``exp(-min(phi)) E_k(|dphi|)`` never overflow,
+    and every affine factor entering a polynomial must be read in the same orientation,
+    which :meth:`affine` provides. The moment table is grown on demand.
+
+    Parameters
+    ----------
+    phi_lo, phi_hi : ndarray
+        The exponent at the two cell boundaries, non-negative, shape ``(n_rows, n_cells)``.
+    """
+
+    def __init__(self, phi_lo: npt.NDArray[np.floating], phi_hi: npt.NDArray[np.floating]) -> None:
+        self.swap = phi_hi < phi_lo
+        self.delta = np.abs(phi_hi - phi_lo)
+        self.scale = np.exp(-np.minimum(phi_lo, phi_hi))
+        self.moments = self.scale * _e_table(0, self.delta)
+
+    def affine(
+        self, lo: npt.NDArray[np.floating], hi: npt.NDArray[np.floating]
+    ) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]:
+        """Orient an affine quantity's endpoint pair to this basis's anchored coordinate.
+
+        Parameters
+        ----------
+        lo, hi : ndarray
+            The quantity at the cell's lower and upper boundary.
+
+        Returns
+        -------
+        offset, slope : ndarray
+            Its value at the anchored origin and its slope along the anchored coordinate.
+        """
+        start = np.where(self.swap, hi, lo)
+        return start, np.where(self.swap, lo, hi) - start
+
+    def mean(self, coef: npt.NDArray[np.floating]) -> npt.NDArray[np.floating]:
+        """Cell mean of the polynomial ``coef`` (anchored coordinate) times ``exp(-phi)``.
+
+        Parameters
+        ----------
+        coef : ndarray
+            Coefficients of shape ``(d + 1, n_rows, n_cells)`` (trailing axes may
+            broadcast).
+
+        Returns
+        -------
+        ndarray
+            The mean, shape ``(n_rows, n_cells)``.
+        """
+        if coef.shape[0] > self.moments.shape[0]:
+            self.moments = self.scale * _e_table(coef.shape[0] - 1, self.delta)
+        return np.einsum("k...,k...->...", coef, self.moments[: coef.shape[0]])
+
+
+def _series_length(max_arg: float) -> int:
+    """Terms an exponential-family series needs to reach the float64 floor at ``max_arg``.
+
+    The series in this module are entire with terms falling like ``arg**j / j!``, so this
+    is pure truncation control read off the data rather than a tolerance to tune.
+
+    Parameters
+    ----------
+    max_arg : float
+        Largest exponent argument the series will be evaluated at.
+
+    Returns
+    -------
+    int
+        Smallest term count whose next term is below 1e-17 at ``max_arg``.
+    """
+    length, term = 1, 1.0
+    arg = max(float(max_arg), 1e-3)
+    while term * arg / length > 1e-17 * max(1.0, np.exp(arg)):
+        term *= arg / length
+        length += 1
+    return length + 1
+
+
+class _WeightedBasis:
+    """Cell means against one base exponent, threaded with each row's reading weight.
+
+    Every reading weight this module supports is exactly ``Wp(lag) + We(lag) exp(-w lag)``
+    with ``Wp`` and ``We`` polynomials in the lag to the output-bin end:
+
+    - a plain row is ``Wp = 1``, ``We = 0``;
+    - a moment row ``lag**p exp(-w lag)`` is ``We = lag**p``;
+    - an integrated row ``g_p(lag) = integral_0^lag u**p exp(-w u) du`` is, below the
+      series crossover, the entire series of ``g_p`` in ``Wp`` alone, and above it the
+      closed form ``p!/w**(p+1)`` in ``Wp`` with the complement polynomial in ``We`` --
+      the branch masks are baked into the coefficients per cell, so both shapes coexist
+      in one row.
+
+    The mean of any polynomial ``P(x)`` against weight and base exponent is then two
+    anchored contractions, one against ``base`` and one against ``base + w lag``. The
+    weight polynomials are composed into the two anchored cell coordinates once, here,
+    and every subsequent :meth:`powers` table reuses them.
+
+    Parameters
+    ----------
+    base_lo, base_hi : ndarray
+        Base exponent (decay and shift factors, without the weight's own exponential) at
+        the two cell boundaries, shape ``(n_rows, n_cells)``.
+    lag_lo, lag_hi : ndarray
+        Lag to the output-bin end at the boundaries, same shape.
+    rate, power, integrated : ndarray
+        Per-row weight spec: exponential rate [1/day], polynomial power, and whether the
+        weight is the running integral of the kernel rather than the kernel itself.
+    """
+
+    def __init__(
+        self,
+        base_lo: npt.NDArray[np.floating],
+        base_hi: npt.NDArray[np.floating],
+        lag_lo: npt.NDArray[np.floating],
+        lag_hi: npt.NDArray[np.floating],
+        rate: npt.NDArray[np.floating],
+        power: npt.NDArray[np.integer],
+        integrated: npt.NDArray[np.bool_],
+    ) -> None:
+        self.base = (base_lo, base_hi)
+        self.lag = (lag_lo, lag_hi)
+        self.rate = rate[:, None]
+
+        with np.errstate(invalid="ignore"):
+            weight_arg = self.rate * 0.5 * (lag_lo + lag_hi)
+        series_cell = weight_arg < _SERIES_CROSSOVER
+        n_terms = _series_length(min(_SERIES_CROSSOVER, float(np.nanmax(weight_arg, initial=0.0))))
+        p_max = int(power.max(initial=0))
+
+        # Weight coefficients in the lag, as (per-row scalar) x (per-cell mask) terms.
+        factorial = np.cumprod(np.concatenate([[1.0], np.arange(1.0, p_max + n_terms + 2)]))
+        n_cells = series_cell.shape[-1]
+        w_plain = np.zeros((p_max + n_terms + 2, len(rate), n_cells))
+        w_exp = np.zeros((max(p_max + 1, 1), len(rate), n_cells))
+        w_exp[0] += (~integrated & (power == 0))[:, None]
+        for p in range(1, p_max + 1):
+            w_exp[p] += (~integrated & (power == p))[:, None]
+        for row in np.flatnonzero(integrated):
+            p, w = int(power[row]), float(rate[row])
+            choose = series_cell[row]
+            sign = 1.0
+            for j in range(n_terms):
+                w_plain[p + 1 + j, row] += choose * sign / (factorial[j] * (p + j + 1))
+                sign *= -w
+            if not choose.all() and w > 0.0:
+                top = factorial[p] / w ** (p + 1)
+                w_plain[0, row] += ~choose * top
+                for r in range(p + 1):
+                    w_exp[r, row] -= ~choose * top * w**r / factorial[r]
+        self.weight_lag = (w_plain, w_exp)
+
+    @staticmethod
+    def _compose(
+        basis: _CellBasis,
+        lag_coef: npt.NDArray[np.floating],
+        lag_lo: npt.NDArray[np.floating],
+        lag_hi: npt.NDArray[np.floating],
+    ) -> npt.NDArray[np.floating]:
+        """Compose a polynomial in the lag with the lag's affine run across each cell.
+
+        Parameters
+        ----------
+        basis : _CellBasis
+            Basis whose anchored orientation the composition must follow.
+        lag_coef : ndarray
+            Coefficients in the lag, shape ``(d + 1, n_rows, n_cells or 1)``.
+        lag_lo, lag_hi : ndarray
+            Lag endpoints per cell.
+
+        Returns
+        -------
+        ndarray
+            Coefficients in the anchored cell coordinate, shape ``(d + 1, n_rows, n_cells)``.
+        """
+        offset, slope = basis.affine(lag_lo, lag_hi)
+        out = lag_coef[-1] * np.ones_like(offset)[None]
+        for coef in lag_coef[-2::-1]:
+            out = _affine_multiply(out, offset, slope)
+            out[0] += coef
+        return out
+
+    def powers(
+        self,
+        qty_lo: npt.NDArray[np.floating],
+        qty_hi: npt.NDArray[np.floating],
+        n_powers: int,
+        extra_lo: npt.NDArray[np.floating] | float = 0.0,
+        extra_hi: npt.NDArray[np.floating] | float = 0.0,
+    ) -> npt.NDArray[np.floating]:
+        """Cell means of ``qty**m * weight * exp(-(base + extra))`` for ``m = 0..n_powers``.
+
+        Parameters
+        ----------
+        qty_lo, qty_hi : ndarray
+            Endpoints of the affine quantity whose powers are read.
+        n_powers : int
+            Highest power.
+        extra_lo, extra_hi : ndarray or float, optional
+            An additional affine exponent, folded exactly into the anchored base -- no
+            series is involved. Default 0.
+
+        Returns
+        -------
+        ndarray
+            Table of shape ``(n_powers + 1, n_rows, n_cells)``.
+        """
+        base_lo, base_hi = self.base
+        lag_lo, lag_hi = self.lag
+        exponents = (
+            (base_lo + extra_lo, base_hi + extra_hi),
+            (base_lo + extra_lo + self.rate * lag_lo, base_hi + extra_hi + self.rate * lag_hi),
+        )
+        out = None
+        for (phi_lo, phi_hi), weight in zip(exponents, self.weight_lag, strict=True):
+            basis = _CellBasis(phi_lo, phi_hi)
+            coef = self._compose(basis, weight, lag_lo, lag_hi)
+            offset, slope = basis.affine(qty_lo, qty_hi)
+            table = np.empty((n_powers + 1, *offset.shape))
+            for m in range(n_powers + 1):
+                table[m] = basis.mean(coef)
+                if m < n_powers:
+                    coef = _affine_multiply(coef, offset, slope)
+            out = table if out is None else out + table
+        return out
 
 
 def _cell_edges(
@@ -468,8 +770,10 @@ def paths_transfer(
     paths_idx: npt.NDArray[np.intp],
     active: npt.NDArray[np.bool_],
     bin_end_rate: npt.NDArray[np.floating] | None = None,
-    bin_end_ramp: npt.NDArray[np.bool_] | None = None,
+    bin_end_power: npt.NDArray[np.integer] | None = None,
+    bin_end_integrated: npt.NDArray[np.bool_] | None = None,
     with_target_terms: bool = False,
+    n_target_modes: int = 1,
 ) -> NetworkTransfer:
     """Build the exact transfer operators and travel times of every source-to-node path.
 
@@ -503,18 +807,25 @@ def paths_transfer(
         in. The row then reads the exponentially weighted bin average of its input rather
         than the plain one, which is what an enthalpy balance over a bin asks for. Length
         ``n_nodes``; ``None`` (default) is a plain reading and adds exactly zero.
-    bin_end_ramp : ndarray of bool or None, optional
-        Rows whose reading weight carries the additional factor ``(t_end - t)`` [days] --
-        the weight becomes ``(t_end - t) exp(-w (t_end - t))``, which is what the first
-        time-moment of a bin's driving asks for (the axial flux moment reads through it).
-        The factor is affine across a cell exactly as the exponent is, so every cell mean
-        stays closed-form; a False row's factor is the constant 1 in the same expressions.
-        Length ``n_nodes``; ``None`` (default) is all plain.
+    bin_end_power : ndarray of int or None, optional
+        Rows whose reading weight carries the additional factor ``(t_end - t)**p`` [days**p]
+        -- the ``p``-th time moment of the bin's driving, which the axial moment budgets
+        read through. The factor is affine across a cell to the ``p``-th power, so every
+        cell mean stays closed-form. Length ``n_nodes``; ``None`` (default) is all 0.
+    bin_end_integrated : ndarray of bool or None, optional
+        Rows whose weight is the *running integral* of the kernel,
+        ``g_p(lag) = integral_0^lag u**p exp(-w u) du``, rather than the kernel itself --
+        what the time-integrated content of a bin reads through. Evaluated by its entire
+        series below the crossover of :data:`_SERIES_CROSSOVER` and its incomplete-gamma
+        closed form above, per cell. Length ``n_nodes``; ``None`` (default) is all False.
     with_target_terms : bool, optional
         Also build the target-independent factors of the affine relaxation bias (see
-        :class:`TargetTerms`); requires uniform ``tedges_days`` spacing, which the scan of
-        :func:`apply_segment_targets` assumes. The operator itself is identical either
+        :class:`TargetTerms`); requires uniform ``tedges_days`` spacing, which the scans of
+        :func:`apply_segment_targets` assume. The operator itself is identical either
         way. Default False.
+    n_target_modes : int, optional
+        Number of axial target modes the bias factors are built for; see
+        :func:`apply_segment_targets`. Default 1, the position-uniform target.
 
     Returns
     -------
@@ -643,14 +954,20 @@ def paths_transfer(
     arrival_mid = quarter_arrival.mean(axis=1)
     cout_bin = np.searchsorted(cout_tedges_days, arrival_mid, side="right") - 1
     bin_end = cout_tedges_days[np.clip(cout_bin, 0, n_cout - 1) + 1]
-    weight = np.zeros(n_nodes) if bin_end_rate is None else np.asarray(bin_end_rate, dtype=float)
+    # The reading weight of each row is a function of the lag to the output-bin end alone;
+    # the lag is affine across a cell exactly as the decay exponent is, so every weighted
+    # cell mean stays closed-form. The decay exponent is kept pure here -- the integrated
+    # weights carry their own exponential inside the kernel, so the weight machinery owns
+    # the split between the two.
+    weight_rate = np.zeros(n_nodes) if bin_end_rate is None else np.asarray(bin_end_rate, dtype=float)
+    weight_power = np.zeros(n_nodes, dtype=int) if bin_end_power is None else np.asarray(bin_end_power, dtype=int)
+    weight_integrated = (
+        np.zeros(n_nodes, dtype=bool) if bin_end_integrated is None else np.asarray(bin_end_integrated, dtype=bool)
+    )
+    weighted_rows = bin_end_rate is not None or bin_end_power is not None or bin_end_integrated is not None
     lag_to_bin_end = np.maximum(bin_end[:, None, :] - quarter_arrival, 0.0)
-    quarter_phi = decay_exponent[:, n_edge:].reshape(n_nodes, 2, -1) + weight[:, None, None] * lag_to_bin_end
-    # The reading ramp of each row: the lag to the bin end for ramp rows, the constant 1
-    # otherwise -- both affine across a cell, so one closed form serves every row.
-    ramp_rows = np.zeros(n_nodes, dtype=bool) if bin_end_ramp is None else np.asarray(bin_end_ramp, dtype=bool)
-    quarter_ramp = np.where(ramp_rows[:, None, None], lag_to_bin_end, 1.0)
-    ramp_lo, ramp_hi = _cell_edges(quarter_ramp)
+    lag_lo, lag_hi = _cell_edges(lag_to_bin_end)
+    quarter_phi = decay_exponent[:, n_edge:].reshape(n_nodes, 2, -1)
     cell_travel_time = (quarter_arrival - samples[:, n_edge:].reshape(n_nodes, 2, -1)).mean(axis=1)
     phi_lo, phi_hi = _cell_edges(quarter_phi)
     label = _interp_rows(arrival[:, :n_edge], tedges_days, node_cumulative)
@@ -724,8 +1041,14 @@ def paths_transfer(
     # Every cell contribution is a share of its output bin's label span: that division is
     # what turns the label-uniform integral into the flow-weighted bin average. Cells the
     # label does not reach have zero width; their NaN decay exponents and travel times are
-    # masked out rather than multiplied by it.
-    cell_survive = _ramp_surviving_fraction(phi_lo, phi_hi, ramp_lo, ramp_hi)
+    # masked out rather than multiplied by it. Plain operators keep the direct closed form;
+    # weighted rows go through the weight machinery, whose plain case reduces to the same
+    # expression.
+    if weighted_rows:
+        band_weights = _WeightedBasis(phi_lo, phi_hi, lag_lo, lag_hi, weight_rate, weight_power, weight_integrated)
+        cell_survive = band_weights.powers(np.zeros_like(phi_lo), np.zeros_like(phi_hi), 0)[0]
+    else:
+        cell_survive = _surviving_fraction(phi_lo, phi_hi)
     survived = np.where(carrying, label_width * cell_survive, 0.0)
     carried_out = np.where(carrying, label_width * cell_travel_time, 0.0)
     span = np.where(cout_label_width > 0.0, cout_label_width, 1.0)
@@ -766,19 +1089,17 @@ def paths_transfer(
         # midpoint reads them off; an arrival exactly on the record's final edge is
         # re-labelled to the last real bin by the clip, whose zero-length exit piece makes
         # that exact.
-        #
-        # Every slab is restricted to the rows still on a path at its depth, which the
-        # decreasing-depth row order makes a leading slice (see :class:`TargetTerms`). Slab
-        # ``d`` of mean_down is read as the entry piece at depth d and as the exit piece at
-        # depth d - 1, and the latter needs the more rows, so it is built on those.
+        n_modes = int(n_target_modes)
         n_cells = grid.shape[1] - 1
+        binomial = np.zeros((n_modes + 1, n_modes + 1))
+        binomial[:, 0] = 1.0
+        for row in range(1, n_modes + 1):
+            binomial[row, 1:] = binomial[row - 1, 1:] + binomial[row - 1, :-1]
+        factorial = np.cumprod(np.concatenate([[1.0], np.arange(1.0, n_modes + 40.0)]))
         # Rows in order of decreasing path depth, so "active at depth d" is a leading slice.
-        # Stage l of mean_down is read as depth l's entry piece and as depth l - 1's exit
-        # piece; the latter needs the more rows, so the stage is built on those.
         path_depth = active.sum(axis=1)
         order = np.argsort(-path_depth, kind="stable")
         stage_rows = [order[: int(np.count_nonzero(path_depth > max(stage - 1, 0)))] for stage in range(max_depth + 1)]
-        mean_down = [np.where(carrying[stage_rows[0]], cell_survive[stage_rows[0]], 0.0)]
         # A segment's entry face is the exit face of the one before it, so the input bin of
         # every face is read once per stage rather than once per depth per side. The row order
         # is what makes the sharing free: stage l + 1 keeps a prefix of stage l's rows, so the
@@ -796,67 +1117,178 @@ def paths_transfer(
             ).astype(np.int32)
             for stage in range(max_depth + 1)
         ]
-        mean_shift, bin_entry, bin_exit, gap, entry_shift, row_offset = [], [], [], [], [], []
+        # Chunk every segment's record at >= _CHUNK_VOLUMES pipe volumes of throughflow
+        # since the last chunk start. A traversal displaces exactly one volume, so a
+        # parcel's interior bins span at most one chunk boundary, and every position below
+        # is measured within a chunk -- bounded however long the record grows.
+        n_seg_all = len(segment_volume)
+        dt0 = float(dt_days[0])
+        theta = segment_flow * dt0 / segment_volume[:, None]
+        big_theta = np.concatenate([np.zeros((n_seg_all, 1)), np.cumsum(theta, axis=1)], axis=1)
+        chunk_of_bin = np.zeros((n_seg_all, n_cin), dtype=np.int32)
+        for e in range(n_seg_all):
+            start = 0
+            row = big_theta[e]
+            for j in range(1, n_cin):
+                if row[j] - row[start] >= _CHUNK_VOLUMES:
+                    start = j
+                chunk_of_bin[e, j] = start
+        chunk_edge = np.concatenate([np.zeros((n_seg_all, 1), dtype=np.int32), chunk_of_bin], axis=1)
+        theta_in = big_theta[:, :-1] - np.take_along_axis(big_theta, chunk_of_bin, axis=1)
+        theta_in_edge = big_theta - np.take_along_axis(big_theta, chunk_edge.astype(np.intp), axis=1)
+        rho_into = np.exp(-segment_decay[:, None] * dt0 * (np.arange(n_cin + 1)[None, :] - chunk_edge))
+        exit_read, entry_read, position_exit, position_mid, position_entry = [], [], [], [], []
+        bin_entry, bin_exit, bin_mid, segment_of = [], [], [], []
         for depth in range(max_depth):
             rows = stage_rows[depth + 1]
             here = carrying[rows]
-            phi_down = quarter_phi[rows] - stage_phi[depth + 1].reshape(n_nodes, 2, n_cells)[rows]
-            mean_down.append(
-                np.where(here, _ramp_surviving_fraction(*_cell_edges(phi_down), ramp_lo[rows], ramp_hi[rows]), 0.0)
-            )
-            exits = stage_arrival[depth + 1].reshape(n_nodes, 2, n_cells)[rows]
+            segs = paths_idx[rows, depth]
+            rate_row = segment_decay[segs][:, None]
             entry_bin, exit_bin = faces[depth][: rows.size], faces[depth + 1][: rows.size]
-            # The interior-edge factor, shifted by the exit bin's left edge so the exponent
-            # stays non-negative (up to the operator's roundtrip rounding) however long the
-            # record is.
-            rate = segment_decay[paths_idx[rows, depth], None, None]
-            shift = rate * (exits - tedges_days[exit_bin][:, None, :]) + phi_down
-            shift_lo, shift_hi = _cell_edges(shift)
-            mean_shift.append(
-                np.where(here, _ramp_surviving_fraction(shift_lo, shift_hi, ramp_lo[rows], ramp_hi[rows]), 0.0)
-            )
-            gap.append(np.exp(-rate[:, 0] * float(dt_days[0]) * (exit_bin - entry_bin)))
-            bin_entry.append(entry_bin)
-            bin_exit.append(exit_bin)
-            # The entry position of a cell's parcels, as the fraction of the segment already
-            # displaced at their entry time. The entry time stays inside one flow bin (the
-            # grid seeds tedges at every node), where the cumulative volume is linear, so the
-            # fraction is affine across the cell and pairs with the interior-edge factor in
-            # the closed ramp mean.
+            phi_down = quarter_phi[rows] - stage_phi[depth + 1].reshape(n_nodes, 2, n_cells)[rows]
+            exits = stage_arrival[depth + 1].reshape(n_nodes, 2, n_cells)[rows]
             entries = stage_arrival[depth].reshape(n_nodes, 2, n_cells)[rows]
-            frac = (
-                _interp_rows(
-                    entries.reshape(rows.size, -1), tedges_days, segment_cumulative[paths_idx[rows, depth]]
-                ).reshape(rows.size, 2, n_cells)
-                / segment_volume[paths_idx[rows, depth], None, None]
-            )
-            entry_shift.append(
-                np.where(
-                    here,
-                    _ramp_surviving_fraction(shift_lo, shift_hi, ramp_lo[rows], ramp_hi[rows], *_cell_edges(frac)),
+            down_lo, down_hi = _cell_edges(phi_down)
+            # The two anchor exponents of one traversal: the exit-side lag from the exit
+            # bin's left edge, and the entry-side lag to the entry bin's right edge. Every
+            # parcel-dependent quantity of the bias is proportional to one of them --
+            # positions through the local flow over ``k V``, the partial-piece kernels
+            # directly -- so both are computed from within-bin time differences and no
+            # power of a record-scale cumulative volume ever forms.
+            s_lo, s_hi = _cell_edges(rate_row[:, None, :] * (exits - tedges_days[exit_bin][:, None, :]))
+            sp_lo, sp_hi = _cell_edges(rate_row[:, None, :] * (tedges_days[entry_bin + 1][:, None, :] - entries))
+            with np.errstate(divide="ignore", invalid="ignore"):
+                invk_exit = np.where(
+                    rate_row > 0.0,
+                    segment_flow[segs[:, None], exit_bin] / (rate_row * segment_volume[segs][:, None]),
                     0.0,
                 )
+                invk_entry = np.where(
+                    rate_row > 0.0,
+                    segment_flow[segs[:, None], entry_bin] / (rate_row * segment_volume[segs][:, None]),
+                    0.0,
+                )
+            # The interior-piece exponent continued to the entry bin's right edge; for a
+            # traversal inside one bin it runs one bin backwards, which is the exact
+            # over-subtraction the two partial pieces over-count. Fold it into the stored
+            # exponent so the largest scale any slab holds is ``exp(k dt)`` of one bin.
+            span_bins = rate_row * float(dt_days[0]) * (exit_bin - entry_bin - 1)
+            spec = (weight_rate[rows], weight_power[rows], weight_integrated[rows])
+            # The partial-piece kernels carry their own exponential inside the lambda
+            # integral, so their outer exponent is the downstream decay alone (plus, on the
+            # entry side, the decay from the entry bin's right edge to the delivery); the
+            # interior position slabs additionally decay through the exit-side lag itself.
+            side_exit = _WeightedBasis(down_lo, down_hi, lag_lo[rows], lag_hi[rows], *spec)
+            side_entry = _WeightedBasis(
+                s_lo + span_bins + down_lo, s_hi + span_bins + down_hi, lag_lo[rows], lag_hi[rows], *spec
             )
-            row_offset.append(paths_idx[rows, depth] * n_cin)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            tilt_scale = np.where(
-                segment_decay[:, None] > 0.0,
-                segment_flow / (segment_decay[:, None] * segment_volume[:, None]),
-                0.0,
-            )
+            # Exit partial: gamma-kernel means per power of the local ``1/kappa``, series
+            # where the exit-side lag is small and the incomplete-gamma form where it is
+            # not; both branches are combinations of the same power tables.
+            s_mid = 0.5 * (s_lo + s_hi)
+            with np.errstate(invalid="ignore"):
+                series_cells = s_mid < _SERIES_CROSSOVER
+            n_terms = _series_length(min(_SERIES_CROSSOVER, float(np.nanmax(s_mid, initial=0.0))))
+            t_exit = side_exit.powers(s_lo, s_hi, n_modes + n_terms)
+            t_exit_shift = side_exit.powers(s_lo, s_hi, n_modes - 1, extra_lo=s_lo, extra_hi=s_hi)
+            gamma_mean = np.empty((n_modes, rows.size, n_cells))
+            for low in range(n_modes):
+                series_val = np.zeros((rows.size, n_cells))
+                sign = 1.0
+                for j in range(n_terms):
+                    series_val += sign / (factorial[j] * (low + j + 1)) * t_exit[low + 1 + j]
+                    sign = -sign
+                closed_val = t_exit[0].copy()
+                for r in range(low + 1):
+                    closed_val -= t_exit_shift[r] / factorial[r]
+                gamma_mean[low] = np.where(series_cells, series_val, factorial[low] * closed_val)
+            # Entry partial: the kernel ``J_i(s')`` by its entire series where the
+            # entry-side lag is small -- each term bounded, because ``invk s'`` is the
+            # entry-edge fraction -- and by its ``i! (-1)**(i+1) (e**-s' - sum)`` closed
+            # form where it is not, where the local ``invk`` cannot amplify the
+            # cancellation.
+            sp_mid = 0.5 * (sp_lo + sp_hi)
+            with np.errstate(invalid="ignore"):
+                series_entry = sp_mid < _SERIES_CROSSOVER
+            n_terms_entry = _series_length(min(_SERIES_CROSSOVER, float(np.nanmax(sp_mid, initial=0.0))))
+            t_entry = side_entry.powers(sp_lo, sp_hi, n_modes + n_terms_entry)
+            t_entry_shift = side_entry.powers(sp_lo, sp_hi, 0, extra_lo=sp_lo, extra_hi=sp_hi)[0]
+            # The exit chunk's frame data per cell: the frame offset of the parcel's exit
+            # fraction, the same offset carried across the one chunk boundary a traversal
+            # can span, and the entry-side frame offset closing the scans' cutoff.
+            frame_exit = 1.0 - theta_in_edge[segs[:, None], exit_bin]
+            chunk_start = chunk_edge[segs[:, None], exit_bin]
+            crossing = entry_bin < chunk_start
+            frame_mid = frame_exit - theta_in_edge[segs[:, None], chunk_start]
+            decay_mid = np.where(crossing, rho_into[segs[:, None], exit_bin], 0.0)
+            frame_entry = -theta_in_edge[segs[:, None], entry_bin + 1]
+            # A traversal inside one bin has no interior bins: its scan terms must cancel
+            # exactly, which the shared chunk frame provides -- except when the exit bin
+            # itself starts a chunk, where the exit gather and the entry cutoff live in
+            # different frames. There the cutoff alone books the single over-counted bin,
+            # and the exit-side scan weights are zeroed.
+            split_frame = (exit_bin == entry_bin) & (chunk_edge[segs[:, None], exit_bin + 1] == exit_bin)
+            slab_exit = np.zeros((n_modes, rows.size, n_cells))
+            slab_entry = np.zeros((n_modes, rows.size, n_cells))
+            slab_pos_exit = np.zeros((n_modes, rows.size, n_cells))
+            slab_pos_mid = np.zeros((n_modes, rows.size, n_cells))
+            slab_pos_entry = np.zeros((n_modes, rows.size, n_cells))
+            for i in range(n_modes):
+                for low in range(i + 1):
+                    slab_exit[i] += binomial[i, low] * (-invk_exit) ** low * gamma_mean[low]
+                    # alpha = frame - invk s, so the position means read the power tables.
+                    slab_pos_exit[i] += (
+                        binomial[i, low] * frame_exit ** (i - low) * (-invk_exit) ** low * t_exit_shift[low]
+                    )
+                    slab_pos_mid[i] += (
+                        binomial[i, low] * frame_mid ** (i - low) * (-invk_exit) ** low * t_exit_shift[low]
+                    )
+                    slab_pos_entry[i] += binomial[i, low] * frame_entry ** (i - low) * invk_entry**low * t_entry[low]
+                series_val = np.zeros((rows.size, n_cells))
+                sign = 1.0
+                for j in range(n_terms_entry):
+                    series_val += sign / factorial[i + 1 + j] * t_entry[i + 1 + j]
+                    sign = -sign
+                closed_val = t_entry_shift.copy()
+                for m in range(i + 1):
+                    closed_val -= (-1.0) ** m / factorial[m] * t_entry[m]
+                closed_val *= (-1.0) ** (i + 1)
+                slab_entry[i] = invk_entry**i * factorial[i] * np.where(series_entry, series_val, closed_val)
+                slab_pos_mid[i] *= decay_mid
+            exit_read.append(np.where(here, slab_exit, 0.0))
+            entry_read.append(np.where(here, slab_entry, 0.0))
+            position_exit.append(np.where(here & ~split_frame, slab_pos_exit, 0.0))
+            position_mid.append(np.where(here & ~split_frame, slab_pos_mid, 0.0))
+            position_entry.append(np.where(here, slab_pos_entry, 0.0))
+            bin_entry.append(entry_bin)
+            bin_exit.append(exit_bin)
+            bin_mid.append(chunk_start)
+            segment_of.append(segs)
+        kdt = segment_decay * float(dt_days[0])
+        anchored = _e_table(n_modes - 1, kdt)
+        etilde = np.zeros_like(anchored)
+        for r in range(n_modes):
+            for low in range(r + 1):
+                etilde[r] += binomial[r, low] * (-1.0) ** low * anchored[low]
         target_terms = TargetTerms(
-            mean_down=mean_down,
-            mean_shift=mean_shift,
+            exit_read=exit_read,
+            entry_read=entry_read,
+            position_exit=position_exit,
+            position_mid=position_mid,
+            position_entry=position_entry,
             bin_entry=bin_entry,
             bin_exit=bin_exit,
-            gap=gap,
-            entry_shift=entry_shift,
-            edge_fraction=segment_cumulative / segment_volume[:, None],
-            tilt_scale=tilt_scale,
-            row_offset=row_offset,
+            bin_mid=bin_mid,
+            segment_of=segment_of,
             cell_weight=(label_width / span_all.ravel()[flat_cout].reshape(n_nodes, n_cells))[order],
             flat_cout=flat_cout.reshape(n_nodes, n_cells)[order].ravel(),
             segment_rate=segment_decay,
+            theta=theta,
+            theta_in=theta_in,
+            chunk_edge=chunk_edge,
+            rho_into=rho_into,
+            etilde=etilde,
+            n_modes=n_modes,
             dt_days=float(dt_days[0]),
         )
     return NetworkTransfer(
@@ -864,49 +1296,67 @@ def paths_transfer(
     )
 
 
+def _legendre_monomial(n_modes: int) -> npt.NDArray[np.floating]:
+    """Monomial coefficients of the shifted Legendre polynomials on the unit interval.
+
+    Parameters
+    ----------
+    n_modes : int
+        Number of modes.
+
+    Returns
+    -------
+    ndarray
+        ``lam`` of shape ``(n_modes, n_modes)`` with
+        ``P_m(2 xi - 1) = sum_i lam[m, i] xi**i``.
+    """
+    lam = np.zeros((n_modes, n_modes))
+    lam[0, 0] = 1.0
+    if n_modes > 1:
+        lam[1, :2] = [-1.0, 2.0]
+    for m in range(2, n_modes):
+        # Bonnet's recursion on the shifted argument: (m) P_m = (2m-1)(2 xi - 1) P_{m-1} - (m-1) P_{m-2}.
+        lam[m, 1:] = 2.0 * (2 * m - 1) / m * lam[m - 1, :-1]
+        lam[m] -= (2 * m - 1) / m * lam[m - 1] + (m - 1) / m * lam[m - 2]
+    return lam
+
+
 def apply_segment_targets(
     transfer: NetworkTransfer,
-    segment_target: npt.NDArray[np.floating],
-    *,
-    segment_tilt: npt.NDArray[np.floating] | None = None,
+    segment_modes: npt.NDArray[np.floating],
 ) -> npt.NDArray[np.floating]:
     """Apply concrete per-segment relaxation targets to a prebuilt operator's bias factors.
 
     The affine model is ``c_node = W @ c_source + b``; this computes ``b`` for one target
-    set. The only sequential work is one exponentially forgetting scan per segment,
-    ``S[j] = S[j-1] * exp(-k dt) + (Tb[j] - Tb[j-1])``, whose partial sums turn the
-    interior-edge terms of every cell into two gathers; everything else is elementwise on
-    the stored cell factors and one scatter-add. All exponents are non-positive, so no
-    input scale can overflow. A segment whose target never moves has no interior-edge sum at
-    all, so its scan is skipped -- which is most of them when the caller carries inert copies
-    of its segments.
+    set. The target of segment ``e`` at volume fraction ``xi`` through it is
+    ``sum_m segment_modes[m, e] * P_m(2 xi - 1)`` with ``P_m`` the Legendre polynomials --
+    mode 0 is the position-uniform target, mode 1 twice the old half-spread tilt, and the
+    modes are what the axial flux moments of :mod:`pipetransport.heat` relax toward.
 
-    With ``segment_tilt`` the target of segment ``e`` gains a component linear in position,
-    ``tilt_e(t) * (x/L - 1/2)`` at volume fraction ``x/L`` -- the first axial mode of a
-    relaxation field that varies along the pipe. A parcel reads the tilt through its own
-    traversal, and integrating by parts exactly as for the uniform target leaves four
-    closed-form pieces: the two boundary readings with halved coefficients (the parcel
-    enters at ``-1/2`` and leaves at ``+1/2``), the interior-edge sum with each jump
-    weighted by the edge's own :attr:`~TargetTerms.edge_fraction`, the entry-position
-    correction carried by :attr:`~TargetTerms.entry_shift`, and the traversal term
-    ``(1/V) int tilt q exp(-k (b - t)) dt``, which is the uniform-target machinery applied
-    to ``tilt * tilt_scale``. A zero-rate segment's tilt is zeroed first -- a pipe that
-    does not exchange has nothing to relax toward -- which is also what makes the
-    ``k -> 0`` limit of the ``1/k`` in :attr:`~TargetTerms.tilt_scale` exact with no
-    separate code path.
+    A parcel's reading of that field splits at the input-bin edges of each traversal into
+    an entry piece, full interior bins and an exit piece. The partial pieces are stored
+    per-cell closed forms times the mode series read at the entry and exit bins. The
+    interior sum runs over **chunk-anchored scans**: each segment's record is chunked at
+    1.5 pipe volumes of throughflow (see :class:`TargetTerms`), a parcel's volume
+    fraction at an interior edge is its per-cell frame offset plus the edge's bounded
+    in-chunk position, and the scans ``sum_j G_s[j] theta_in[j]**u rho**(J-1-j)`` --
+    plain forgetting scans, cut at each chunk start -- turn every cell's interior sum
+    into gathers at its exit edge, its exit chunk's start and its entry edge, weighted by
+    powers of the stored frame offsets. Positions never leave their chunk's frame before
+    they are raised to powers, which is what holds the high modes at round-off accuracy
+    for every coupling strength and record length. All the sequential work is
+    ``n_modes (n_modes + 1) / 2`` forgetting scans per segment whose modes move.
 
     Parameters
     ----------
     transfer : NetworkTransfer
         Operator built by :func:`paths_transfer` with ``with_target_terms=True``.
-    segment_target : ndarray
-        Relaxation target of every segment [same unit as the source signal], piecewise
-        constant on the input bins, shape ``(n_seg, n_cin)``.
-    segment_tilt : ndarray or None, optional
-        Linear-in-position component of the target, same shape and unit: the target at
-        volume fraction ``x/L`` through segment ``e`` is
-        ``segment_target[e] + segment_tilt[e] * (x/L - 1/2)``. ``None`` (default) is the
-        position-uniform target, bit-identical to not passing the argument.
+    segment_modes : ndarray
+        Axial mode coefficients of every segment's target [unit of the source signal],
+        piecewise constant on the input bins, shape ``(n_modes, n_seg, n_cin)``; a 2-D
+        array is the position-uniform target alone. Up to the operator's
+        :attr:`~TargetTerms.n_modes` leading modes are read; missing trailing modes are
+        zero.
 
     Returns
     -------
@@ -918,78 +1368,86 @@ def apply_segment_targets(
     Raises
     ------
     ValueError
-        If the operator was built without target terms.
+        If the operator was built without target terms, or with fewer modes than passed.
     """
     terms = transfer.target_terms
     if terms is None:
         msg = "operator was built without target terms; pass with_target_terms=True to paths_transfer"
         raise ValueError(msg)
-    target = np.asarray(segment_target, dtype=float)
-    n_seg, n_cin = target.shape
+    modes = np.asarray(segment_modes, dtype=float)
+    if modes.ndim == 2:  # noqa: PLR2004 -- a 2-D array is the position-uniform target
+        modes = modes[None]
+    if modes.shape[0] > terms.n_modes:
+        msg = f"operator was built for {terms.n_modes} target mode(s), got {modes.shape[0]}; raise n_target_modes"
+        raise ValueError(msg)
+    n_modes = terms.n_modes
+    n_seg, n_cin = modes.shape[1:]
     n_nodes, n_cout = transfer.valid_out.shape
-    dt = terms.dt_days
 
-    # Forgetting scan over the interior input edges, one fused C pass per segment.
-    steps = np.diff(target, axis=1)
-    rho = np.exp(-terms.segment_rate * dt)
-    scan = np.zeros((n_seg, n_cin))
-    for e in np.flatnonzero(steps.any(axis=1)):
-        scan[e, 1:] = lfilter([1.0], [1.0, -rho[e]], steps[e])
-
-    tilt = None
-    if segment_tilt is not None:
-        tilt = np.where(terms.segment_rate[:, None] > 0.0, np.asarray(segment_tilt, dtype=float), 0.0)
-        traversal = tilt * terms.tilt_scale
-        steps_tilt, steps_traversal = np.diff(tilt, axis=1), np.diff(traversal, axis=1)
-        # Each interior jump of the tilt is read at the crossing edge's own position, so the
-        # edge-weighted series scans jumps times the edge fraction; the plain series carries
-        # the entry-position correction, whose parcel-dependent factor lives in entry_shift.
-        weighted = steps_tilt * (terms.edge_fraction[:, 1:-1] - 0.5)
-        scan_tilt, scan_edge, scan_traversal = np.zeros((3, n_seg, n_cin))
-        for e in np.flatnonzero(steps_tilt.any(axis=1) | steps_traversal.any(axis=1)):
-            scan_tilt[e, 1:] = lfilter([1.0], [1.0, -rho[e]], steps_tilt[e])
-            scan_edge[e, 1:] = lfilter([1.0], [1.0, -rho[e]], weighted[e])
-            scan_traversal[e, 1:] = lfilter([1.0], [1.0, -rho[e]], steps_traversal[e])
-        flat_tilt, flat_traversal = tilt.ravel(), traversal.ravel()
-        flat_scan_tilt, flat_scan_edge, flat_scan_traversal = (
-            scan_tilt.ravel(),
-            scan_edge.ravel(),
-            scan_traversal.ravel(),
-        )
-
-    # Per depth: entry piece, exit piece and the scanned interior-edge sum of each cell, over
-    # the rows still on a path at that depth -- the leading ``n_rows`` of the stored order,
-    # so every slab is a slice and no row is gathered. The rows the slice drops contribute an
-    # exact zero: their entry and exit stages are the same floats, so the two target readings
-    # cancel and the interior sum spans no bins.
-    #
-    # The gathers read the raveled target and scan through a flat index, the segment's row
-    # offset plus the stored bin. That is the same element ``take_along_axis`` would fetch,
-    # but it neither materializes the broadcast index grid that call builds internally nor
-    # copies ``target[seg]`` and ``scan[seg]`` first -- together about two thirds of the work
-    # of this loop, which is in turn most of the module's runtime.
-    flat_target, flat_scan = target.ravel(), scan.ravel()
-    cell_bias = np.zeros_like(terms.cell_weight)
-    for depth, offset in enumerate(terms.row_offset):
-        n_rows = offset.size
-        at_entry = terms.bin_entry[depth] + offset[:, None]
-        at_exit = terms.bin_exit[depth] + offset[:, None]
-        interior = flat_scan[at_exit] - flat_scan[at_entry] * terms.gap[depth]
-        cell_bias[:n_rows] += (
-            flat_target[at_exit] * terms.mean_down[depth + 1]
-            - flat_target[at_entry] * terms.mean_down[depth][:n_rows]
-            - terms.mean_shift[depth] * interior
-        )
-        if tilt is not None:
-            interior_tilt = flat_scan_tilt[at_exit] - flat_scan_tilt[at_entry] * terms.gap[depth]
-            interior_edge = flat_scan_edge[at_exit] - flat_scan_edge[at_entry] * terms.gap[depth]
-            interior_trav = flat_scan_traversal[at_exit] - flat_scan_traversal[at_entry] * terms.gap[depth]
-            cell_bias[:n_rows] += (
-                (0.5 * flat_tilt[at_exit] - flat_traversal[at_exit]) * terms.mean_down[depth + 1]
-                + (0.5 * flat_tilt[at_entry] + flat_traversal[at_entry]) * terms.mean_down[depth][:n_rows]
-                + terms.entry_shift[depth] * interior_tilt
-                - terms.mean_shift[depth] * (interior_edge - interior_trav)
+    # The mode series in monomials of the volume fraction, and the per-bin interior
+    # integrals G_s: what one fully traversed bin contributes per power of the fraction a
+    # parcel entered it at. Both carry every mode's coefficient, so they are built once
+    # per segment however many rows read them.
+    lam = _legendre_monomial(n_modes)
+    monomial = np.einsum("mej,mi->iej", modes, lam[: modes.shape[0]])
+    kdt = terms.segment_rate * terms.dt_days
+    rho = np.exp(-kdt)
+    binomial = np.zeros((n_modes, n_modes))
+    binomial[:, 0] = 1.0
+    for row in range(1, n_modes):
+        binomial[row, 1:] = binomial[row - 1, 1:] + binomial[row - 1, :-1]
+    interior_bin = np.zeros((n_modes, n_seg, n_cin))
+    for s in range(n_modes):
+        for i in range(s, n_modes):
+            interior_bin[s] += (
+                binomial[i, s] * monomial[i] * terms.theta ** (i - s) * (kdt * terms.etilde[i - s])[:, None]
             )
+
+    # Chunk-anchored scans, edge-indexed: scans[s][u][e, J] sums the bins of edge J's own
+    # chunk, ``sum_j G_s[j] theta_in[j]**u rho**(J-1-j)`` -- a plain forgetting scan of the
+    # bounded in-chunk positions, minus the same scan's value at the chunk start carried
+    # over the chunk. Contributions from before a parcel's own reach are removed, never
+    # cancelled at scale, which is what holds the high modes at round-off accuracy. A
+    # segment whose modes are identically zero scans to zero, so it is skipped.
+    moving = np.flatnonzero(np.any(monomial != 0.0, axis=(0, 2)) & (kdt > 0.0))
+    edge_index = np.arange(n_cin + 1)[None, :]
+    scans: list[list[npt.NDArray[np.floating]]] = [[] for _ in range(n_modes)]
+    for s in range(n_modes):
+        for u in range(s + 1):
+            forcing = np.zeros((n_seg, n_cin + 1))
+            forcing[:, 1:] = interior_bin[s] * terms.theta_in**u
+            scan = np.zeros_like(forcing)
+            for e in moving:
+                scan[e] = lfilter([1.0], [1.0, -rho[e]], forcing[e])
+            at_start = np.take_along_axis(scan, terms.chunk_edge.astype(np.intp), axis=1)
+            scans[s].append(scan - np.where(edge_index > terms.chunk_edge, terms.rho_into, 0.0) * at_start)
+
+    # Per depth: the mode series read at the entry and exit bins against the stored partial
+    # pieces, and the scans gathered with per-cell position-power weights. The rows are the
+    # leading ``n_rows`` of the stored order, so every slab is a slice and no row is
+    # gathered; flat gathers avoid materializing take_along_axis's index grids.
+    flat_monomial = monomial.reshape(n_modes, -1)
+    cell_bias = np.zeros_like(terms.cell_weight)
+    for depth, segs in enumerate(terms.segment_of):
+        n_rows = segs.size
+        at_exit = segs[:, None] * n_cin + terms.bin_exit[depth]
+        at_entry = segs[:, None] * n_cin + terms.bin_entry[depth]
+        scan_exit = segs[:, None] * (n_cin + 1) + terms.bin_exit[depth]
+        scan_mid = segs[:, None] * (n_cin + 1) + terms.bin_mid[depth]
+        scan_entry = segs[:, None] * (n_cin + 1) + terms.bin_entry[depth] + 1
+        acc = np.zeros(at_exit.shape)
+        for i in range(n_modes):
+            acc += flat_monomial[i][at_exit] * terms.exit_read[depth][i]
+            acc += flat_monomial[i][at_entry] * terms.entry_read[depth][i]
+        for s in range(n_modes):
+            for u in range(s + 1):
+                flat_scan = scans[s][u].ravel()
+                acc += binomial[s, u] * (
+                    terms.position_exit[depth][s - u] * flat_scan[scan_exit]
+                    + terms.position_mid[depth][s - u] * flat_scan[scan_mid]
+                    - terms.position_entry[depth][s - u] * flat_scan[scan_entry]
+                )
+        cell_bias[:n_rows] += acc
 
     out_slots = n_nodes * (n_cout + 2)
     bias = np.bincount(terms.flat_cout, weights=(cell_bias * terms.cell_weight).ravel(), minlength=out_slots).reshape(

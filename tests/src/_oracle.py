@@ -8,6 +8,13 @@ average with :func:`scipy.integrate.quad`. It shares no code path with the packa
 network topology, so agreement between the two is evidence about the physics rather than about
 one implementation.
 
+Wherever an integrand is smooth on a piece -- a parcel's relaxation toward a polynomial
+target inside one flow bin, an output bin's label integral between kinks, a reading-weight
+kernel -- the oracle integrates it with fixed-order Gauss-Legendre quadrature whose order is
+the ``gauss_order`` of the path. The integrands are analytic on those pieces, so the error
+falls factorially with the order: the default 24 sits at the float64 floor for every case the
+tests reach, and raising the order is the knob that checks that claim rather than trusting it.
+
 It is slow -- one root solve per pipe per quadrature point -- so tests keep the records short.
 Flows must be strictly positive: the root solves need a strictly monotone cumulative volume,
 and the package's plateau handling is checked separately.
@@ -18,6 +25,7 @@ from __future__ import annotations
 import itertools
 
 import numpy as np
+from numpy.polynomial import legendre
 from scipy.integrate import quad
 from scipy.optimize import brentq
 
@@ -65,10 +73,17 @@ class OraclePath:
     segment_target : ndarray or None, optional
         Relaxation target of each path segment, piecewise constant on the input bins,
         shape ``(m, n_bins)``. Required by :meth:`deliver` and :meth:`tout`.
-    segment_target_slope : ndarray or None, optional
-        Linear-in-position component of the target, same shape: the target at volume
-        fraction ``x/L`` through a segment is ``target[j] + slope[j] * (x/L - 1/2)``.
-        ``None`` (default) is the position-uniform target.
+    segment_target_modes : ndarray or None, optional
+        Higher axial modes of the target, shape ``(n_extra, m, n_bins)``: the target at
+        volume fraction ``xi = x/L`` through a segment is
+        ``target[j] + sum_k modes[k - 1][j] * P_k(2 xi - 1)`` with ``P_k`` the Legendre
+        polynomial of degree ``k``. ``None`` (default) is the position-uniform target.
+    gauss_order : int, optional
+        Order of every fixed Gauss-Legendre quadrature in this path -- the in-piece
+        relaxation integral of :meth:`deliver`, the label integrals of :meth:`tout`, and
+        the integrated reading-weight kernel. The integrands are analytic per piece, so
+        the default 24 reaches the float64 floor; raise it to verify that instead of
+        assuming it. Default 24.
     """
 
     def __init__(
@@ -80,7 +95,8 @@ class OraclePath:
         segment_decay,
         node_flow,
         segment_target=None,
-        segment_target_slope=None,
+        segment_target_modes=None,
+        gauss_order=24,
     ):
         self.tedges = np.asarray(tedges_days, dtype=float)
         self.volume = np.asarray(segment_volume, dtype=float)
@@ -88,7 +104,10 @@ class OraclePath:
         self.pipes = [_Displacement(self.tedges, q) for q in np.atleast_2d(segment_flow)][: len(self.volume)]
         self.node = _Displacement(self.tedges, node_flow)
         self.target = None if segment_target is None else np.atleast_2d(segment_target)[: len(self.volume)]
-        self.slope = None if segment_target_slope is None else np.atleast_2d(segment_target_slope)[: len(self.volume)]
+        self.modes = None
+        if segment_target_modes is not None:
+            self.modes = np.asarray(segment_target_modes, dtype=float)[:, : len(self.volume)]
+        self.gauss = np.polynomial.legendre.leggauss(int(gauss_order))
 
     def _cross(self, pipe, volume, known, *, forward):
         """Solve the displacement condition of one pipe for the unknown face time.
@@ -174,7 +193,36 @@ class OraclePath:
         """
         return float(brentq(lambda t: self.node(t) - label, self.tedges[0], self.tedges[-1], xtol=1e-14))
 
-    def cout(self, *, cin, cout_tedges_days, bin_end_rate=0.0, bin_end_ramp=False):
+    def _weight(self, lag, *, rate, power, integrated):
+        """Evaluate the reading weight at a lag before the output-bin end; scalar in, scalar out.
+
+        Parameters
+        ----------
+        lag : float
+            ``t_end - t`` [days], non-negative.
+        rate : float
+            Rate ``w`` [1/day] of the exponential factor.
+        power : int
+            Power ``p`` of the polynomial factor.
+        integrated : bool
+            False reads ``lag**p * exp(-rate * lag)``; True reads its running integral
+            ``g_p(lag) = int_0^lag u**p exp(-rate u) du``, evaluated with the path's
+            Gauss-Legendre rule -- the kernel the enthalpy chain's time-integrated
+            content readings use.
+
+        Returns
+        -------
+        float
+            The weight.
+        """
+        if not integrated:
+            return lag**power * np.exp(-rate * lag)
+        nodes, weights = self.gauss
+        half = 0.5 * lag
+        at = half + half * nodes
+        return float(half * np.sum(weights * at**power * np.exp(-rate * at)))
+
+    def cout(self, *, cin, cout_tedges_days, bin_end_rate=0.0, bin_end_power=0, bin_end_integrated=False):
         """Bin-averaged delivered quality on the output grid.
 
         Splits every output bin's label interval at the labels where ``cin`` steps, then
@@ -190,9 +238,12 @@ class OraclePath:
             Rate ``w`` [1/day] of an extra reading weight ``exp(-w (t_end - t))``, with ``t``
             the parcel's delivery time and ``t_end`` the right edge of its output bin. Default
             0, the plain bin average.
-        bin_end_ramp : bool, optional
-            Multiply the reading weight by the additional factor ``t_end - t`` [days] -- the
-            first time-moment reading. Default False.
+        bin_end_power : int, optional
+            Power ``p`` of an additional polynomial factor ``(t_end - t)**p`` [days**p] on
+            the reading weight -- the p-th time-moment reading. Default 0.
+        bin_end_integrated : bool, optional
+            Replace the weight by its running integral ``int_0^lag u**p exp(-w u) du``.
+            Default False.
 
         Returns
         -------
@@ -224,8 +275,8 @@ class OraclePath:
 
             def integrand(label, end=bin_end):
                 lag = end - self._time_at_label(label)
-                value = np.exp(-exponent(label) - bin_end_rate * lag)
-                return value * lag if bin_end_ramp else value
+                weight = self._weight(lag, rate=bin_end_rate, power=bin_end_power, integrated=bin_end_integrated)
+                return np.exp(-exponent(label)) * weight
 
             for a, b in itertools.pairwise(bounds):
                 source_time = self.departure(self._time_at_label(0.5 * (a + b)))
@@ -239,13 +290,15 @@ class OraclePath:
         """Deliver one parcel with per-segment relaxation toward the piecewise-constant targets.
 
         Walks the path sequentially: within each segment the parcel relaxes toward that
-        segment's target, exactly, one target bin at a time -- deliberately the naive
-        piece-by-piece algorithm, sharing no arithmetic with the package's Abel-summed form.
+        segment's target, one target bin at a time -- deliberately the naive piece-by-piece
+        algorithm, sharing no arithmetic with the package's scanned closed forms.
 
-        With a target slope the target seen by the parcel moves linearly in time inside a
-        piece (its position advances at the bin's constant flow), so the exact update is the
-        ramp particular solution plus the decaying transient; at zero slope it is the
-        constant-target update, same expression.
+        Within a piece the flow is constant, so the parcel's volume fraction is affine in
+        time and the target it sees is a polynomial in time of the modes' degree. The exact
+        update over the piece is the decaying transient plus the relaxation integral
+        ``int k Tb(t) exp(-k (end - t)) dt``, whose integrand is analytic; it is evaluated
+        with the path's fixed Gauss-Legendre rule rather than a closed form, which is what
+        keeps this reference numerically independent of the package's expressions.
 
         Parameters
         ----------
@@ -264,6 +317,7 @@ class OraclePath:
         if self.target is None:
             msg = "deliver() needs per-segment relaxation targets; pass segment_target to OraclePath"
             raise ValueError(msg)
+        nodes, weights = self.gauss
         time, temperature = departure, t_source
         for e, (pipe, volume, decay, target) in enumerate(
             zip(self.pipes, self.volume, self.decay, self.target, strict=True)
@@ -278,13 +332,16 @@ class OraclePath:
                 if step_end <= time:
                     break
                 span = step_end - time
-                tb, ramp = target[j], 0.0
-                if self.slope is not None:
-                    tb += self.slope[e][j] * ((pipe(time) - entry_volume) / volume - 0.5)
-                    ramp = self.slope[e][j] * pipe.rate[j] / volume
                 if decay > 0.0:
-                    settled = tb - ramp / decay  # the ramp particular solution at the current time
-                    temperature = settled + ramp * span + (temperature - settled) * np.exp(-decay * span)
+                    middle, half = 0.5 * (time + step_end), 0.5 * span
+                    at = middle + half * nodes
+                    tb = np.full(len(at), target[j])
+                    if self.modes is not None:
+                        fraction = (pipe(middle) + pipe.rate[j] * half * nodes - entry_volume) / volume
+                        coefficients = np.concatenate([[0.0], self.modes[:, e, j]])
+                        tb += legendre.legval(2.0 * fraction - 1.0, coefficients)
+                    relax = half * np.sum(weights * decay * tb * np.exp(-decay * (step_end - at)))
+                    temperature = temperature * np.exp(-decay * span) + relax
                 time = step_end
             time = exit_time
         return time, temperature
@@ -311,13 +368,13 @@ class OraclePath:
                 return np.nan
         return time
 
-    def tout(self, *, tin, cout_tedges_days, bin_end_rate=0.0, bin_end_ramp=False):
+    def tout(self, *, tin, cout_tedges_days, bin_end_rate=0.0, bin_end_power=0, bin_end_integrated=False):
         """Bin-averaged delivered temperature on the output grid, with relaxation targets.
 
         The integrand over the label is smooth except where a parcel crosses *any* segment
         face exactly at a target-bin edge, so every output bin's label interval is split at
         the labels of those crossings (found by the same root solves the oracle is built
-        on) and each kink-free piece is integrated with adaptive quadrature.
+        on) and each kink-free piece is integrated with the path's Gauss-Legendre rule.
 
         Parameters
         ----------
@@ -329,9 +386,12 @@ class OraclePath:
             Rate ``w`` [1/day] of an extra reading weight ``exp(-w (t_end - t))``, with ``t``
             the parcel's delivery time and ``t_end`` the right edge of its output bin.
             Default 0, the plain bin average.
-        bin_end_ramp : bool, optional
-            Multiply the reading weight by the additional factor ``t_end - t`` [days] -- the
-            first time-moment reading. Default False.
+        bin_end_power : int, optional
+            Power ``p`` of an additional polynomial factor ``(t_end - t)**p`` on the
+            reading weight -- the p-th time-moment reading. Default 0.
+        bin_end_integrated : bool, optional
+            Replace the weight by its running integral ``int_0^lag u**p exp(-w u) du``.
+            Default False.
 
         Returns
         -------
@@ -358,13 +418,12 @@ class OraclePath:
             j = int(np.clip(np.searchsorted(self.tedges, depart, side="right") - 1, 0, len(tin) - 1))
             value = self.deliver(depart, tin[j])[1]
             lag = bin_end - self._time_at_label(label)
-            value *= np.exp(-bin_end_rate * lag)
-            return value * lag if bin_end_ramp else value
+            return value * self._weight(lag, rate=bin_end_rate, power=bin_end_power, integrated=bin_end_integrated)
 
         # Each piece between consecutive kinks is analytic, so fixed-order Gauss-Legendre
         # converges immediately; adaptive quadrature only rediscovers that at much greater
         # cost, and complains about the kinks when a piece happens to straddle one.
-        nodes, weights = np.polynomial.legendre.leggauss(12)
+        nodes, weights = self.gauss
 
         out = np.full(len(cout_tedges_days) - 1, np.nan)
         for j in range(len(out)):
