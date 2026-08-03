@@ -299,42 +299,61 @@ def _surviving_fraction(phi_lo: npt.NDArray[np.floating], phi_hi: npt.NDArray[np
 def _ramp_surviving_fraction(
     phi_lo: npt.NDArray[np.floating],
     phi_hi: npt.NDArray[np.floating],
-    ramp_lo: npt.NDArray[np.floating],
-    ramp_hi: npt.NDArray[np.floating],
+    ramp_lo: npt.NDArray[np.floating] | float,
+    ramp_hi: npt.NDArray[np.floating] | float,
+    pair_lo: npt.NDArray[np.floating] | float = 1.0,
+    pair_hi: npt.NDArray[np.floating] | float = 1.0,
 ) -> npt.NDArray[np.floating]:
-    """Label-averaged ``ramp * exp(-phi)`` over a cell on which both factors are affine.
+    """Label-averaged ``ramp * pair * exp(-phi)`` over a cell on which all three are affine.
 
     Anchored at the lower-exponent end so nothing overflows: with ``d = |phi_hi - phi_lo|``
-    and the ramp read from that end (``near``) toward the other (``far``), the mean is
-    ``exp(-min(phi)) * (near * E0 + (far - near) * E1)`` with ``E0 = (1 - e^-d)/d`` and
-    ``E1 = (1 - (1 + d) e^-d)/d**2``. ``E1``'s closed form loses a factor ``1/d**2`` to
-    cancellation, so below ``d = 0.01`` it is evaluated by its series, whose fifth term is
-    already below 1e-13 there; both arrangements agree to round-off at the crossover, so
-    the switch is a floating-point evaluation choice, not a model threshold.
+    and both affine factors read from that end, the mean is
+    ``exp(-min(phi)) * (a0 b0 E0 + (a0 db + b0 da) E1 + da db E2)`` with
+    ``En = integral_0^1 x^n e^{-d x} dx``. A constant factor of 1 collapses its terms, so
+    the single-ramp and plain means are the same expression, not special cases. ``E1`` and
+    ``E2`` lose factors ``1/d**2`` and ``1/d**3`` to cancellation in their closed forms, so
+    below ``d = 0.01`` both are evaluated by their series, whose truncation sits below
+    1e-13 there; the arrangements agree to round-off at the crossover, a floating-point
+    evaluation choice rather than a model threshold.
 
     Parameters
     ----------
     phi_lo, phi_hi : ndarray
         Non-negative exponent at the two cell boundaries.
-    ramp_lo, ramp_hi : ndarray
-        The affine factor at the same two boundaries.
+    ramp_lo, ramp_hi : ndarray or float
+        The first affine factor at the same two boundaries.
+    pair_lo, pair_hi : ndarray or float, optional
+        A second affine factor; the default 1 reduces to the single-ramp mean exactly.
 
     Returns
     -------
     ndarray
-        Mean of ``ramp * exp(-phi)`` over the cell, elementwise. Exactly the plain affine
-        average times ``exp(-phi)`` where the exponents coincide.
+        Mean of ``ramp * pair * exp(-phi)`` over the cell, elementwise. Exactly the mean of
+        the affine product times ``exp(-phi)`` where the exponents coincide.
     """
     delta = np.abs(phi_hi - phi_lo)
     swap = phi_hi < phi_lo
-    near = np.where(swap, ramp_hi, ramp_lo)
-    far = np.where(swap, ramp_lo, ramp_hi)
+    a0 = np.where(swap, ramp_hi, ramp_lo)
+    da = np.where(swap, ramp_lo, ramp_hi) - a0
+    b0 = np.where(swap, pair_hi, pair_lo)
+    db = np.where(swap, pair_lo, pair_hi) - b0
     with np.errstate(invalid="ignore", divide="ignore"):
         e0 = np.where(delta > 0.0, -np.expm1(-delta) / delta, 1.0)
-        closed = (1.0 - (1.0 + delta) * np.exp(-delta)) / np.square(delta)
-    series = 0.5 - delta / 3.0 + np.square(delta) / 8.0 - delta**3 / 30.0 + delta**4 / 144.0
-    e1 = np.where(delta < _RAMP_SERIES_CROSSOVER, series, closed)
-    return np.exp(-np.minimum(phi_lo, phi_hi)) * (near * e0 + (far - near) * e1)
+        e1_closed = (1.0 - (1.0 + delta) * np.exp(-delta)) / np.square(delta)
+        e2_closed = (2.0 - (np.square(delta) + 2.0 * delta + 2.0) * np.exp(-delta)) / delta**3
+    small = delta < _RAMP_SERIES_CROSSOVER
+    e1 = np.where(
+        small,
+        0.5 - delta / 3.0 + np.square(delta) / 8.0 - delta**3 / 30.0 + delta**4 / 144.0,
+        e1_closed,
+    )
+    e2 = np.where(
+        small,
+        1.0 / 3.0 - delta / 4.0 + np.square(delta) / 10.0 - delta**3 / 36.0 + delta**4 / 168.0 - delta**5 / 960.0,
+        e2_closed,
+    )
+    mean = a0 * b0 * e0 + (a0 * db + b0 * da) * e1 + da * db * e2
+    return np.exp(-np.minimum(phi_lo, phi_hi)) * mean
 
 
 def _cell_edges(
@@ -449,6 +468,7 @@ def paths_transfer(
     paths_idx: npt.NDArray[np.intp],
     active: npt.NDArray[np.bool_],
     bin_end_rate: npt.NDArray[np.floating] | None = None,
+    bin_end_ramp: npt.NDArray[np.bool_] | None = None,
     with_target_terms: bool = False,
 ) -> NetworkTransfer:
     """Build the exact transfer operators and travel times of every source-to-node path.
@@ -483,6 +503,13 @@ def paths_transfer(
         in. The row then reads the exponentially weighted bin average of its input rather
         than the plain one, which is what an enthalpy balance over a bin asks for. Length
         ``n_nodes``; ``None`` (default) is a plain reading and adds exactly zero.
+    bin_end_ramp : ndarray of bool or None, optional
+        Rows whose reading weight carries the additional factor ``(t_end - t)`` [days] --
+        the weight becomes ``(t_end - t) exp(-w (t_end - t))``, which is what the first
+        time-moment of a bin's driving asks for (the axial flux moment reads through it).
+        The factor is affine across a cell exactly as the exponent is, so every cell mean
+        stays closed-form; a False row's factor is the constant 1 in the same expressions.
+        Length ``n_nodes``; ``None`` (default) is all plain.
     with_target_terms : bool, optional
         Also build the target-independent factors of the affine relaxation bias (see
         :class:`TargetTerms`); requires uniform ``tedges_days`` spacing, which the scan of
@@ -617,9 +644,13 @@ def paths_transfer(
     cout_bin = np.searchsorted(cout_tedges_days, arrival_mid, side="right") - 1
     bin_end = cout_tedges_days[np.clip(cout_bin, 0, n_cout - 1) + 1]
     weight = np.zeros(n_nodes) if bin_end_rate is None else np.asarray(bin_end_rate, dtype=float)
-    quarter_phi = decay_exponent[:, n_edge:].reshape(n_nodes, 2, -1) + weight[:, None, None] * np.maximum(
-        bin_end[:, None, :] - quarter_arrival, 0.0
-    )
+    lag_to_bin_end = np.maximum(bin_end[:, None, :] - quarter_arrival, 0.0)
+    quarter_phi = decay_exponent[:, n_edge:].reshape(n_nodes, 2, -1) + weight[:, None, None] * lag_to_bin_end
+    # The reading ramp of each row: the lag to the bin end for ramp rows, the constant 1
+    # otherwise -- both affine across a cell, so one closed form serves every row.
+    ramp_rows = np.zeros(n_nodes, dtype=bool) if bin_end_ramp is None else np.asarray(bin_end_ramp, dtype=bool)
+    quarter_ramp = np.where(ramp_rows[:, None, None], lag_to_bin_end, 1.0)
+    ramp_lo, ramp_hi = _cell_edges(quarter_ramp)
     cell_travel_time = (quarter_arrival - samples[:, n_edge:].reshape(n_nodes, 2, -1)).mean(axis=1)
     phi_lo, phi_hi = _cell_edges(quarter_phi)
     label = _interp_rows(arrival[:, :n_edge], tedges_days, node_cumulative)
@@ -694,7 +725,7 @@ def paths_transfer(
     # what turns the label-uniform integral into the flow-weighted bin average. Cells the
     # label does not reach have zero width; their NaN decay exponents and travel times are
     # masked out rather than multiplied by it.
-    cell_survive = _surviving_fraction(phi_lo, phi_hi)
+    cell_survive = _ramp_surviving_fraction(phi_lo, phi_hi, ramp_lo, ramp_hi)
     survived = np.where(carrying, label_width * cell_survive, 0.0)
     carried_out = np.where(carrying, label_width * cell_travel_time, 0.0)
     span = np.where(cout_label_width > 0.0, cout_label_width, 1.0)
@@ -770,7 +801,9 @@ def paths_transfer(
             rows = stage_rows[depth + 1]
             here = carrying[rows]
             phi_down = quarter_phi[rows] - stage_phi[depth + 1].reshape(n_nodes, 2, n_cells)[rows]
-            mean_down.append(np.where(here, _surviving_fraction(*_cell_edges(phi_down)), 0.0))
+            mean_down.append(
+                np.where(here, _ramp_surviving_fraction(*_cell_edges(phi_down), ramp_lo[rows], ramp_hi[rows]), 0.0)
+            )
             exits = stage_arrival[depth + 1].reshape(n_nodes, 2, n_cells)[rows]
             entry_bin, exit_bin = faces[depth][: rows.size], faces[depth + 1][: rows.size]
             # The interior-edge factor, shifted by the exit bin's left edge so the exponent
@@ -779,7 +812,9 @@ def paths_transfer(
             rate = segment_decay[paths_idx[rows, depth], None, None]
             shift = rate * (exits - tedges_days[exit_bin][:, None, :]) + phi_down
             shift_lo, shift_hi = _cell_edges(shift)
-            mean_shift.append(np.where(here, _surviving_fraction(shift_lo, shift_hi), 0.0))
+            mean_shift.append(
+                np.where(here, _ramp_surviving_fraction(shift_lo, shift_hi, ramp_lo[rows], ramp_hi[rows]), 0.0)
+            )
             gap.append(np.exp(-rate[:, 0] * float(dt_days[0]) * (exit_bin - entry_bin)))
             bin_entry.append(entry_bin)
             bin_exit.append(exit_bin)
@@ -795,7 +830,13 @@ def paths_transfer(
                 ).reshape(rows.size, 2, n_cells)
                 / segment_volume[paths_idx[rows, depth], None, None]
             )
-            entry_shift.append(np.where(here, _ramp_surviving_fraction(shift_lo, shift_hi, *_cell_edges(frac)), 0.0))
+            entry_shift.append(
+                np.where(
+                    here,
+                    _ramp_surviving_fraction(shift_lo, shift_hi, ramp_lo[rows], ramp_hi[rows], *_cell_edges(frac)),
+                    0.0,
+                )
+            )
             row_offset.append(paths_idx[rows, depth] * n_cin)
         with np.errstate(divide="ignore", invalid="ignore"):
             tilt_scale = np.where(

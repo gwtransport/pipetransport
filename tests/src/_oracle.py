@@ -174,7 +174,7 @@ class OraclePath:
         """
         return float(brentq(lambda t: self.node(t) - label, self.tedges[0], self.tedges[-1], xtol=1e-14))
 
-    def cout(self, *, cin, cout_tedges_days, bin_end_rate=0.0):
+    def cout(self, *, cin, cout_tedges_days, bin_end_rate=0.0, bin_end_ramp=False):
         """Bin-averaged delivered quality on the output grid.
 
         Splits every output bin's label interval at the labels where ``cin`` steps, then
@@ -190,6 +190,9 @@ class OraclePath:
             Rate ``w`` [1/day] of an extra reading weight ``exp(-w (t_end - t))``, with ``t``
             the parcel's delivery time and ``t_end`` the right edge of its output bin. Default
             0, the plain bin average.
+        bin_end_ramp : bool, optional
+            Multiply the reading weight by the additional factor ``t_end - t`` [days] -- the
+            first time-moment reading. Default False.
 
         Returns
         -------
@@ -218,17 +221,16 @@ class OraclePath:
             bounds = np.concatenate([[lo], interior, [hi]])
             total = 0.0
             bin_end = cout_tedges_days[j + 1]
+
+            def integrand(label, end=bin_end):
+                lag = end - self._time_at_label(label)
+                value = np.exp(-exponent(label) - bin_end_rate * lag)
+                return value * lag if bin_end_ramp else value
+
             for a, b in itertools.pairwise(bounds):
                 source_time = self.departure(self._time_at_label(0.5 * (a + b)))
                 bin_index = int(np.clip(np.searchsorted(self.tedges, source_time, side="right") - 1, 0, len(cin) - 1))
-                integral, _ = quad(
-                    lambda label, end=bin_end: np.exp(
-                        -exponent(label) - bin_end_rate * (end - self._time_at_label(label))
-                    ),
-                    a,
-                    b,
-                    limit=200,
-                )
+                integral, _ = quad(integrand, a, b, limit=200)
                 total += cin[bin_index] * integral
             out[j] = total / (hi - lo)
         return out
@@ -309,7 +311,7 @@ class OraclePath:
                 return np.nan
         return time
 
-    def tout(self, *, tin, cout_tedges_days):
+    def tout(self, *, tin, cout_tedges_days, bin_end_rate=0.0, bin_end_ramp=False):
         """Bin-averaged delivered temperature on the output grid, with relaxation targets.
 
         The integrand over the label is smooth except where a parcel crosses *any* segment
@@ -323,6 +325,13 @@ class OraclePath:
             Source temperature, one value per input bin.
         cout_tedges_days : ndarray
             Output bin edges in days.
+        bin_end_rate : float, optional
+            Rate ``w`` [1/day] of an extra reading weight ``exp(-w (t_end - t))``, with ``t``
+            the parcel's delivery time and ``t_end`` the right edge of its output bin.
+            Default 0, the plain bin average.
+        bin_end_ramp : bool, optional
+            Multiply the reading weight by the additional factor ``t_end - t`` [days] -- the
+            first time-moment reading. Default False.
 
         Returns
         -------
@@ -344,10 +353,13 @@ class OraclePath:
                     kinks.append(self.node(arrival))
         kinks = np.array(sorted(kinks))
 
-        def temperature(label):
+        def temperature(label, bin_end):
             depart = self.departure(self._time_at_label(label))
             j = int(np.clip(np.searchsorted(self.tedges, depart, side="right") - 1, 0, len(tin) - 1))
-            return self.deliver(depart, tin[j])[1]
+            value = self.deliver(depart, tin[j])[1]
+            lag = bin_end - self._time_at_label(label)
+            value *= np.exp(-bin_end_rate * lag)
+            return value * lag if bin_end_ramp else value
 
         # Each piece between consecutive kinks is analytic, so fixed-order Gauss-Legendre
         # converges immediately; adaptive quadrature only rediscovers that at much greater
@@ -364,10 +376,13 @@ class OraclePath:
             interior = kinks[(kinks > lo) & (kinks < hi)]
             bounds = np.concatenate([[lo], interior, [hi]])
             total = 0.0
+            bin_end = cout_tedges_days[j + 1]
             for a, b in itertools.pairwise(bounds):
                 if not b > a:
                     continue
                 middle, half = 0.5 * (a + b), 0.5 * (b - a)
-                total += half * sum(w * temperature(middle + half * x) for x, w in zip(nodes, weights, strict=True))
+                total += half * sum(
+                    w * temperature(middle + half * x, bin_end) for x, w in zip(nodes, weights, strict=True)
+                )
             out[j] = total / (hi - lo)
         return out

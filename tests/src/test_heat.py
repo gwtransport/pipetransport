@@ -804,6 +804,142 @@ def test_end_of_bin_weight_matches_the_brute_force_oracle_on_a_travelling_path(r
     np.testing.assert_allclose(read[covered], reference[covered], rtol=0.0, atol=3e-7)
 
 
+@pytest.mark.parametrize("rate", [0.0, 5.336])
+def test_ramp_weight_reduces_to_its_closed_form_without_travel(rate):
+    """A no-travel row with the ramp weight reads ``dt * E1(w dt)`` times its own input.
+
+    The ramp reading integrates ``(t_end - t) exp(-w (t_end - t))`` against the bin, so on
+    an empty path a piecewise-constant series must come back as
+    ``dt * (1 - (1 + w dt) e^{-w dt}) / (w dt)^2`` times itself -- ``dt / 2`` at ``w = 0``,
+    the plain first moment of a uniform bin.
+    """
+    n_bins = 48
+    tedges = pd.date_range("2025-06-01", periods=n_bins + 1, freq="h")
+    days = tedges_to_days(tedges)
+    dt = float(days[1] - days[0])
+    values = 10.0 + np.random.default_rng(1).normal(0.0, 3.0, n_bins)
+    flow = np.full((1, n_bins), 500.0)
+
+    transfer = paths_transfer(
+        tedges_days=days,
+        cout_tedges_days=days,
+        segment_volume=np.array([100.0]),
+        segment_flow=flow,
+        segment_decay=np.array([0.0]),
+        node_flow=flow,
+        paths_idx=np.zeros((1, 0), dtype=np.intp),
+        active=np.zeros((1, 0), dtype=bool),
+        bin_end_rate=np.array([rate]),
+        bin_end_ramp=np.array([True]),
+    )
+    columns = np.clip(transfer.col_start[..., None] + np.arange(transfer.band_vals.shape[-1]), 0, n_bins - 1)
+    read = np.einsum("nkb,nkb->nk", transfer.band_vals, values[columns])[0]
+
+    x = rate * dt
+    factor = dt * (1.0 - (1.0 + x) * np.exp(-x)) / x**2 if rate else dt / 2.0
+    np.testing.assert_allclose(read, factor * values, rtol=0.0, atol=1e-13)
+
+
+@pytest.mark.parametrize("rate", [0.0, 5.336])
+def test_ramp_weight_matches_the_brute_force_oracle_on_a_travelling_path(rate):
+    """The first-moment reading is as exact as the exponential one, parcel by parcel."""
+    n_bins = 60
+    tedges = pd.date_range("2025-06-01", periods=n_bins + 1, freq="h")
+    days = tedges_to_days(tedges)
+    hours = np.arange(n_bins)
+    cin = 10.0 + np.random.default_rng(7).normal(0.0, 2.0, n_bins)
+    downstream = 600.0 + 200.0 * np.sin(2.0 * np.pi * hours / 24.0)
+    segment_flow = np.vstack([downstream + 250.0 + 100.0 * np.cos(2.0 * np.pi * hours / 17.0), downstream])
+    volume, decay = np.array([120.0, 45.0]), np.array([0.35, 0.6])
+
+    transfer = paths_transfer(
+        tedges_days=days,
+        cout_tedges_days=days,
+        segment_volume=volume,
+        segment_flow=segment_flow,
+        segment_decay=decay,
+        node_flow=downstream[None, :],
+        paths_idx=np.array([[0, 1]], dtype=np.intp),
+        active=np.ones((1, 2), dtype=bool),
+        bin_end_rate=np.array([rate]),
+        bin_end_ramp=np.array([True]),
+    )
+    columns = np.clip(transfer.col_start[..., None] + np.arange(transfer.band_vals.shape[-1]), 0, n_bins - 1)
+    read = np.where(transfer.valid_out[0], np.einsum("nkb,nkb->nk", transfer.band_vals, cin[columns])[0], np.nan)
+
+    reference = OraclePath(
+        tedges_days=days,
+        segment_flow=segment_flow,
+        segment_volume=volume,
+        segment_decay=decay,
+        node_flow=downstream,
+    ).cout(cin=cin, cout_tedges_days=days, bin_end_rate=rate, bin_end_ramp=True)
+
+    assert np.array_equal(np.isnan(read), np.isnan(reference))
+    covered = np.isfinite(read)
+    assert covered.sum() > 40, "the comparison must cover most of the record"
+    # The reading is in kelvin-days (the ramp carries a day), so the oracle's quadrature
+    # floor scales with the bin width; 3e-7 * dt is the same relative floor as the
+    # exponential reading's.
+    np.testing.assert_allclose(read[covered], reference[covered], rtol=0.0, atol=3e-7 / 24.0)
+
+
+def test_ramp_readings_carry_the_bias_and_the_tilt_exactly(heat_network, short_tedges, diurnal_demand):
+    """The full affine reading through a ramp-weighted row, against the oracle.
+
+    The moment recursion of the axial model reads face temperatures through the weight
+    ``(t_end - t) exp(-h (t_end - t))``, and those temperatures include the relaxation bias
+    and its tilt. Every bias slab of a ramp row therefore carries the ramp factor -- for the
+    entry-position term that makes the cell mean a product of two affines against the
+    exponential, the ``E2`` closed form -- and this is the one comparison that exercises it.
+    """
+    demand = heat_network.flow_array(diurnal_demand(heat_network, short_tedges))
+    rng = np.random.default_rng(41)
+    n_seg, n_bins = len(heat_network.segments), len(short_tedges) - 1
+    rates = _rate(heat_network, depth=heat_network.segments["depth"]).to_numpy()
+    targets = rng.uniform(8.0, 24.0, size=(n_seg, n_bins))
+    tilts = rng.uniform(-6.0, 6.0, size=(n_seg, n_bins))
+    tin = rng.uniform(6.0, 14.0, size=n_bins)
+    node = "T4"
+    reading_rate = 3.1
+
+    requested = [node]
+    paths = [heat_network.segments.index.get_indexer(list(heat_network.paths[node]))]
+    days = tedges_to_days(short_tedges)
+    transfer = paths_transfer(
+        tedges_days=days,
+        cout_tedges_days=days,
+        segment_volume=heat_network.segments["volume"].to_numpy(dtype=float),
+        segment_flow=heat_network.segment_flow(flow=demand),
+        segment_decay=rates,
+        node_flow=heat_network.node_flow(flow=demand, nodes=requested),
+        paths_idx=np.array(paths, dtype=np.intp),
+        active=np.ones((1, len(paths[0])), dtype=bool),
+        bin_end_rate=np.array([reading_rate]),
+        bin_end_ramp=np.array([True]),
+        with_target_terms=True,
+    )
+    columns = np.clip(transfer.col_start[..., None] + np.arange(transfer.band_vals.shape[-1]), 0, n_bins - 1)
+    actual = np.einsum("nkb,nkb->nk", transfer.band_vals, tin[columns])[0]
+    actual += apply_segment_targets(transfer, targets, segment_tilt=tilts)[0]
+    actual = np.where(transfer.valid_out[0], actual, np.nan)
+
+    rows = paths[0]
+    expected = OraclePath(
+        tedges_days=days,
+        segment_flow=heat_network.segment_flow(flow=demand)[rows],
+        segment_volume=heat_network.segments["volume"].to_numpy(dtype=float)[rows],
+        segment_decay=rates[rows],
+        node_flow=heat_network.node_flow(flow=demand, nodes=requested)[0],
+        segment_target=targets[rows],
+        segment_target_slope=tilts[rows],
+    ).tout(tin=tin, cout_tedges_days=days, bin_end_rate=reading_rate, bin_end_ramp=True)
+
+    both = np.isfinite(actual) & np.isfinite(expected)
+    assert both.sum() > 0.5 * len(actual)
+    np.testing.assert_allclose(actual[both], expected[both], atol=1e-11)
+
+
 def test_bias_weights_are_non_negative_and_complete_the_row_sum(heat_network, short_tedges, diurnal_demand):
     """Every target bin enters with a non-negative weight, and the weights close the budget.
 
