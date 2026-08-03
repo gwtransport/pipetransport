@@ -2286,10 +2286,10 @@ def test_the_warm_start_prefix_drives_no_wall_flux(heat_pipe, soil, surface):
     )
 
 
-def _equilibrating_pipe(h_tau, *, days=12):
-    """A 100 mm x 1 km grass main whose flow puts it at a chosen ``h*tau``, and its inputs."""
+def _equilibrating_pipe(h_tau, *, days=12, diameter=0.1):
+    """A 1 km grass main of the given diameter whose flow puts it at a chosen ``h*tau``."""
     segments = pd.DataFrame(
-        {"from": ["Plant"], "to": ["T1"], "length": [1000.0], "diameter": [0.1], "cover": ["grass"]},
+        {"from": ["Plant"], "to": ["T1"], "length": [1000.0], "diameter": [diameter], "cover": ["grass"]},
         index=["main"],
     )
     network = PipeNetwork(segments=segments, source="Plant")
@@ -2332,6 +2332,76 @@ def test_the_reverse_names_the_regime_it_cannot_invert(h_tau):
     assert "raise max_sweeps or atol" not in message, "the knobs that cannot help must not be advertised"
 
     # The one-way reverse it points at really does return a usable answer here.
+    one_way = heat.endmember_to_source(tout=measured, **shared, max_sweeps=1)
+    assert np.isfinite(one_way).any()
+
+
+def test_the_reverse_names_a_sub_bin_transit_rather_than_the_coupling():
+    """A transit under a bin diverges far below the coupling boundary, and the message says why.
+
+    A 100 mm main emptied in half an hour on hourly bins couples at only ``h*tau = 0.11``,
+    yet the outer map's spectral radius is 21 (measured by power iteration, issue #40): a
+    parcel crosses the pipe inside a bin, so the deconvolution is nearly singular at the
+    fastest alternation the record carries while the halo coupling still feeds that
+    alternation back. Blaming the coupling here would tell the user to shorten the segment
+    -- which shortens the transit and makes it worse. The message has to name the transit,
+    and the remedy it points at is the one that measurably works: finer bins.
+    """
+    # h*tau = rate * (0.5 h): the transit spans half a bin at the median flow.
+    shared, tin = _equilibrating_pipe(0.1112, days=8)
+    measured = heat.source_to_endmember(tin=tin, **shared)
+
+    with pytest.raises(RuntimeError, match="did not converge") as raised:
+        heat.endmember_to_source(tout=measured, **shared)
+    message = str(raised.value)
+    assert "'main'" in message, message
+    assert "transit" in message, message
+    assert "bins" in message, message
+    assert "max_sweeps=1" in message, message
+    assert "past about 0.7" not in message, "a coupling of 0.11 is not past 0.7; the boundary must not be misquoted"
+
+    # The remedy the message names, measured: the same pipe, flow and coupling on 15-minute
+    # bins puts the transit at two bins, and the reverse round-trips. Only the resolution
+    # failed, not the physics.
+    network = shared["network"]
+    tedges = pd.date_range("2025-06-01", periods=6 * 96 + 1, freq="15min")
+    n = len(tedges) - 1
+    tin_fine = 8.0 + 2.0 * np.sin(2.0 * np.pi * np.arange(n) / 288.0)
+    fine = dict(
+        flow=np.full((1, n), shared["flow"][0, 0]),
+        tedges=tedges,
+        cout_tedges=tedges,
+        network=network,
+        soil=shared["soil"],
+        surface_temperature=pd.DataFrame({"grass": np.full(n, 22.0)}),
+    )
+    measured_fine = heat.source_to_endmember(tin=tin_fine, **fine)
+    recovered = heat.endmember_to_source(tout=measured_fine, **fine)
+    inner = slice(96, -192)
+    # The resonant modes are weakly determined, so this sits above the no-gap Tikhonov floor:
+    # measured 1.7e-4 K. The bound pins the remedy; the baseline behavior was a RuntimeError.
+    assert float(np.nanmax(np.abs(recovered[inner] - tin_fine[inner]))) < 1e-3
+
+
+def test_a_service_line_at_a_one_bin_transit_is_the_coupling_regime():
+    """The 40 mm case of issue #40 fits the ``h*tau`` story after all: it sits at 1.12.
+
+    Thin pipes equilibrate fast (``h ~ 1/(D**2 ln D)``), so a 40 mm service line at a 1 h
+    transit couples at ``h*tau = 1.12`` -- past the ~0.7 boundary exactly like a 100 mm main
+    at a 6 h transit, however mild a 1 h transit sounds. Its transit spans exactly one bin,
+    so no alternation resonance is involved: the outer map's spectral radius is 1.43, on the
+    same curve as the 100 mm geometry, and unchanged from 6 to 24 days of record -- the
+    failure is conditioning of the fixed point, not an unfinished spin-up. The message must
+    name the coupling, and the one-way reverse it offers instead must work.
+    """
+    # h*tau = rate * (1 h) for a 40 mm grass line at depth 1: a one-bin transit.
+    shared, tin = _equilibrating_pipe(1.1166, days=8, diameter=0.04)
+    measured = heat.source_to_endmember(tin=tin, **shared)
+
+    with pytest.raises(RuntimeError, match=r"h\*tau = 1\.12") as raised:
+        heat.endmember_to_source(tout=measured, **shared)
+    assert "'main'" in str(raised.value), str(raised.value)
+
     one_way = heat.endmember_to_source(tout=measured, **shared, max_sweeps=1)
     assert np.isfinite(one_way).any()
 
