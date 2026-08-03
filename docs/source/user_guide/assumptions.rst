@@ -404,26 +404,28 @@ internally.
 falls along a pipe like :math:`e^{-h_e \tau}` --- by a factor 1.6 over a 2 h transit on a 100 mm
 service line, and 3.8 over 6 h. Charging the whole pipe with one average flux history therefore gives
 every parcel in it the same soil memory. Under 24 h diurnal forcing at hourly bins that is worth
-about 0.5--0.9 K on a 100 mm line. It is not a bin-resolution question that a finer ``tedges`` would
-answer: it is a *spatial* one.
+about 0.07 K over a 2 h transit and 0.5 K over 6 h on a 100 mm line. It is not a bin-resolution
+question that a finer ``tedges`` would answer: it is a *spatial* one.
 
 **What you can do.** Declare the pipe as a chain of shorter segments. That is exact in the transport
 it does not touch --- :math:`k` series pieces of volume :math:`V/k` at the same flow compose to the
 same arrival map, and their exchange exponents add to the whole pipe's, so ``W``, the residence times
 and the coverage mask are unchanged to round-off and only the soil memory is refined.
 
-**Check that it settles when you do.** Under continuous flow it does: on a 2 km / 100 mm line the
-per-doubling steps fall about fourfold (0.21, 0.058, 0.014, 0.0034 K). Under intermittent demand it
-does **not**. On the same pipe drawing 11 h a day the steps are 2.39, 3.14, 2.61, 2.31 K, and deeper
-stagnation diverges outright --- at 2 h a day, 1 against 16 pieces differ by 818 K and the call still
-returns without raising. The mechanism is that :math:`\psi = Q (T_\text{in} - T_\text{out}) / L`
-saturates at the full parcel-to-wall contrast after a stagnation however short the piece is, so
-refining amplifies the flux fed to the halo instead of resolving it. Refine only where the branch
-flows continuously, and read a moving answer as a warning rather than as progress.
+**How many pieces are enough.** The cost falls roughly as the square of the per-piece coupling
+:math:`h_e \tau / n`: on the 100 mm line above, the 6 h gap falls 0.5, 0.12, 0.03, 0.01 K over 1, 2,
+4, 8 pieces. Keeping :math:`h_e \tau` per piece under about 0.3 holds the assumption below roughly
+one percent of the water--soil contrast. Refining is safe under stagnation too: the enthalpy budget
+books a standing pipe's flux into the bins the water stands in whatever the piece count, so on the
+issue-#24 duty cycles --- a main flushed 2 h in every 24, a line standing 22 h a day --- 1 and 16
+pieces agree to 0.15 K. (Under the earlier delivery-bin flux, refining a stagnating pipe amplified
+the flux fed to the halo instead of resolving it; that mechanism went with the attribution.)
 
 **How it is checked.** Not checked --- there is no parameter to validate. That one flux history per
-pipe is an approximation, and that refining it converges under continuous flow, are pinned by tests
-against an independently written reference which keeps one soil memory per axial cell.
+pipe is an approximation, and that refining it converges, are pinned by tests against an
+independently written reference which keeps one soil memory per axial cell; on a shared time grid
+the two collapse onto each other, so the residual between them is the comparison's discretisation
+rather than unattributed physics (issue #32).
 
 
 .. _assumption-effective-target:

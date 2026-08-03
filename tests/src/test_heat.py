@@ -1014,6 +1014,12 @@ def _local_reference(*, tin, t_inf, dt, tau, n_slug, r_inner, d_eff, alpha, kapp
     well behaved as the film and wall resistance shrink, and it reduces exactly to the one-way
     relaxation when the halo is switched off.
 
+    The record opens on the same pipe the package opens on: the warm start has fed the pipe
+    at ``tin[0]`` for longer than a transit with no halo yet, so the slug starts at the
+    settled profile toward the undisturbed soil rather than uniform at ``tin[0]``. The two
+    initial states agree in the settled window either way; starting from the same one makes
+    the opening bins comparable too (issue #32).
+
     Parameters
     ----------
     tin, t_inf : ndarray
@@ -1062,7 +1068,11 @@ def _local_reference(*, tin, t_inf, dt, tau, n_slug, r_inner, d_eff, alpha, kapp
     tin_fine, tinf_fine = np.asarray(tin)[sample], np.asarray(t_inf)[sample]
 
     gain = rate * area * (1.0 - survive) / (rate * step)  # psi = gain * (T_parcel - T_eff)
-    slug = np.full(n_slug, tin_fine[0])
+    # Cell i is delivered after n_slug - i more sub-steps, so at the record's opening its
+    # water has already relaxed toward the undisturbed soil over n_slug - i - 0.5 sub-steps
+    # (cell centres) of the warm start.
+    age = (n_slug - np.arange(n_slug) - 0.5) * step
+    slug = tinf_fine[0] + (tin_fine[0] - tinf_fine[0]) * np.exp(-rate * age)
     flux = np.zeros((n_steps, n_slug))
     increment = np.zeros((n_steps, n_slug))
     delivered = np.zeros(n_steps)
@@ -1133,7 +1143,9 @@ def test_two_way_model_agrees_with_the_local_fine_step_reference(transit_hours, 
     booked over the residence time that term is gone, the unsplit gap falls several-fold, and
     what is left drops steeply at the first refinement and then flattens onto a floor that
     more pieces do not move -- so the assertions below pin the drop and the floor rather than
-    a rate. Issue #32 tracks attributing that floor.
+    a rate. The floor is the comparison's own time discretisation, not the model's: the
+    reference sub-steps at CFL 1 inside the package's bins, and the sibling test below shows
+    the gap collapsing once the two share one grid (issue #32).
 
     A film resistance is supplied deliberately. At the bare-pipe limit the reference's
     closed-form per-step solve is singular and it diverges below about 2 % of the soil
@@ -1166,8 +1178,41 @@ def test_two_way_model_agrees_with_the_local_fine_step_reference(transit_hours, 
         for n_sub in (1, 4, 8)
     ]
     assert gaps[0] < tolerance, gaps
-    assert gaps[1] < 0.4 * gaps[0], gaps  # measured 0.09-0.34 of the unsplit gap
-    assert gaps[2] <= gaps[1], gaps  # the floor: measured 0.68-0.99, never a rise
+    assert gaps[1] < 0.4 * gaps[0], gaps  # measured 0.05-0.15 of the unsplit gap
+    assert gaps[2] <= gaps[1], gaps  # the floor: measured 0.36-0.92, never a rise
+
+
+def test_the_agreement_floor_is_the_two_time_discretisations():
+    """On one shared grid the package and the local reference collapse onto each other.
+
+    The sibling test's residual floor -- about 0.01 K at hourly bins that more pieces do not
+    move -- measures the comparison rather than the model: the reference advances at CFL 1,
+    sub-stepping inside the package's bins, so the two discretise the same physics on
+    different time grids. Run both on the same one -- 15-minute bins, the reference's
+    sub-step equal to the bin width, eight pieces against eight axial cells -- and the
+    settled-window gap falls to 0.002 K, thirty-fold below the unsplit axial cost and
+    shrinking with the bin width (0.020 K at hourly, 0.006 K at half-hourly). With the
+    axial resolution matched as well, no unattributed physics is left between them; that
+    is the attribution issue #32 asked for.
+    """
+    tedges = pd.date_range("2025-06-01", periods=4 * 96 + 1, freq="15min")
+    n_bins = len(tedges) - 1
+    tin = 13.0 + 3.0 * np.sin(2.0 * np.pi * (np.arange(n_bins) + 0.5) / 96.0)
+    reference = _local_reference(
+        tin=tin,
+        t_inf=np.full(n_bins, 18.0),
+        dt=1.0 / 96.0,
+        tau=2.0 / 24.0,
+        n_slug=8,
+        r_inner=0.05,
+        d_eff=1.0 + GRASS["kappa"] / GRASS["eta"],
+        alpha=GRASS["alpha"],
+        kappa=GRASS["kappa"],
+        r_other=1.0 / (2.0 * np.pi * 0.05 * 0.454),
+    )
+    settled = slice(2 * 96, None)
+    gap = float(np.max(np.abs(_series_pipe(8, transit_hours=2.0, tin=tin, tedges=tedges) - reference)[settled]))
+    assert gap < 0.005, gap  # measured 0.0020 K
 
 
 def test_uniform_temperature_is_a_fixed_point(heat_network, hourly_tedges, diurnal_demand):

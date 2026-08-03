@@ -103,15 +103,20 @@ Validity
   100 mm service line -- but the model gives every parcel in a pipe the same soil memory.
   That is the model's spatial resolution along a pipe, and it is a stated assumption rather
   than a parameter. Measured against a reference that keeps one memory per axial cell, it is
-  worth 0.08 K on a 100 mm line at a 2 h transit and 0.53 K at 6 h, under 24 h diurnal
+  worth 0.07 K on a 100 mm line at a 2 h transit and 0.5 K at 6 h, under 24 h diurnal
   forcing at hourly bins. Refining ``tedges`` does not reduce it; it is a property of the
   transit.
 
   Declare a pipe as a chain of shorter segments if you need it resolved -- splitting is
-  exact for the transport, which is unchanged to round-off by it. The gap closes steeply at
-  the first refinement (to 0.03-0.05 K at four pieces) and then flattens onto a floor more
-  pieces do not move; issue #32 tracks both removing the assumption and attributing that
-  floor.
+  exact for the transport, which is unchanged to round-off by it, and it is stable under
+  stagnation: on the issue-#24 duty cycles, 1 and 16 pieces agree to 0.15 K. The cost falls
+  roughly as the square of the per-piece coupling ``h tau / n``: at the transits above,
+  0.07/0.5 K whole falls to 0.005/0.03 K at four pieces. Keeping ``h tau`` per piece under
+  about 0.3 holds the assumption below roughly one percent of the water-soil contrast.
+  What splitting does not remove -- about 0.01 K at hourly bins -- is not the model but the
+  measurement: the reference sub-steps inside the bins, and on matched grids (its step equal
+  to the bin width) the residual collapses to 0.002 K and shrinks with the bin width. Issue
+  #32 records the attribution; removing the assumption analytically remains open there.
 - The relaxation target is an *effective driving temperature*, not a wall temperature. The
   rate keeps the steady soil resistance, which overstates the resistance while the halo is
   still developing, so the target has to be pushed past the undisturbed soil to reproduce
