@@ -2331,9 +2331,10 @@ def _reverse_case(network, tedges, demand, soil, surface_frame, *, nodes, tin, *
         soil=soil,
         surface_temperature=surface_frame,
         nodes=nodes,
-        # What these test is the deconvolution and its refusals, none of which the internal
-        # split touches; carrying it here would multiply their cost to re-measure what
-        # test_the_reverse_direction_survives_splitting_the_pipes already covers.
+        # What these test is the deconvolution and its refusals, which the axial mode
+        # count does not touch; two modes keep the outer-times-inner iteration at the
+        # cost these cases were calibrated on.
+        n_modes=2,
     )
     measured = heat.source_to_endmember(tin=tin, **shared)
     recovered = heat.endmember_to_source(tout=measured, **shared, **kwargs)
