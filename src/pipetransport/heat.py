@@ -1747,7 +1747,7 @@ def source_to_endmember(
     ...     {"alpha": [0.05, 0.07], "kappa": [0.025, 0.035], "eta": [0.41, 0.41]},
     ...     index=["grass", "paved"],
     ... )
-    >>> tedges = pd.date_range("2025-06-01", "2025-06-08", freq="h")
+    >>> tedges = pd.date_range("2025-06-01", "2025-06-05", freq="h")
     >>> surface = pd.DataFrame(
     ...     {
     ...         "grass": np.full(len(tedges) - 1, 22.0),
@@ -1764,7 +1764,7 @@ def source_to_endmember(
     ...     surface_temperature=surface,
     ... )
     >>> cout.shape
-    (4, 168)
+    (4, 96)
     >>> bool(
     ...     np.all(np.diff([8.0, np.nanmean(cout[3]), 30.0]) > 0)
     ... )  # between plant and sol-air
@@ -1936,7 +1936,7 @@ def endmember_to_source(
     ...     {"alpha": [0.05], "kappa": [0.015], "eta": [0.41]},
     ...     index=["grass"],
     ... )
-    >>> tedges = pd.date_range("2025-06-01", "2025-06-11", freq="h")
+    >>> tedges = pd.date_range("2025-06-01", "2025-06-09", freq="h")
     >>> demand = example_demand(tedges=tedges, network=network)
     >>> surface = pd.DataFrame({"grass": np.full(len(tedges) - 1, 25.0)})
     >>> hours = np.arange(len(tedges) - 1)
