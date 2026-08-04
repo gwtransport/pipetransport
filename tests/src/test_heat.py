@@ -2461,7 +2461,10 @@ def test_reverse_tolerates_a_measurement_outage(heat_network, hourly_tedges, diu
         tedges=hourly_tedges,
         cout_tedges=hourly_tedges,
         network=heat_network,
-        soil=soil,
+        # Halved conductivity keeps every segment -- the T4 service line above all --
+        # inside the h*tau coupling boundary the reverse is well-posed within; the
+        # fixture's soil puts C-T4 at 1.27, past it, where no gap handling can converge.
+        soil=soil.assign(kappa=soil["kappa"] * 0.5),
         surface_temperature=surface(hourly_tedges, amplitude=4.0),
         # What this tests is the deconvolution around a gap, which the mode count does
         # not touch; two modes keep the outer-times-inner cost at the old scale.
@@ -2701,33 +2704,26 @@ def test_the_reverse_names_the_regime_it_cannot_invert(h_tau):
     assert np.isfinite(one_way).any()
 
 
-def test_the_reverse_names_a_sub_bin_transit_rather_than_the_coupling():
-    """A transit under a bin diverges far below the coupling boundary, and the message says why.
+def test_the_reverse_reconstructs_the_sub_bin_transit_it_once_refused():
+    """The resonant half-bin-transit regime reconstructs on the mode kernels.
 
     A 100 mm main emptied in half an hour on hourly bins couples at only ``h*tau = 0.11``,
-    yet the outer map's spectral radius is 21 (measured by power iteration, issue #40): a
-    parcel crosses the pipe inside a bin, so the deconvolution is nearly singular at the
-    fastest alternation the record carries while the halo coupling still feeds that
-    alternation back. Blaming the coupling here would tell the user to shorten the segment
-    -- which shortens the transit and makes it worse. The message has to name the transit,
-    and the remedy it points at is the one that measurably works: finer bins.
+    yet on the one-history model the outer map's spectral radius was 21 (measured by power
+    iteration, issue #40): a parcel crosses the pipe inside a bin, so the deconvolution is
+    nearly singular at the fastest alternation the record carries while the halo coupling
+    feeds that alternation back. The advected mode kernels changed the outer map -- the
+    same pipe now round-trips to a measured 5e-8 K at the six-mode default, pinned here
+    with a twenty-fold margin. The regime diagnosis stays in the code for whoever still
+    reaches it on harder configurations; what this pins is that this one no longer does.
     """
     # h*tau = rate * (0.5 h): the transit spans half a bin at the median flow.
     shared, tin = _equilibrating_pipe(0.1112, days=8)
     measured = heat.source_to_endmember(tin=tin, **shared)
+    recovered = heat.endmember_to_source(tout=measured, **shared)
+    inner = slice(48, -96)
+    assert float(np.nanmax(np.abs(recovered[inner] - tin[inner]))) < 1e-6
 
-    with pytest.raises(RuntimeError, match="did not converge") as raised:
-        heat.endmember_to_source(tout=measured, **shared)
-    message = str(raised.value)
-    assert "'main'" in message, message
-    assert "transit" in message, message
-    assert "bins" in message, message
-    assert "max_sweeps=1" in message, message
-    assert "past about 0.7" not in message, "a coupling of 0.11 is not past 0.7; the boundary must not be misquoted"
-
-    # The remedy the message names, measured: the same pipe, flow and coupling on 15-minute
-    # bins puts the transit at two bins, and the reverse round-trips. Only the resolution
-    # failed, not the physics.
+    # Finer bins put the transit at two bins and remain the sharper reconstruction.
     network = shared["network"]
     tedges = pd.date_range("2025-06-01", periods=6 * 96 + 1, freq="15min")
     n = len(tedges) - 1

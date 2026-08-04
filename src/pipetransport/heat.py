@@ -217,10 +217,11 @@ _DIVERGENCE_STEPS = 5
 # and from 30-minute to 2-hour bins at fixed coupling. Coupling: at transits of a few bins or
 # more the radius crosses one near h*tau = 0.7 (0.92 at 0.50 and 1.10 at 0.75 on a 100 mm
 # main; a 400 mm main crosses nearer 1.0), the excess is broad-band, and no Anderson window
-# recovers it. Transit: a segment that empties in about a bin leaves the deconvolution nearly
-# singular at the fastest alternation the record carries whatever the coupling -- radius 21 at
-# h*tau = 0.11 for a 100 mm main at a half-bin transit -- while transits of 1.5 bins and more
-# leave only isolated resonant modes above one, which the extrapolation still reaches.
+# recovers it. Transit: on the one-history model a segment that emptied in about a bin left
+# the deconvolution nearly singular at the fastest alternation the record carries whatever
+# the coupling (radius 21 at h*tau = 0.11 for a 100 mm main at a half-bin transit); the
+# advected mode kernels tamed that map -- the same pipe now reconstructs to 5e-8 K -- and
+# the transit diagnosis remains for configurations that still reach it.
 _COUPLING_LIMIT = 0.7
 _SHORT_TRANSIT_BINS = 1.5
 
@@ -1884,15 +1885,15 @@ def endmember_to_source(
     and 1.10 at 0.75 on a 100 mm main; a 400 mm main crosses nearer 1.0), the excess is
     broad-band, and nothing reaches the fixed point -- a 40 mm service line at a 1 h transit
     already sits at ``h*tau = 1.12``, which is why the two-way reverse is unavailable on fast
-    service lines however short their transit sounds. **Transit**: a segment that empties in
-    about a bin or less is nearly singular at the fastest alternation the record carries
-    whatever its coupling -- radius 21 at ``h*tau = 0.11`` for a 100 mm main at a half-bin
-    transit. That one is a resolution problem rather than a physics problem: the same pipe on
-    15-minute bins, where the transit spans two, reconstructs to 2e-4 K. Between the two,
-    transits near 1.5-2.5 bins put only isolated resonant modes above one, which the
-    extrapolation still reaches at a reconstruction error that grows as the transit shortens
-    (2e-4 K at a 1.5-bin transit against 2e-2 K at half a bin on a 400 mm main whose coupling
-    is negligible). The RuntimeError names whichever regime applies.
+    service lines however short their transit sounds. **Transit**: on the one-history
+    model a segment that emptied in about a bin was nearly singular at the fastest
+    alternation the record carries whatever its coupling -- radius 21 at ``h*tau = 0.11``
+    for a 100 mm main at a half-bin transit. The advected mode kernels changed that outer
+    map: the same pipe now reconstructs to 5e-8 K at the six-mode default, and finer bins
+    remain the sharper choice wherever a transit spans less than a bin. The regime
+    diagnosis stays: a configuration that does diverge with a sub-bin transit is still
+    told to refine ``tedges``, which is still the remedy that works there. The
+    RuntimeError names whichever regime applies.
 
     The reconstruction leans on a fabricated production series over the bins no measurement
     constrains, and the coupling carries that invention into bins the record *does* constrain
@@ -2027,11 +2028,9 @@ def endmember_to_source(
     #
     # The inner fixed point is only asked for the accuracy the outer iterate has itself: a
     # halo resolved to `atol` around a production series still kelvins from its own fixed
-    # point is thrown away on the next step. The forcing shrinks with the outer increment
-    # and always sits one forcing ratio below it -- the outer residual reads the inner
-    # solves' stopping wobble through the deconvolution's conditioning, so an inner solve
-    # only as tight as the outer target leaves the outer loop a floor above its own test.
-    # Seeded at inf, so the first inner solve is a single sweep.
+    # point is thrown away on the next step. The forcing shrinks with the outer increment, so
+    # the last inner solve is the exact one, and the outer loop pays one or two extra steps
+    # for it. Seeded at inf, so the first inner solve is a single sweep.
     # The outer map is affine, so plain repetition converges only where its own spectral
     # radius happens to be under one -- and a pipe that equilibrates appreciably over its
     # transit puts it over, as does one that empties in about a bin. Extrapolating over the
@@ -2069,7 +2068,7 @@ def endmember_to_source(
         increment, previous, best, growing = np.inf, np.inf, np.inf, 0
         history: list[tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]] = []
         for _ in range(max_sweeps - 1):
-            inner_atol = _INNER_FORCING * max(atol, increment)
+            inner_atol = max(atol, _INNER_FORCING * increment)
             state = _converge_targets(
                 system,
                 filled(recovered),
