@@ -1661,9 +1661,13 @@ def source_to_endmember(
         resolution along a pipe, a model order like a mesh rather than a tuning knob.
         1 is the classical one-history model, whose truncation under intermittent
         demand reaches a quarter of the driving contrast; 6 (default) resolves an
-        overnight-stagnation profile to under 1 % of it. Runtime and memory grow with
-        the count -- see ``max_sweeps`` for the measured costs -- so a study that only
-        needs the classical behaviour can ask for less. Default 6.
+        overnight-stagnation profile to under 1 % of it. The bin width bounds what the
+        count can buy: a segment flushed more than about a pipe volume per bin cannot
+        drive modes finer than the bin resolves, and asking for them is refused by name
+        with the two remedies that work -- fewer modes for that geometry, or finer
+        ``tedges``. Runtime and memory grow with the count -- see ``max_sweeps`` for the
+        measured costs -- so a study that only needs the classical behaviour can ask
+        for less. Default 6.
     max_sweeps : int, optional
         Iteration cap. 1 is the one-way model. The sweep count is a property of the physics,
         not of the record length: it is set by how much of the steady soil resistance the
