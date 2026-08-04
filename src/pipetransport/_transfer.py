@@ -568,82 +568,6 @@ class _CellBasis:
         return np.einsum("k...,k...->...", coef, self.moments[: coef.shape[0]])
 
 
-def _product_mean(
-    phi_lo: npt.NDArray[np.floating],
-    phi_hi: npt.NDArray[np.floating],
-    factors: tuple[tuple[npt.NDArray[np.floating], npt.NDArray[np.floating], int], ...] = (),
-) -> npt.NDArray[np.floating]:
-    """Cell mean of a product of affine powers times ``exp(-phi)``, all affine per cell.
-
-    The bare building block of the snapshot slabs, which carry no reading weight: the
-    factors' endpoint pairs are oriented into the anchored coordinate of the exponent and
-    multiplied out, and the mean is one moment contraction.
-
-    Parameters
-    ----------
-    phi_lo, phi_hi : ndarray
-        Exponent at the two cell boundaries.
-    factors : tuple of (lo, hi, power), optional
-        Affine factors with integer powers. Default none, the plain mean.
-
-    Returns
-    -------
-    ndarray
-        The mean, elementwise over cells.
-    """
-    basis = _CellBasis(phi_lo, phi_hi)
-    coef = np.ones((1, *np.broadcast_shapes(np.shape(phi_lo), np.shape(phi_hi))))
-    for lo, hi, power in factors:
-        offset, slope = basis.affine(lo, hi)
-        for _ in range(power):
-            coef = _affine_multiply(coef, offset, slope)
-    return basis.mean(coef)
-
-
-def _pair_powers(
-    phi_lo: npt.NDArray[np.floating],
-    phi_hi: npt.NDArray[np.floating],
-    first: tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]],
-    n_first: int,
-    second: tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]],
-    n_second: int,
-) -> npt.NDArray[np.floating]:
-    """Cell means of ``first**a second**b exp(-phi)`` for all ``a <= n_first, b <= n_second``.
-
-    One anchored basis serves the whole table; the polynomial stacks grow by one affine
-    multiply per power, so the table costs quadratically few vector operations.
-
-    Parameters
-    ----------
-    phi_lo, phi_hi : ndarray
-        Exponent at the two cell boundaries.
-    first, second : tuple of ndarray
-        Endpoint pairs of the two affine quantities.
-    n_first, n_second : int
-        Highest powers.
-
-    Returns
-    -------
-    ndarray
-        Table of shape ``(n_first + 1, n_second + 1, *cells)``.
-    """
-    basis = _CellBasis(phi_lo, phi_hi)
-    shape = np.broadcast_shapes(np.shape(phi_lo), np.shape(phi_hi))
-    out = np.empty((n_first + 1, n_second + 1, *shape))
-    f_off, f_slope = basis.affine(*first)
-    s_off, s_slope = basis.affine(*second)
-    coef_b = np.ones((1, *shape))
-    for b in range(n_second + 1):
-        coef = coef_b
-        for a in range(n_first + 1):
-            out[a, b] = basis.mean(coef)
-            if a < n_first:
-                coef = _affine_multiply(coef, f_off, f_slope)
-        if b < n_second:
-            coef_b = _affine_multiply(coef_b, s_off, s_slope)
-    return out
-
-
 def _shape_powers(
     phi_lo: npt.NDArray[np.floating],
     phi_hi: npt.NDArray[np.floating],
@@ -737,8 +661,9 @@ class _WeightedBasis:
 
     The mean of any polynomial ``P(x)`` against weight and base exponent is then two
     anchored contractions, one against ``base`` and one against ``base + w lag``. The
-    weight polynomials are composed into the two anchored cell coordinates once, here,
-    and every subsequent :meth:`powers` table reuses them.
+    weight polynomials are held in the lag coordinate and composed into each anchored
+    cell coordinate by the :meth:`powers` tables, whose extra exponents shift the
+    anchors.
 
     Parameters
     ----------

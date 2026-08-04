@@ -454,20 +454,20 @@ plus transient deficit*, not an artefact.
 delivered temperature is a genuine weighted average of the produced water and those targets, **it can
 fall outside the range of its own inputs**, and there is no general bound on by how much.
 
-A step in the produced temperature into a *continuously flowing* pipe is the mild case: 18 % of the
-instantaneous plant-to-soil contrast --- 4.3 K on a 100 mm line after a 24 K step --- peaking 1.9
-transits after the step and back inside the range after about nine days. Splitting the pipe
-(:ref:`assumption-uniform-wall-flux`) into a chain of shorter segments cuts that to 1--4 %.
+A step in the produced temperature into a *continuously flowing* pipe is the mild case: 2.4 % of the
+instantaneous plant-to-soil contrast at the six-mode default --- 0.6 K on a 100 mm line after a 24 K
+step --- where the classical one-history model paid 18 %.
 
-Intermittent demand used to be far worse, and is the case the wall-flux attribution was changed for.
-Booking each parcel's heat over the bins it actually occupied rather than over the single bin it was
-delivered in, a 100 mm line idle 8 hours a day delivers water 7.8 % of the contrast past the soil,
-and resolving the pipe now *helps*: the excursion falls monotonically and is back inside the range at
-two pieces (--3.8 %) and four (--10.3 %). Reading the flux off the delivered water instead put the
-same case at 20--28 % and made refining worse rather than better, and on sharper duty cycles --- a
-main flushed two hours in every 24, a line standing ten days --- it reached 8.8 times the contrast,
-converged and unflagged. Those shapes now come back within about a kelvin of the range of their
-inputs.
+Intermittent demand used to be far worse, and is the case the wall-flux attribution and the axial
+modes carry together. Booking each parcel's heat over the bins it actually occupied, at the
+positions it occupied, a 100 mm line idle 8 hours a day delivers water 26 % of the contrast past the
+soil at one mode, 8 % at two, and under 1 % at the six-mode default
+(:ref:`assumption-uniform-wall-flux`). Reading the flux off the delivered water instead put the same
+case at 20--28 % and made refining worse rather than better, and on sharper duty cycles --- a main
+flushed two hours in every 24, a line standing ten days --- it reached 8.8 times the contrast,
+converged and unflagged. The standing line now comes back within half a kelvin of the range of its
+inputs, and the flushed main --- six pipe volumes through in a single hourly bin --- carries its
+range in the leading modes alone and is refused by name at mode counts its bin width cannot drive.
 
 The one-way model (``max_sweeps=1``) has a fixed target and is still the only variant guaranteed
 inside the range of its inputs.
@@ -475,7 +475,7 @@ inside the range of its inputs.
 **What you can do.** Treat any delivered temperature outside the hull of your inputs as carrying this
 overshoot rather than as a physical prediction, and compare against ``max_sweeps=1`` when you need a
 bound that cannot leave the hull. Be most suspicious on branches with a strong duty cycle, where the
-effect is largest --- though refining the pipe now settles it rather than aggravating it.
+effect is largest --- though raising the axial modes now settles it rather than aggravating it.
 
 **How it is checked.** Not at runtime --- the invariant a runtime check would assert is false, and a
 guard that fires on correct physics is worse than none. Its *size* is pinned by a test.
@@ -498,15 +498,16 @@ exchange landed on the few bins of the next morning's flush --- overstated by th
 standing time to the transit. On a line idle 8 hours a day that drove the delivered temperature
 20--28 % of the plant-to-soil contrast past the soil and *grew* when the pipe was refined; on sharper
 duty cycles it reached several times the contrast, converged and unflagged. The corresponding
-excursion is now 7.8 %, and refining settles it.
+excursion is now 26 % of the contrast at one axial mode, 8 % at two and under 1 % at the six-mode
+default, and raising the modes settles it.
 
 **What you can do.** Nothing special. The one case still worth attention is the very first bins of a
 record, where the model assumes the pipe starts in equilibrium with undisturbed soil rather than
 carrying a history it cannot know.
 
 **How it is checked.** By the only test in the suite with zero flow anywhere: it pins the excursion
-under a duty cycle and asserts that refining the pipe reduces it monotonically and brings the answer
-back inside the range of its inputs.
+under a duty cycle at each rung of the mode ladder and asserts that raising the modes brings the
+answer back inside the range of its inputs.
 
 Units
 -----
