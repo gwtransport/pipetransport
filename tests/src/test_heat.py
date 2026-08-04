@@ -1726,7 +1726,10 @@ def test_the_delivered_temperature_overshoots_the_forcing_range_by_a_measured_am
 
     Pinning the size of it is the test that can fail. Loosening it into a range check with a
     few kelvin of slack --- which is what a hand-written pair of literals amounts to --- would
-    pass whether the overshoot were 0.2 K or 4 K.
+    pass whether the overshoot were 0.02 K or 4 K. At six axial modes the excursion on this
+    mild, continuously flowing case is a measured 2.4 % of the step -- the same 1-4 % band
+    the split-pipe adjudication of issue #32 put the resolved limit at, where the classical
+    one-history model paid 18 %.
     """
     tedges = pd.date_range("2025-06-01", periods=40 * 24 + 1, freq="h")
     n = len(tedges) - 1
@@ -1751,38 +1754,21 @@ def test_the_delivered_temperature_overshoots_the_forcing_range_by_a_measured_am
     # side, and there is none on the warm side.
     assert finite.max() <= 45.0 + 1e-9
     excursion = (21.0 - finite.min()) / contrast
-    assert 0.15 < excursion < 0.25, excursion
+    assert 0.015 < excursion < 0.035, excursion
 
-    # Two things bound it. The one-way model has a fixed target and is exactly inside the
-    # hull; and declaring the same pipe as two segments, which refines the flux history the
-    # halo is built from, cuts the excursion severalfold without removing it.
+    # The one-way model has a fixed target and is exactly inside the hull.
     one_way = heat.source_to_endmember(**shared, max_sweeps=1)[0]
     assert np.nanmin(one_way) >= 21.0 - 1e-9
-    halves = PipeNetwork(
-        segments=pd.DataFrame(
-            {
-                "from": ["Plant", "mid"],
-                "to": ["mid", "T1"],
-                "length": [500.0, 500.0],
-                "diameter": [0.1, 0.1],
-                "cover": ["grass", "grass"],
-            },
-            index=["a", "b"],
-        ),
-        source="Plant",
-    )
-    split = heat.source_to_endmember(**{**shared, "network": halves})[0]
-    assert (21.0 - np.nanmin(split)) / contrast < 0.5 * excursion
 
 
 @pytest.mark.parametrize(
     ("label", "diameter", "length", "flow", "ceiling"),
     [
-        # Two hours of flow in every 24, at 0.8 m/s: the running transit is shorter than one
+        # Two hours of flow in every 24, at 0.8 m/s: the running transit is a sixth of a
         # bin, so a delivery-bin flux charges a whole day of exchange to a couple of bins.
-        ("flushed twice a day", 0.4, 500.0, "flush", 1.2),
+        ("flushed twice a day", 0.4, 500.0, "flush", 0.5),
         # Ten days standing, then a normal four-hour transit.
-        ("stagnant for ten days", 0.3, 1000.0, "stagnant", 4.0),
+        ("stagnant for ten days", 0.3, 1000.0, "stagnant", 1.5),
     ],
 )
 def test_intermittent_demand_stays_near_the_range_of_its_inputs(label, diameter, length, flow, ceiling):
@@ -1829,6 +1815,11 @@ def test_intermittent_demand_stays_near_the_range_of_its_inputs(label, diameter,
         network=PipeNetwork(segments=segments, source="Plant"),
         soil=pd.DataFrame([GRASS], index=["grass"]),
         surface_temperature=pd.DataFrame({"grass": np.full(n, hull_hi)}),
+        # The flush shape passes six pipe volumes in a single bin, which supports no
+        # axial modes past the leading few: the delivered range is identical at two,
+        # three and four modes, and the sweep's divergence refusal past that is pinned by
+        # test_a_pipe_flushed_within_a_bin_refuses_the_modes_it_cannot_drive.
+        n_modes=4 if flow == "flush" else 6,
     )
     delivered = heat.source_to_endmember(**shared)
 
@@ -1841,23 +1832,56 @@ def test_intermittent_demand_stays_near_the_range_of_its_inputs(label, diameter,
     assert np.nanmax(np.abs(delivered - one_way)) > 0.1, label
 
 
-def test_stagnation_overshoot_stays_small_and_refining_settles_it(soil):
-    """The excursion under a duty cycle: small, warm-side, and *removed* by refining.
+def test_a_pipe_flushed_within_a_bin_refuses_the_modes_it_cannot_drive():
+    """Axial modes finer than the bin width can drive diverge, and the message says so.
 
-    Standing water is the case the wall flux has to get right. It exchanges heat with the soil
-    for as long as it stands, and the enthalpy budget books that heat into the bins it
-    actually stood in -- a bin with no throughflow still leaks ``-h (H - V Tb)``. Reading the
-    flux off the water a pipe delivers instead would charge a whole idle night to the single
-    bin the water finally left in, overstating it by the ratio of the standing time to the
-    transit; that is what used to drive the delivered temperature a quarter of the contrast
-    past the soil here, and several times the contrast on the shapes in issue #24.
+    The issue #24 flushing main passes six pipe volumes in a single hourly bin. Its axial
+    profile is uniform -- the delivered range is identical at two, three and four modes --
+    but asking for more modes than the bin resolves turns the sweep's reading feedback
+    into amplification, and the honest answer is a refusal naming the segment and the
+    remedies rather than an exhausted cap.
+    """
+    diameter, length = 0.4, 500.0
+    peak = 0.8 * np.pi * (diameter / 2.0) ** 2 * 86400.0
+    demand = np.tile(np.concatenate([np.full(2, peak), np.zeros(22)]), 10)
+    n = len(demand)
+    tedges = pd.date_range("2025-06-01", periods=n + 1, freq="h")
+    segments = pd.DataFrame(
+        {"from": ["Plant"], "to": ["T1"], "length": [length], "diameter": [diameter], "cover": ["grass"]},
+        index=["P"],
+    )
+    with pytest.raises(RuntimeError, match="pipe volumes in a single bin") as raised:
+        heat.source_to_endmember(
+            tin=np.full(n, 8.0),
+            flow=demand[None, :],
+            tedges=tedges,
+            cout_tedges=tedges,
+            network=PipeNetwork(segments=segments, source="Plant"),
+            soil=pd.DataFrame([GRASS], index=["grass"]),
+            surface_temperature=pd.DataFrame({"grass": np.full(n, 22.0)}),
+        )
+    message = str(raised.value)
+    assert "refine tedges" in message.lower() or "lower n_modes" in message.lower(), message
 
-    So the excursion is now small, and -- the discriminating part -- declaring the pipe as a
-    chain of shorter segments *reduces* it monotonically and takes the answer back inside the
-    hull, where it used to grow. A model whose refinement diverges cannot be trusted at any
-    resolution; one that settles can.
 
-    This is also the only configuration in the file with zero flow anywhere, so it is what
+def test_stagnation_overshoot_stays_small_and_raising_the_modes_settles_it(soil):
+    """The excursion under a duty cycle: small at the default, and the modes are why.
+
+    Standing water is the case the wall flux has to get right. It exchanges heat with the
+    soil for as long as it stands, and the moment budgets book that heat into the bins it
+    actually stood in, at the positions it stood at -- a bin with no throughflow still leaks
+    ``-h (y_m - V n_m c_m)`` in every mode. What truncating the axial profile costs is
+    measured by the mode ladder: the classical one-history model delivers water a quarter of
+    the driving contrast past the soil here, two modes cut that to 8 %, and the six-mode
+    default to under 1 % -- the band the Eulerian duty-cycle adjudication of issue #32 put
+    the class truncation at. The discriminating part is the ladder itself: a model whose
+    refinement did not settle could not be trusted at any order.
+
+    Declaring the pipe as shorter segments must then leave the settled answer alone -- the
+    modes already resolve what splitting used to approximate -- and the record opens idle,
+    so this also exercises the running-value warm start end to end.
+
+    This is the only configuration in the file with zero flow anywhere, so it is what
     exercises the stagnation assumption end to end rather than as a statement in the docs.
     """
     days, idle = 6, 8
@@ -1865,7 +1889,7 @@ def test_stagnation_overshoot_stays_small_and_refining_settles_it(soil):
     tedges = pd.date_range("2025-06-01", periods=n + 1, freq="h")
     contrast = 20.0 - 8.0
 
-    def excursion(pieces):
+    def excursion(pieces, n_modes):
         """Warm-side excursion past the soil, as a fraction of the contrast."""
         nodes = ["Plant", *[f"n{i}" for i in range(1, pieces)], "T1"]
         segments = pd.DataFrame(
@@ -1889,16 +1913,18 @@ def test_stagnation_overshoot_stays_small_and_refining_settles_it(soil):
             network=network,
             soil=soil,
             surface_temperature=pd.DataFrame({"grass": np.full(n, 20.0), "paved": np.full(n, 20.0)}),
+            n_modes=n_modes,
         )
         one_way = heat.source_to_endmember(**shared, max_sweeps=1)
         assert np.nanmax(one_way) <= 20.0 + 1e-9, "the one-way model must stay inside its hull"
         return (np.nanmax(heat.source_to_endmember(**shared)) - 20.0) / contrast
 
-    whole, halved, refined = excursion(1), excursion(2), excursion(4)
-    assert 0.05 < whole < 0.11, whole
-    assert halved < whole, (whole, halved)
-    assert refined < halved, (halved, refined)
-    assert refined < 0.0, f"four pieces must bring the delivered temperature back inside the hull: {refined}"
+    one_history, two_modes, default = excursion(1, 1), excursion(1, 2), excursion(1, 6)
+    assert 0.20 < one_history < 0.35, one_history
+    assert 0.04 < two_modes < 0.12, two_modes
+    assert abs(default) < 0.01, default
+    refined = excursion(4, 6)
+    assert abs(refined) < 0.01, f"splitting must leave the settled answer alone: {refined}"
 
 
 def test_the_model_is_linear_in_every_temperature_input(heat_network, hourly_tedges, diurnal_demand, soil, surface):
@@ -2437,6 +2463,9 @@ def test_reverse_tolerates_a_measurement_outage(heat_network, hourly_tedges, diu
         network=heat_network,
         soil=soil,
         surface_temperature=surface(hourly_tedges, amplitude=4.0),
+        # What this tests is the deconvolution around a gap, which the mode count does
+        # not touch; two modes keep the outer-times-inner cost at the old scale.
+        n_modes=2,
     )
     measured = heat.source_to_endmember(tin=tin, **shared)
     gapped = measured.copy()
@@ -2501,6 +2530,10 @@ def test_a_measurement_outage_does_not_corrupt_the_record_around_it():
         network=network,
         soil=pd.DataFrame([GRASS], index=["grass"]),
         surface_temperature=pd.DataFrame({"grass": np.full(n, 20.0)}),
+        # The gap contract is a deconvolution property; two modes and a tight tolerance
+        # keep the no-gap premise at the 1e-8 sharpness it was calibrated on.
+        n_modes=2,
+        atol=1e-9,
     )
     measured = heat.source_to_endmember(tin=tin, **shared)
     gap = slice(96, 168)

@@ -396,30 +396,38 @@ adequacy of the lead-in, the bin width and the trench spacing is your modelling 
 How far along a pipe the wall flux is resolved
 ----------------------------------------------
 
-**Assumption.** The wall flux is uniform along a pipe, and each pipe keeps one soil memory. That is
-the model's spatial resolution along a pipe; there is no parameter, and nothing is subdivided
-internally.
+**Assumption.** The wall flux along a pipe is carried in its leading axial Legendre modes ---
+``n_modes`` of them, six by default --- and each mode keeps its own soil memory. The count is the
+model's spatial resolution along a pipe, a model order like a mesh; nothing is subdivided
+internally, and one mode is the classical uniform-flux model.
 
 **Why it matters.** Because the soil columns are independent, the flux is a *local* quantity, and it
 falls along a pipe like :math:`e^{-h_e \tau}` --- by a factor 1.6 over a 2 h transit on a 100 mm
-service line, and 3.8 over 6 h. Charging the whole pipe with one average flux history therefore gives
-every parcel in it the same soil memory. Under 24 h diurnal forcing at hourly bins that is worth
-about 0.07 K over a 2 h transit and 0.5 K over 6 h on a 100 mm line. It is not a bin-resolution
-question that a finer ``tedges`` would answer: it is a *spatial* one.
+service line, and 3.8 over 6 h. Charging the whole pipe with one average flux history gives every
+parcel in it the same soil memory: under 24 h diurnal forcing at hourly bins that is worth about
+0.07 K over a 2 h transit and 0.5 K over 6 h on a 100 mm line, and under an overnight duty cycle it
+delivers water a quarter of the water--soil contrast past the soil. It is not a bin-resolution
+question that a finer ``tedges`` would answer: it is a *spatial* one, and the modes answer it.
 
-**What you can do.** Declare the pipe as a chain of shorter segments. That is exact in the transport
-it does not touch --- :math:`k` series pieces of volume :math:`V/k` at the same flow compose to the
-same arrival map, and their exchange exponents add to the whole pipe's, so ``W``, the residence times
-and the coverage mask are unchanged to round-off and only the soil memory is refined.
+**What the modes are worth, in numbers.** On the duty-cycled 100 mm line --- standing 8 h a night,
+the shape the uniform flux gets most wrong --- the delivered excursion past the soil falls from
+26 % of the contrast at one mode through 8 % at two to under 1 % at the six-mode default. Measured
+against an Eulerian reference that keeps a full axial grid, the six-mode class truncation on that
+duty cycle is about 2 % of the contrast, and steadily flowing pipes sit at the comparison's own
+0.01 K discretisation floor from two modes on. Runtime grows roughly linearly with the count.
 
-**How many pieces are enough.** The cost falls roughly as the square of the per-piece coupling
-:math:`h_e \tau / n`: on the 100 mm line above, the 6 h gap falls 0.5, 0.12, 0.03, 0.01 K over 1, 2,
-4, 8 pieces. Keeping :math:`h_e \tau` per piece under about 0.3 holds the assumption below roughly
-one percent of the water--soil contrast. Refining is safe under stagnation too: the enthalpy budget
-books a standing pipe's flux into the bins the water stands in whatever the piece count, so on the
-issue-#24 duty cycles --- a main flushed 2 h in every 24, a line standing 22 h a day --- 1 and 16
-pieces agree to 0.15 K. (Under the earlier delivery-bin flux, refining a stagnating pipe amplified
-the flux fed to the halo instead of resolving it; that mechanism went with the attribution.)
+**What splitting still is.** Declaring the pipe as a chain of shorter segments remains exact in the
+transport --- :math:`k` series pieces of volume :math:`V/k` at the same flow compose to the same
+arrival map, so ``W``, the residence times and the coverage mask are unchanged to round-off --- but
+it buys the soil memory nothing the modes do not already resolve: on the duty cycle above the
+six-mode answer moves by under a percent of the contrast when the pipe is split in four.
+
+**The one resolution limit left.** A pipe flushed *several volumes in a single bin* --- the
+issue-#24 main pushing six volumes through per hourly bin --- cannot drive axial modes finer than
+the bin width, and asking for them turns the sweep's feedback into amplification. The sweep refuses
+that configuration by name; its delivered range is carried by the leading modes alone, so lowering
+``n_modes`` for such a geometry, or refining ``tedges`` until the transit spans a bin, are both
+exact answers rather than concessions.
 
 **How it is checked.** Not checked --- there is no parameter to validate. That one flux history per
 pipe is an approximation, and that refining it converges, are pinned by tests against an

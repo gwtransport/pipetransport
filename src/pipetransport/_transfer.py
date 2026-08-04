@@ -865,17 +865,15 @@ class _WeightedBasis:
             (base_lo + extra_lo, base_hi + extra_hi),
             (base_lo + extra_lo + self.rate * lag_lo, base_hi + extra_hi + self.rate * lag_hi),
         )
-        out = None
+        out = np.zeros((n_powers + 1, *np.broadcast_shapes(np.shape(base_lo), np.shape(base_hi))))
         for (phi_lo, phi_hi), weight in zip(exponents, self.weight_lag, strict=True):
             basis = _CellBasis(phi_lo, phi_hi)
             coef = self._compose(basis, weight, lag_lo, lag_hi)
             offset, slope = basis.affine(qty_lo, qty_hi)
-            table = np.empty((n_powers + 1, *offset.shape))
             for m in range(n_powers + 1):
-                table[m] = basis.mean(coef)
+                out[m] += basis.mean(coef)
                 if m < n_powers:
                     coef = _affine_multiply(coef, offset, slope)
-            out = table if out is None else out + table
         return out
 
 
@@ -1380,14 +1378,14 @@ def paths_transfer(
         # Snapshot rows keep one fixed position in every depth's slabs (the stored order is
         # shared), so the per-depth quantities their snapshots need are captured as row
         # slices during the loop and assembled afterwards.
-        snap_pos = snap_stash = None
-        if snapshot_rows is not None and len(snapshot_rows):
-            snapshot_rows = np.asarray(snapshot_rows, dtype=np.intp)
+        snap_pos = None
+        snap_rows = np.zeros(0, dtype=np.intp) if snapshot_rows is None else np.asarray(snapshot_rows, dtype=np.intp)
+        snap_depth = path_depth[snap_rows] - 1
+        snap_stash: list[dict[str, npt.NDArray]] = []
+        if snap_rows.size:
             pos_of_row = np.empty(n_nodes, dtype=np.intp)
             pos_of_row[order] = np.arange(n_nodes)
-            snap_pos = pos_of_row[snapshot_rows]
-            snap_depth = path_depth[snapshot_rows] - 1
-            snap_stash: list[dict[str, npt.NDArray]] = []
+            snap_pos = pos_of_row[snap_rows]
         exit_read, entry_read, position_exit, position_mid, position_entry = [], [], [], [], []
         bin_entry, bin_exit, bin_mid, segment_of = [], [], [], []
         for depth in range(max_depth):
@@ -1520,7 +1518,7 @@ def paths_transfer(
             bin_exit.append(exit_bin)
             bin_mid.append(chunk_start)
             segment_of.append(segs)
-            if snap_stash is not None:
+            if snap_rows.size:
                 snap_stash.append({
                     "s_lo": s_lo,
                     "s_hi": s_hi,
@@ -1550,7 +1548,7 @@ def paths_transfer(
             # only. A cell contributes to the unique chunk-start edge inside its traversal
             # -- either its exit chunk's start, or its exit bin itself when that bin opens
             # a chunk -- and every stored exponent is the decay accrued up to that anchor.
-            n_snap = len(snapshot_rows)
+            n_snap = snap_rows.size
             top = n_modes - 1
             shape4 = (n_modes, n_modes, n_snap, n_cells)
             alive = np.zeros((n_snap, n_cells), dtype=bool)
@@ -1563,16 +1561,16 @@ def paths_transfer(
             own_entry = np.zeros(shape4)
             own_pos_mid = np.zeros(shape4)
             own_pos_entry = np.zeros(shape4)
-            up_exit = [np.zeros(shape4) for _ in range(max_depth)]
-            up_entry = [np.zeros(shape4) for _ in range(max_depth)]
-            up_pos_exit = [np.zeros(shape4) for _ in range(max_depth)]
-            up_pos_mid = [np.zeros(shape4) for _ in range(max_depth)]
-            up_pos_entry = [np.zeros(shape4) for _ in range(max_depth)]
+            up_exit: list[npt.NDArray[np.floating]] = [np.zeros(shape4) for _ in range(max_depth)]
+            up_entry: list[npt.NDArray[np.floating]] = [np.zeros(shape4) for _ in range(max_depth)]
+            up_pos_exit: list[npt.NDArray[np.floating]] = [np.zeros(shape4) for _ in range(max_depth)]
+            up_pos_mid: list[npt.NDArray[np.floating]] = [np.zeros(shape4) for _ in range(max_depth)]
+            up_pos_entry: list[npt.NDArray[np.floating]] = [np.zeros(shape4) for _ in range(max_depth)]
             flat = np.zeros(n_cells)
             for r in range(n_snap):
                 own = int(snap_depth[r])
                 pos = int(snap_pos[r])
-                orig = int(snapshot_rows[r])
+                orig = int(snap_rows[r])
                 st = {key: value[pos] for key, value in snap_stash[own].items()}
                 seg = int(paths_idx[orig, own])
                 kdt_e = float(segment_decay[seg]) * dt0
@@ -1732,7 +1730,7 @@ def paths_transfer(
                 covered = np.bincount(a_idx[live], weights=label_width[orig][live], minlength=n_cin + 1)
                 anchor_valid[r] = np.abs(covered - segment_volume[seg]) <= _COVERAGE_TOLERANCE * segment_volume[seg]
             snapshots = SnapshotTerms(
-                segment=paths_idx[snapshot_rows, np.maximum(snap_depth, 0)],
+                segment=paths_idx[snap_rows, np.maximum(snap_depth, 0)],
                 row_pos=snap_pos,
                 own_depth=snap_depth,
                 alive=alive,
@@ -2155,7 +2153,7 @@ def network_transfer(
     # makes its own path's warm start infinite -- so one closed tap leaves the other nodes
     # their padding. np.where rather than multiplying by `active`, because inf * 0 is NaN.
     with np.errstate(divide="ignore"):
-        ratio = volume / network.segment_flow(flow=demand)[:, 0]
+        ratio = volume / network.segment_flow(flow=_running_start(demand)[:, None])[:, 0]
     per_path = np.sum(np.where(active, ratio[paths_idx], 0.0), axis=1)
 
     tedges, demand, n_pad = resolve_spinup(spinup, tedges=tedges, flow=demand, warm_start_days=per_path)
@@ -2172,6 +2170,30 @@ def network_transfer(
     return requested, transfer, n_pad
 
 
+def _running_start(flow: npt.NDArray[np.floating]) -> npt.NDArray[np.floating]:
+    """Each endmember's first running demand -- what its warm start holds.
+
+    A record that opens flowing warm-starts at its first observed value, as it always has.
+    A record that opens *idle* has nothing at its first value to fill the pipes with, yet
+    it opens on water that must have been delivered somehow; its warm start holds the
+    first demand the record actually shows. An endmember that never flows keeps its
+    (zero) first value and its path falls through to strict validity as before.
+
+    Parameters
+    ----------
+    flow : ndarray
+        Endmember demand of shape ``(n_endmembers, n_cin)``.
+
+    Returns
+    -------
+    ndarray
+        One demand per endmember.
+    """
+    first_running = np.argmax(flow > 0.0, axis=1)
+    lead = flow[np.arange(len(flow)), first_running]
+    return np.where((flow > 0.0).any(axis=1), lead, flow[:, 0])
+
+
 def resolve_spinup(
     spinup: str | None,
     *,
@@ -2182,9 +2204,12 @@ def resolve_spinup(
     """Validate the ``spinup`` policy and prepend the warm-start bins it implies.
 
     ``"constant"`` extends the record backwards far enough to cover the longest path that can
-    usefully be warm-started, holding every endmember demand at its first observed value, so
-    the earliest output bins are fed by a defined (if assumed) history instead of coming back
-    NaN. A path is discarded as a candidate when its warm start is undefined -- a zero or
+    usefully be warm-started, holding every endmember demand at its first *running* value --
+    the first observed one for a record that opens flowing, the first nonzero one for a
+    record that opens idle -- so the earliest output bins are fed by a defined (if assumed)
+    history instead of coming back NaN. The idle case matters most for the heat pair: a
+    record opening on standing water otherwise opens on an unseeded content state, and the
+    first flow resumption books a violent record-opening transient. A path is discarded as a candidate when its warm start is undefined -- a zero or
     non-finite leading flow -- or when the padding it implies is so long that a constant
     history is not a meaningful assumption; those paths keep their strict-validity NaN. Both
     judgements are made **per path**, so one stagnant or unreachably deep branch costs only
@@ -2243,5 +2268,6 @@ def resolve_spinup(
         return tedges, flow, 0
     offsets = pd.TimedeltaIndex(bin_width * np.arange(n_pad, 0, -1))
     padded_tedges = (tedges[0] - offsets).append(tedges)
-    padded_flow = np.concatenate([np.repeat(flow[:, :1], n_pad, axis=1), flow], axis=1)
+    lead = _running_start(flow)
+    padded_flow = np.concatenate([np.repeat(lead[:, None], n_pad, axis=1), flow], axis=1)
     return padded_tedges, padded_flow, n_pad
