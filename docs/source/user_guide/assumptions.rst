@@ -396,34 +396,44 @@ adequacy of the lead-in, the bin width and the trench spacing is your modelling 
 How far along a pipe the wall flux is resolved
 ----------------------------------------------
 
-**Assumption.** The wall flux is uniform along a pipe, and each pipe keeps one soil memory. That is
-the model's spatial resolution along a pipe; there is no parameter, and nothing is subdivided
-internally.
+**Assumption.** The wall flux along a pipe is carried in its leading axial Legendre modes ---
+``n_modes`` of them, six by default --- and each mode keeps its own soil memory. The count is the
+model's spatial resolution along a pipe, a model order like a mesh; nothing is subdivided
+internally, and one mode is the classical uniform-flux model.
 
 **Why it matters.** Because the soil columns are independent, the flux is a *local* quantity, and it
 falls along a pipe like :math:`e^{-h_e \tau}` --- by a factor 1.6 over a 2 h transit on a 100 mm
-service line, and 3.8 over 6 h. Charging the whole pipe with one average flux history therefore gives
-every parcel in it the same soil memory. Under 24 h diurnal forcing at hourly bins that is worth
-about 0.5--0.9 K on a 100 mm line. It is not a bin-resolution question that a finer ``tedges`` would
-answer: it is a *spatial* one.
+service line, and 3.8 over 6 h. Charging the whole pipe with one average flux history gives every
+parcel in it the same soil memory: under 24 h diurnal forcing at hourly bins that is worth about
+0.07 K over a 2 h transit and 0.5 K over 6 h on a 100 mm line, and under an overnight duty cycle it
+delivers water a quarter of the water--soil contrast past the soil. It is not a bin-resolution
+question that a finer ``tedges`` would answer: it is a *spatial* one, and the modes answer it.
 
-**What you can do.** Declare the pipe as a chain of shorter segments. That is exact in the transport
-it does not touch --- :math:`k` series pieces of volume :math:`V/k` at the same flow compose to the
-same arrival map, and their exchange exponents add to the whole pipe's, so ``W``, the residence times
-and the coverage mask are unchanged to round-off and only the soil memory is refined.
+**What the modes are worth, in numbers.** On the duty-cycled 100 mm line --- standing 8 h a night,
+the shape the uniform flux gets most wrong --- the delivered excursion past the soil falls from
+26 % of the contrast at one mode through 8 % at two to under 1 % at the six-mode default. Measured
+against an Eulerian reference that keeps a full axial grid, the six-mode class truncation on that
+duty cycle is about 2 % of the contrast, and steadily flowing pipes sit at the comparison's own
+0.01 K discretisation floor from two modes on. Runtime grows roughly linearly with the count.
 
-**Check that it settles when you do.** Under continuous flow it does: on a 2 km / 100 mm line the
-per-doubling steps fall about fourfold (0.21, 0.058, 0.014, 0.0034 K). Under intermittent demand it
-does **not**. On the same pipe drawing 11 h a day the steps are 2.39, 3.14, 2.61, 2.31 K, and deeper
-stagnation diverges outright --- at 2 h a day, 1 against 16 pieces differ by 818 K and the call still
-returns without raising. The mechanism is that :math:`\psi = Q (T_\text{in} - T_\text{out}) / L`
-saturates at the full parcel-to-wall contrast after a stagnation however short the piece is, so
-refining amplifies the flux fed to the halo instead of resolving it. Refine only where the branch
-flows continuously, and read a moving answer as a warning rather than as progress.
+**What splitting still is.** Declaring the pipe as a chain of shorter segments remains exact in the
+transport --- :math:`k` series pieces of volume :math:`V/k` at the same flow compose to the same
+arrival map, so ``W``, the residence times and the coverage mask are unchanged to round-off --- but
+it buys the soil memory nothing the modes do not already resolve: on the duty cycle above the
+six-mode answer moves by under a percent of the contrast when the pipe is split in four.
+
+**The one resolution limit left.** A pipe flushed *several volumes in a single bin* --- the
+issue-#24 main pushing six volumes through per hourly bin --- cannot drive axial modes finer than
+the bin width, and asking for them turns the sweep's feedback into amplification. The sweep refuses
+that configuration by name; its delivered range is carried by the leading modes alone, so lowering
+``n_modes`` for such a geometry, or refining ``tedges`` until the transit spans a bin, are both
+exact answers rather than concessions.
 
 **How it is checked.** Not checked --- there is no parameter to validate. That one flux history per
-pipe is an approximation, and that refining it converges under continuous flow, are pinned by tests
-against an independently written reference which keeps one soil memory per axial cell.
+pipe is an approximation, and that refining it converges, are pinned by tests against an
+independently written reference which keeps one soil memory per axial cell; on a shared time grid
+the two collapse onto each other, so the residual between them is the comparison's discretisation
+rather than unattributed physics (issue #32).
 
 
 .. _assumption-effective-target:
@@ -444,20 +454,20 @@ plus transient deficit*, not an artefact.
 delivered temperature is a genuine weighted average of the produced water and those targets, **it can
 fall outside the range of its own inputs**, and there is no general bound on by how much.
 
-A step in the produced temperature into a *continuously flowing* pipe is the mild case: 18 % of the
-instantaneous plant-to-soil contrast --- 4.3 K on a 100 mm line after a 24 K step --- peaking 1.9
-transits after the step and back inside the range after about nine days. Splitting the pipe
-(:ref:`assumption-uniform-wall-flux`) into a chain of shorter segments cuts that to 1--4 %.
+A step in the produced temperature into a *continuously flowing* pipe is the mild case: 2.4 % of the
+instantaneous plant-to-soil contrast at the six-mode default --- 0.6 K on a 100 mm line after a 24 K
+step --- where the classical one-history model paid 18 %.
 
-Intermittent demand used to be far worse, and is the case the wall-flux attribution was changed for.
-Booking each parcel's heat over the bins it actually occupied rather than over the single bin it was
-delivered in, a 100 mm line idle 8 hours a day delivers water 7.8 % of the contrast past the soil,
-and resolving the pipe now *helps*: the excursion falls monotonically and is back inside the range at
-two pieces (--3.8 %) and four (--10.3 %). Reading the flux off the delivered water instead put the
-same case at 20--28 % and made refining worse rather than better, and on sharper duty cycles --- a
-main flushed two hours in every 24, a line standing ten days --- it reached 8.8 times the contrast,
-converged and unflagged. Those shapes now come back within about a kelvin of the range of their
-inputs.
+Intermittent demand used to be far worse, and is the case the wall-flux attribution and the axial
+modes carry together. Booking each parcel's heat over the bins it actually occupied, at the
+positions it occupied, a 100 mm line idle 8 hours a day delivers water 26 % of the contrast past the
+soil at one mode, 8 % at two, and under 1 % at the six-mode default
+(:ref:`assumption-uniform-wall-flux`). Reading the flux off the delivered water instead put the same
+case at 20--28 % and made refining worse rather than better, and on sharper duty cycles --- a main
+flushed two hours in every 24, a line standing ten days --- it reached 8.8 times the contrast,
+converged and unflagged. The standing line now comes back within half a kelvin of the range of its
+inputs, and the flushed main --- six pipe volumes through in a single hourly bin --- carries its
+range in the leading modes alone and is refused by name at mode counts its bin width cannot drive.
 
 The one-way model (``max_sweeps=1``) has a fixed target and is still the only variant guaranteed
 inside the range of its inputs.
@@ -465,7 +475,7 @@ inside the range of its inputs.
 **What you can do.** Treat any delivered temperature outside the hull of your inputs as carrying this
 overshoot rather than as a physical prediction, and compare against ``max_sweeps=1`` when you need a
 bound that cannot leave the hull. Be most suspicious on branches with a strong duty cycle, where the
-effect is largest --- though refining the pipe now settles it rather than aggravating it.
+effect is largest --- though raising the axial modes now settles it rather than aggravating it.
 
 **How it is checked.** Not at runtime --- the invariant a runtime check would assert is false, and a
 guard that fires on correct physics is worse than none. Its *size* is pinned by a test.
@@ -488,15 +498,16 @@ exchange landed on the few bins of the next morning's flush --- overstated by th
 standing time to the transit. On a line idle 8 hours a day that drove the delivered temperature
 20--28 % of the plant-to-soil contrast past the soil and *grew* when the pipe was refined; on sharper
 duty cycles it reached several times the contrast, converged and unflagged. The corresponding
-excursion is now 7.8 %, and refining settles it.
+excursion is now 26 % of the contrast at one axial mode, 8 % at two and under 1 % at the six-mode
+default, and raising the modes settles it.
 
 **What you can do.** Nothing special. The one case still worth attention is the very first bins of a
 record, where the model assumes the pipe starts in equilibrium with undisturbed soil rather than
 carrying a history it cannot know.
 
 **How it is checked.** By the only test in the suite with zero flow anywhere: it pins the excursion
-under a duty cycle and asserts that refining the pipe reduces it monotonically and brings the answer
-back inside the range of its inputs.
+under a duty cycle at each rung of the mode ladder and asserts that raising the modes brings the
+answer back inside the range of its inputs.
 
 Units
 -----

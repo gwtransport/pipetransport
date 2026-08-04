@@ -29,28 +29,46 @@ piecewise-constant inputs and two of the three in closed form:
   the same ``1/(D**2 ln D)``-flavoured diameter law as chlorine wall decay: service lines
   equilibrate much faster than trunk mains.
 
+The wall flux is carried as its leading axial Legendre modes per pipe -- ``n_modes`` of
+them, six by default (issue #32). The soil columns along a pipe are independent and the
+memory kernel is the same at every position, so a flux held in a few fixed shapes keeps its
+memory in the same shapes: one deficit convolution per mode replaces an axial grid, the
+higher modes entering the parcel reading as polynomial components of the target profile, in
+the same closed cell forms as the mean. Mode 0 alone is the classical one-history model this
+package carried before, and the count is a model order like a mesh rather than a tuning
+knob.
+
 The two-way coupling is a fixed point of two vectorized passes (one transport evaluation,
-one convolution per segment). Sweep 1 relaxes toward the undisturbed soil temperature at
-the steady buried-pipe rate -- exactly the classical one-way model, returned by
-``max_sweeps=1``; every further sweep shifts the targets by the deficit convolution of the
-latest wall-flux history. Two choices make that iteration usable. The relaxation rate keeps
-the *steady* resistance (folding the lag-0 deficit into an early-time resistance -- the
-borehole-model move -- lands 5-20 % below the analytic steady buried-pipe law). And the wall
-flux of a bin is the segment's own enthalpy budget over it, so each parcel's heat is booked
-into the bins it actually occupied. Water that stands still exchanges heat for as long as it
-stands, and a bin with no throughflow still leaks ``-h (H - V Tb)``; charging that to the
-single bin the water finally left in would overstate it by the ratio of the standing time to
-the transit, which under intermittent demand runs to several times the driving contrast.
+one deficit convolution per segment and mode). Sweep 1 relaxes toward the undisturbed soil
+temperature at the steady buried-pipe rate -- exactly the classical one-way model, returned
+by ``max_sweeps=1``; every further sweep shifts the targets by the deficit convolutions of
+the latest flux-mode histories. Two choices make that iteration usable. The relaxation
+rate keeps the *steady* resistance (folding the lag-0 deficit into an early-time resistance
+-- the borehole-model move -- lands 5-20 % below the analytic steady buried-pipe law). And
+the flux modes of a bin are the segment's own moment budgets over it, so each
+parcel's heat is booked into the bins it actually occupied, at the positions it occupied.
+Water that stands still exchanges heat for as long as it stands, and a bin with no
+throughflow still leaks ``-h (H - V Tb)``; charging that to the single bin the water finally
+left in would overstate it by the ratio of the standing time to the transit, which under
+intermittent demand runs to several times the driving contrast.
 
 That attribution also makes convergence a property of the model rather than of the
 configuration. Every path through the sweep is causal in time and runs upstream to downstream
-within a bin, so the iteration matrix is block lower triangular and its eigenvalues are the
-same-bin gains ``Dbar[0] V (1 - exp(-h dt)) / (L dt)``, strictly below one for every geometry
-and every bin width. The sweep count grows as ``1/(1 - g)`` as the bins narrow -- 58 to 567
-sweeps over the configurations in the ``Validity`` notes -- which is the opposite trade from a
-flux read off the delivered water: that one grew cheaper on fine bins precisely by mis-timing
-the heat of standing water. The whole model stays linear in the produced water temperature
-and the surface temperatures, so the reverse problem reuses the existing banded solver.
+within a bin, so the iteration matrix is block lower triangular and its same-bin gains
+``Dbar[0] V (1 - exp(-h dt)) / (L dt)`` sit strictly below one for every geometry and every
+bin width -- for every mode alike, because the projection onto the shapes is idempotent. The
+reading sensitivities on top of that slow the plain iteration to a crawl on wide trunks, so
+the sweep extrapolates over its last few iterates exactly as the reverse direction does
+(Anderson; the map is affine), which holds the count to a few tens of sweeps; the
+convergence test reads the plain residual, so the answer is the map's own fixed point. The
+one regime past the extrapolation is a pipe flushed several volumes per *bin*, whose modes
+finer than the bin width can drive feed back faster than the sweep damps them; the sweep
+refuses it by name rather than returning an unconverged answer. Numerically, the moment
+recursions restart at chunk anchors from content moments read off the transport operator
+itself, so a rounding error in the state cannot ride the advective shear coupling across
+the halo memory -- what lets six modes hold round-off accuracy at every coupling strength
+and record length. The whole model stays linear in the produced water temperature and the
+surface temperatures, so the reverse problem reuses the existing banded solver.
 
 Units
 -----
@@ -98,36 +116,35 @@ Validity
   the same-bin loop gain no margin at all. That ratio sets the sweep count and how far the
   fixed point sits from singular, so the swap cuts the sweep count severalfold as well:
   100 against 286 on the example network, 159 against 660 on a 400 mm main.
-- **One wall-flux history per pipe.** The soil columns along a pipe are independent and the
-  wall flux falls along it like ``exp(-h tau)`` -- by a factor 1.6 over a 2 h transit on a
-  100 mm service line -- but the model gives every parcel in a pipe the same soil memory.
-  That is the model's spatial resolution along a pipe, and it is a stated assumption rather
-  than a parameter. Measured against a reference that keeps one memory per axial cell, it is
-  worth 0.08 K on a 100 mm line at a 2 h transit and 0.53 K at 6 h, under 24 h diurnal
-  forcing at hourly bins. Refining ``tedges`` does not reduce it; it is a property of the
-  transit.
-
-  Declare a pipe as a chain of shorter segments if you need it resolved -- splitting is
-  exact for the transport, which is unchanged to round-off by it. The gap closes steeply at
-  the first refinement (to 0.03-0.05 K at four pieces) and then flattens onto a floor more
-  pieces do not move; issue #32 tracks both removing the assumption and attributing that
-  floor.
+- **Six axial modes per pipe (the default).** The wall flux falls along a pipe like
+  ``exp(-h tau)`` -- by a factor 1.6 over a 2 h transit on a 100 mm service line -- and the
+  model resolves that profile in its leading Legendre modes. What it truncates is the
+  profile past the highest mode, a stated model order with no tuning parameter, and the
+  mode ladder measures it. Flowing steadily, two modes already sit at the 0.01 K floor the
+  adjudicating comparison's own sub-stepping leaves on shared grids (0.008 K on a 100 mm
+  line at a 2 h transit). Under an overnight duty cycle -- the case one history gets badly
+  wrong -- the delivered excursion past the soil falls from 26 % of the driving contrast
+  at one mode through 8 % at two to under 1 % at the default, the band the Eulerian
+  duty-cycle adjudication of issue #32 puts the class truncation at (2 % of contrast for
+  six modes against a fully resolved axial grid). Declaring a pipe as series pieces buys
+  nothing the modes do not already resolve; it remains exact for the transport.
 - The relaxation target is an *effective driving temperature*, not a wall temperature. The
   rate keeps the steady soil resistance, which overstates the resistance while the halo is
   still developing, so the target has to be pushed past the undisturbed soil to reproduce
   the faster early exchange -- measured excursions of several times the driving contrast in
-  the bins after a sharp change in the wall flux. The delivered temperature is a weighted
-  average of ``tin`` and those targets, so it can leave the range of its own inputs. Only
-  ``max_sweeps=1`` is guaranteed inside it. A step in ``tin`` into a *continuously flowing*
-  pipe is the mild case: 18 % of the instantaneous plant-to-soil contrast, 1.9 transits after
-  the step, back inside the range after nine days, falling to 1-4 % once the pipe is split.
-  Intermittent demand is the harder one, and is where the flux attribution earns its keep: a
-  line idle 8 h a day now delivers water 7.8 % of the contrast past the soil, and splitting
-  the pipe brings it back *inside* the range (-3.8 % at two pieces, -10.3 % at four). Reading
-  the flux off the delivered water instead put the same case at 20-28 % and made splitting
-  worse rather than better, and on the shapes in issue #24 -- a main flushed 2 h in every 24,
-  a line standing ten days -- it reached 8.8 times the contrast, converged and unflagged.
-  Those now come back within about a kelvin of the range of their inputs.
+  the bins after a sharp change in the wall flux, and larger per mode as the profile
+  sharpens. The delivered temperature is a weighted average of ``tin`` and those targets,
+  so it can leave the range of its own inputs; only ``max_sweeps=1`` is guaranteed inside
+  it. At the six-mode default the share that reaches the delivered water is small. A step
+  in ``tin`` into a *continuously flowing* pipe: 2.4 % of the instantaneous plant-to-soil
+  contrast, where the classical one-history model paid 18 %. A line idle 8 h a day, the
+  case the flux attribution and the modes carry together: under 1 % of the contrast past
+  the soil, from 26 % at one mode and 8 % at two. On the harder shapes of issue #24, a
+  line standing ten days delivers within half a kelvin of the range of its inputs, where
+  a delivered-water flux attribution once reached 8.8 times the contrast, converged and
+  unflagged; and the main flushed 2 h in every 24 -- six pipe volumes through in a single
+  bin -- carries its range in the leading modes alone and is refused by name at mode
+  counts its bin width cannot drive.
 
   Wide pipes on short bins were once worse than any of this: with the line-source halo a
   400 mm main at a half-hour transit came back spanning -88 to +78 C from water produced at
@@ -162,7 +179,11 @@ from scipy.special import erfc, erfcx, exp1, j1, y1
 
 from pipetransport._transfer import (
     NetworkTransfer,
+    _e_table,
+    _legendre_monomial,
+    _running_start,
     apply_banded,
+    apply_content_snapshots,
     apply_segment_targets,
     pad_paths,
     paths_transfer,
@@ -196,10 +217,11 @@ _DIVERGENCE_STEPS = 5
 # and from 30-minute to 2-hour bins at fixed coupling. Coupling: at transits of a few bins or
 # more the radius crosses one near h*tau = 0.7 (0.92 at 0.50 and 1.10 at 0.75 on a 100 mm
 # main; a 400 mm main crosses nearer 1.0), the excess is broad-band, and no Anderson window
-# recovers it. Transit: a segment that empties in about a bin leaves the deconvolution nearly
-# singular at the fastest alternation the record carries whatever the coupling -- radius 21 at
-# h*tau = 0.11 for a 100 mm main at a half-bin transit -- while transits of 1.5 bins and more
-# leave only isolated resonant modes above one, which the extrapolation still reaches.
+# recovers it. Transit: on the one-history model a segment that emptied in about a bin left
+# the deconvolution nearly singular at the fastest alternation the record carries whatever
+# the coupling (radius 21 at h*tau = 0.11 for a 100 mm main at a half-bin transit); the
+# advected mode kernels tamed that map -- the same pipe now reconstructs to 5e-8 K -- and
+# the transit diagnosis remains for configurations that still reach it.
 _COUPLING_LIMIT = 0.7
 _SHORT_TRANSIT_BINS = 1.5
 
@@ -766,19 +788,24 @@ def segment_heat_rate(
 class _HeatSystem(NamedTuple):
     """Everything the Picard loop reads, built once per call.
 
-    Every per-segment array is indexed by the user's own pipes: one row each, carrying one
-    wall-flux history, which is the model's spatial resolution along a pipe.
+    Every per-segment array is indexed by the user's own pipes: one row each, carrying the
+    ``n_modes`` axial Legendre moments of one wall-flux profile -- the modes that are the
+    model's spatial resolution along a pipe.
 
-    ``internal`` holds three rows per segment, all binned on that pipe's own deliveries: the
-    delivered temperature, the same reading weighted by ``exp(-h (t_end - t))``, and that
-    weighted reading taken at the pipe's entry instead. The first closes the advective half of
-    the bin's enthalpy budget and the other two close its storage half; see
-    :func:`_update_targets`.
+    ``internal`` holds ``4 n_modes - 1`` rows per segment, all binned on that pipe's own
+    deliveries: the delivered temperature, its readings against the time-moment weights
+    ``(t_end - t)**p exp(-h (t_end - t))`` for ``p < n_modes`` and against their running
+    integrals for ``p < n_modes - 1``, and the same two weighted families taken at the
+    pipe's entry. The plain reading closes the advective part of every bin's moment
+    budgets, the time-moment family closes the exact bin update of the moment hierarchy,
+    and the integrated family closes the bins' time-integrated content, which the flux
+    moments read; see :func:`_update_targets`.
     """
 
     nodes: tuple[str, ...]
     n_pad: int
     n_bins: int
+    n_modes: int
     dt_days: float
     t_inf: npt.NDArray[np.floating]
     dbar_spectrum: npt.NDArray[np.complexfloating]
@@ -786,7 +813,12 @@ class _HeatSystem(NamedTuple):
     seg_flow: npt.NDArray[np.floating]
     length: npt.NDArray[np.floating]
     volume: npt.NDArray[np.floating]
+    rate: npt.NDArray[np.floating]
     rho: npt.NDArray[np.floating]
+    theta: npt.NDArray[np.floating]
+    nmat: npt.NDArray[np.floating]
+    bin_moment: npt.NDArray[np.floating]
+    bin_integrated: npt.NDArray[np.floating]
     parent: npt.NDArray[np.intp]
     held_slope: npt.NDArray[np.floating]
     held_offset: npt.NDArray[np.floating]
@@ -809,6 +841,7 @@ def _build_system(
     kappa_pipe: float | pd.Series | None,
     film_coefficient: float | pd.Series | None,
     spinup: str | None,
+    n_modes: int,
 ) -> _HeatSystem:
     """Validate the shared inputs and build the operators, targets and kernels once.
 
@@ -891,7 +924,7 @@ def _build_system(
     volume = segments["volume"].to_numpy(dtype=float)
     seg_of = {name: e for e, name in enumerate(segments.index)}
     with np.errstate(divide="ignore"):
-        ratio = volume / network.segment_flow(flow=demand)[:, 0]
+        ratio = volume / network.segment_flow(flow=_running_start(demand)[:, None])[:, 0]
     end_paths, end_active = pad_paths([
         np.array([seg_of[name] for name in network.paths[node]], dtype=np.intp) for node in network.endmembers
     ])
@@ -953,14 +986,18 @@ def _build_system(
         """
         return np.array([seg_of[name] for name in network.paths[node]], dtype=np.intp)
 
-    # Internal rows, three per segment and all binned on that pipe's own deliveries. A bin's
-    # enthalpy budget needs the water it delivered, and -- because the storage term integrates
-    # against the exchange -- the same reading and its inflow counterpart weighted by
-    # ``exp(-h (t_end - t))``. The inflow rows run to the pipe's entry node, so a root segment
-    # reads its own source series across an empty path.
+    # Internal rows, ``4 n_modes - 1`` per segment and all binned on that pipe's own
+    # deliveries. Every bin's moment budgets need the water it delivered, the exact bin
+    # update of the moment hierarchy reads both faces against the time-moment weights
+    # ``(t_end - t)**p exp(-h (t_end - t))``, and the flux moments read the bins'
+    # time-integrated content through the running integrals of the same kernels. The
+    # inflow rows run to the pipe's entry node, so a root segment reads its own source
+    # series across an empty path.
     entry_chains = [chain(str(segments.loc[name, "from"])) for name in segments.index]
     delivery = [np.concatenate([up, [e]]).astype(np.intp) for e, up in enumerate(entry_chains)]
-    int_paths, int_active = pad_paths(delivery + delivery + entry_chains)
+    specs = [(0.0, 0, False)] + [(1.0, p, False) for p in range(n_modes)] + [(1.0, p, True) for p in range(n_modes - 1)]
+    entry_specs = specs[1:]
+    int_paths, int_active = pad_paths(delivery * len(specs) + entry_chains * len(entry_specs))
     rep_paths, rep_active = pad_paths([chain(node) for node in requested])
     rep_flow = network.node_flow(flow=demand_p, nodes=requested)
 
@@ -970,6 +1007,10 @@ def _build_system(
         node_flow: npt.NDArray[np.floating],
         cout: npt.NDArray[np.floating],
         bin_end_rate: npt.NDArray[np.floating] | None,
+        bin_end_power: npt.NDArray[np.integer] | None = None,
+        bin_end_integrated: npt.NDArray[np.bool_] | None = None,
+        snapshot_rows: npt.NDArray[np.intp] | None = None,
+        bin_end_scale: npt.NDArray[np.floating] | None = None,
     ) -> NetworkTransfer:
         return paths_transfer(
             tedges_days=tedges_days,
@@ -981,7 +1022,12 @@ def _build_system(
             paths_idx=paths_idx,
             active=active,
             bin_end_rate=bin_end_rate,
+            bin_end_power=bin_end_power,
+            bin_end_integrated=bin_end_integrated,
             with_target_terms=True,
+            n_target_modes=n_modes,
+            snapshot_rows=snapshot_rows,
+            bin_end_scale=bin_end_scale,
         )
 
     rho = np.exp(-rate * dt_days)
@@ -1004,7 +1050,8 @@ def _build_system(
     with np.errstate(divide="ignore"):
         # A pipe the record opens idle has an infinite transit, so it holds water that has
         # already settled onto the soil and carries no excess: exp(-inf) is the right zero.
-        settled = np.exp(-rate * volume / seg_flow[:, 0])
+        theta = rate * volume / seg_flow[:, 0]
+        settled = np.exp(-theta)
     entry_slope, entry_offset = np.ones(n_seg), np.zeros(n_seg)
     # One pass from the source outward; the loop is over path depth, which is what orders it.
     for e in sorted(range(n_seg), key=lambda seg: entry_chains[seg].size):
@@ -1012,11 +1059,30 @@ def _build_system(
         if upstream >= 0:
             entry_slope[e] = entry_slope[upstream] * settled[upstream]
             entry_offset[e] = t_inf[upstream, 0] + (entry_offset[upstream] - t_inf[upstream, 0]) * settled[upstream]
-    held = seg_flow[:, 0] * (1.0 - settled) / rate
+    # The settled profile's Legendre moments: the excess ``exp(-theta sigma)`` integrates
+    # against the monomials to the E-family, so every mode's opening content is
+    # ``V sum_i lam[m, i] E_i(theta)`` times the entry contrast. Exact at ``theta = inf``
+    # (an idle opening holds no excess anywhere), where the E-family is exactly zero.
+    lam = _legendre_monomial(n_modes)
+    held = volume * np.einsum("mi,ie->me", lam, _e_table(n_modes - 1, theta))
+    # The advected time moments of one bin: the internal operator's kernels carry
+    # ``((t_end - t) q_bin / V)**p``, so the mass of the p-th reading over a bin is
+    # ``theta**p dt E_p(h dt)`` -- the ``theta**p`` joins per bin in the update, and this
+    # holds the base ``dt E_p``. The running integrals' base is its first difference.
+    bin_moment = float(dt_days) * _e_table(n_modes, rate * dt_days)
+    nmat = np.zeros((n_modes, n_modes))
+    for m in range(n_modes):
+        for i in range(m):
+            if (m - i) % 2 == 1:
+                nmat[m, i] = 2.0 * (2 * i + 1)
+    weight_rate = np.concatenate([np.zeros(n_seg) if r == 0.0 else rate for r, _, _ in specs + entry_specs])
+    weight_power = np.concatenate([np.full(n_seg, p) for _, p, _ in specs + entry_specs])
+    weight_integrated = np.concatenate([np.full(n_seg, g, dtype=bool) for _, _, g in specs + entry_specs])
     return _HeatSystem(
         nodes=requested,
         n_pad=n_pad,
         n_bins=n_bins,
+        n_modes=n_modes,
         dt_days=dt_days,
         t_inf=t_inf,
         dbar_spectrum=rfft(dbar, n=halo_length, axis=1),
@@ -1024,7 +1090,12 @@ def _build_system(
         seg_flow=seg_flow,
         length=length,
         volume=volume,
+        rate=rate,
         rho=rho,
+        theta=seg_flow * dt_days / volume[:, None],
+        nmat=nmat,
+        bin_moment=bin_moment[: n_modes + 1],
+        bin_integrated=dt_days * (bin_moment[:n_modes] - bin_moment[1 : n_modes + 1]),
         parent=parent,
         held_slope=held * entry_slope,
         held_offset=held * (entry_offset - t_inf[:, 0]),
@@ -1033,7 +1104,17 @@ def _build_system(
         h_tau=rate * volume / np.where(running > 0.0, running, np.nan),
         segment_names=tuple(str(name) for name in segments.index),
         internal=build(
-            int_paths, int_active, np.vstack([seg_flow] * 3), tedges_days, np.concatenate([np.zeros(n_seg), rate, rate])
+            int_paths,
+            int_active,
+            np.vstack([seg_flow] * len(specs + entry_specs)),
+            tedges_days,
+            weight_rate,
+            weight_power,
+            weight_integrated,
+            # The plain delivery rows lead the layout, one per segment: the content
+            # snapshots that restart the moment recursions are built on their cells.
+            snapshot_rows=np.arange(n_seg, dtype=np.intp),
+            bin_end_scale=np.tile(volume, len(specs) + len(entry_specs)),
         ),
         reporting=build(rep_paths, rep_active, rep_flow, cout_days, None),
     )
@@ -1048,11 +1129,11 @@ def _converge_targets(
     initial: npt.NDArray[np.floating] | None = None,
     fabricated: npt.NDArray[np.bool_] | None = None,
 ) -> npt.NDArray[np.floating]:
-    """Iterate the relaxation targets to their fixed point for one source series.
+    """Iterate the relaxation target modes to their fixed point for one source series.
 
     Sweep 1 is the undisturbed soil -- the one-way model -- and each further sweep replaces
-    the halo with the one implied by the latest flux history. The map contracts by the
-    deficit share of the resistance, so the iterate converges geometrically.
+    the halo with the one implied by the latest flux-moment histories. The map contracts by
+    the deficit share of the resistance, so the iterate converges geometrically.
 
     Parameters
     ----------
@@ -1065,40 +1146,104 @@ def _converge_targets(
     atol : float
         Tolerance on the target increment, absolute, in the unit of the temperatures.
     initial : ndarray or None, optional
-        Starting targets. ``None`` (default) starts from the undisturbed field, which is
-        the one-way model; the reverse direction warm-starts from its previous outer
-        iterate instead. That saves only a few per cent of the sweeps until the outer
-        iterate is close, which is why the reverse direction also loosens ``atol`` in step
-        with its own increment.
+        Starting mode stack of shape ``(n_modes, n_seg, n_bins)``. ``None`` (default)
+        starts from the undisturbed field with no axial variation, which is the one-way
+        model; the reverse direction warm-starts from its previous outer iterate instead.
 
     Returns
     -------
     ndarray
-        Per-segment relaxation targets of shape ``(n_seg, n_bins)``.
+        Per-segment target modes of shape ``(n_modes, n_seg, n_bins)``: mode 0 the
+        relaxation target, the higher modes its axial Legendre components.
 
     Raises
     ------
     RuntimeError
         If the increment is still above the tolerance when the cap is reached.
     """
+    shape = (system.n_modes, *system.t_inf.shape)
+    resting = np.zeros(shape)
+    resting[0] = system.t_inf
     if max_sweeps == 1:
-        return system.t_inf
+        return resting
     # An absolute tolerance, not a relative one. Normalising the increment by the iterate's
     # own scale loosens the test exactly when the iteration is misbehaving -- a state wrong by
     # 1e20 K passes a relative test on itself -- and it makes the answer depend on whether the
     # caller works in Celsius or in kelvin, which an affine model must not.
-    targets = system.t_inf if initial is None else initial
+    state = np.ravel(resting if initial is None else initial)
     # The transport reading of the source series is the same in every sweep; only the bias
     # follows the iterate.
     transported = apply_banded(system.internal, tin_padded)
+    # The sweep map is affine and contracts, but its slowest mode crawls when a wide pipe's
+    # first lag bin holds most of the soil resistance, so the loop extrapolates over its last
+    # few iterates exactly as the reverse direction does (Anderson; on an affine map a Krylov
+    # method). The convergence test reads the plain residual, so the fixed point returned is
+    # the map's own, not the extrapolation's.
+    history: list[tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]] = []
+    increment, best, growing = np.inf, np.inf, 0
     for _ in range(max_sweeps - 1):
-        updated = _update_targets(system, _internal_pass(system, transported, targets), targets, tin_padded, fabricated)
-        increment = float(np.max(np.abs(updated - targets)))
-        targets = updated
+        modes = state.reshape(shape)
+        readings = _internal_pass(system, transported, modes)
+        updated = _update_targets(system, readings, modes, tin_padded, fabricated)
+        mapped = np.ravel(updated)
+        residual = mapped - state
+        previous, increment = increment, float(np.max(np.abs(residual)))
         if increment <= atol:
-            return targets
-    msg = f"the two-way fixed point did not converge within max_sweeps={max_sweeps}; raise max_sweeps or atol"
-    raise RuntimeError(msg)
+            return updated
+        # A residual that keeps growing is the wrong regime, not a slow start: a segment
+        # flushed several volumes per bin asks the sweep for axial modes the bin width
+        # cannot drive, and their reading feedback outruns the same-bin damping. Catch it
+        # while the numbers are finite and say which segment and what helps.
+        growing = growing + 1 if increment > previous else 0
+        best = min(best, increment)
+        if (growing >= _DIVERGENCE_STEPS and increment > 100.0 * best) or not np.isfinite(increment):
+            raise RuntimeError(_sweep_failure(system, previous, increment))
+        history.append((state, residual))
+        del history[: -(_ANDERSON_DEPTH + 1)]
+        state = mapped
+        if len(history) > 1:
+            past = np.column_stack([r for _, r in history])
+            steps = np.column_stack([x for x, _ in history])
+            gamma = np.linalg.lstsq(np.diff(past, axis=1), residual, rcond=None)[0]
+            state = mapped - (np.diff(steps, axis=1) + np.diff(past, axis=1)) @ gamma
+    raise RuntimeError(_sweep_failure(system, previous, increment, exhausted=max_sweeps))
+
+
+def _sweep_failure(system: _HeatSystem, previous: float, increment: float, exhausted: int | None = None) -> str:
+    """Explain a forward sweep that will not reach its fixed point.
+
+    Parameters
+    ----------
+    system : _HeatSystem
+        Prebuilt system, read for the segment that flushes fastest.
+    previous, increment : float
+        The last two sweep residuals.
+    exhausted : int or None, optional
+        The sweep budget, when the loop ran out rather than being cut short by the
+        divergence test. Default None.
+
+    Returns
+    -------
+    str
+        Message naming the regime when there is one to name, and the remedy that works.
+    """
+    ran_out = f" within max_sweeps={exhausted}" if exhausted is not None else ""
+    head = (
+        f"the two-way fixed point did not converge{ran_out}: the sweep residual went "
+        f"{previous:.3e} -> {increment:.3e}. "
+    )
+    spans = np.nanmax(system.theta, axis=1)
+    fastest = int(np.nanargmax(spans)) if np.isfinite(spans).any() else 0
+    if spans[fastest] > 1.0:
+        return head + (
+            f"Segment {system.segment_names[fastest]!r} passes {spans[fastest]:.1f} pipe "
+            f"volumes in a single bin at its peak flow, and axial modes finer than the "
+            f"bin width can drive feed back through the halo faster than the sweep damps "
+            f"them. Refine tedges until every transit spans about a bin or more, or lower "
+            f"n_modes for this geometry -- the delivered range of a pipe flushed within a "
+            f"bin is carried by the leading modes alone."
+        )
+    return head + "Raise max_sweeps or atol."
 
 
 def _diverged_message(system: _HeatSystem, previous: float, increment: float, exhausted: int | None = None) -> str:
@@ -1159,9 +1304,11 @@ def _diverged_message(system: _HeatSystem, previous: float, increment: float, ex
 
 
 def _internal_pass(
-    system: _HeatSystem, transported: npt.NDArray[np.floating], targets: npt.NDArray[np.floating]
+    system: _HeatSystem,
+    transported: npt.NDArray[np.floating],
+    modes: npt.NDArray[np.floating],
 ) -> npt.NDArray[np.floating]:
-    """Read the three internal temperatures, NaN where the record does not constrain them.
+    """Read the internal temperatures, NaN where the record does not constrain them.
 
     Parameters
     ----------
@@ -1170,17 +1317,18 @@ def _internal_pass(
     transported : ndarray
         Reading of the internal operator on the source series, ``apply_banded(system.internal,
         tin_padded)``. It does not depend on the targets, so the sweep loop hoists it out.
-    targets : ndarray
-        Current per-segment relaxation targets.
+    modes : ndarray
+        Current per-segment target modes, shape ``(n_modes, n_seg, n_bins)``.
 
     Returns
     -------
     ndarray
-        The three readings of every segment stacked, shape ``(3 * n_seg, n_bins)``: the
-        delivered temperature, the same reading weighted toward the bin end, and that
-        weighted reading taken at the pipe's entry.
+        The ``4 n_modes - 1`` readings of every segment stacked, shape
+        ``((4 n_modes - 1) n_seg, n_bins)``: the plain delivery, the time-moment and
+        integrated-kernel weighted deliveries, and the two weighted families at the
+        pipe's entry; see :class:`_HeatSystem`.
     """
-    t_int = transported + apply_segment_targets(system.internal, targets)
+    t_int = transported + apply_segment_targets(system.internal, modes)
     t_int[~system.internal.valid_out] = np.nan
     return t_int
 
@@ -1188,111 +1336,259 @@ def _internal_pass(
 def _update_targets(
     system: _HeatSystem,
     t_int: npt.NDArray[np.floating],
-    targets: npt.NDArray[np.floating],
+    modes: npt.NDArray[np.floating],
     tin_padded: npt.NDArray[np.floating],
     fabricated: npt.NDArray[np.bool_] | None = None,
 ) -> npt.NDArray[np.floating]:
-    """One flux-and-halo pass: internal temperatures -> new per-segment targets.
+    """One flux-and-halo pass: internal temperatures -> new per-segment target modes.
 
-    The wall flux of a bin is the segment's own enthalpy budget over it,
-    ``psi = (H[j] - H[j+1] + Q dt (T_in - T_out)) / (L dt)``, with the water content ``H``
-    advanced by the exact solution of ``dH/dt = Q (T_in - T_out) - h (H - V Tb)`` over a bin
-    of constant flow and target,
+    The wall-flux profile of a bin is the segment's own budget over it, one Legendre
+    moment at a time. The content moments ``y_m = V int P_m(2 sigma - 1) (T - T_ref)
+    dsigma`` obey the lower-triangular system
 
-        ``H[j+1] = rho H[j] + Q dt (D_in[j] - D_out[j]) + V (1 - rho) Tb[j]``,
+        ``dy/dt = (-h I + (q/V) N) y + f(t)``,
+        ``f_m = -q ((T_out - T_ref) - (-1)**m (T_in - T_ref)) + h V n_m ctil_m``,
 
-    where ``D`` is the inflow or outflow temperature averaged against ``exp(-h (t_end - t))``
-    -- the two weighted rows of the internal operator -- and ``rho = exp(-h dt)``. Because a
-    parcel's heat release over any interval *is* its temperature drop there, this books each
-    parcel's heat into the bins it actually occupied instead of the single bin it was
-    delivered in, which is what keeps water that has been standing from charging a whole
-    night's exchange to one bin. Content is carried relative to the undisturbed field so the
-    difference stays free of cancellation at absolute temperature, and the record telescopes
-    exactly: nothing is booked that the water did not carry.
+    with ``N`` the constant Legendre derivative coupling, ``n_m = 1/(2m + 1)`` the shape
+    norms and ``ctil`` the target modes (mode 0 relative to the reference). ``N`` is
+    nilpotent, so the exact update over a bin of constant flow and modes is
 
-    Stagnation needs no special case -- ``Q = 0`` drops the advective terms and the pipe still
-    leaks ``-h (H - V Tb)`` into the halo, which is the whole point: a bin with no throughflow
-    books its storage term like any other. What contributes zero flux is the spin-up prefix,
-    and a bin whose readings the record does not constrain -- the undisturbed-soil assumption
-    applied at bin resolution.
+        ``y[j+1] = rho e**(theta N) y[j]
+        + sum_p (N**p/p!) (q/V)**p [-q (Wout_p - pi0 Win_p) + h V (n ctil) m_p]``,
 
-    A bin's own target moves that bin's storage term and the lag-0 deficit brings it straight
-    back, so the sweep has a same-bin gain of about ``Dbar[0] V (1 - rho) / (L dt)``, which is
-    strictly below one because ``Dbar[0] < R_total`` and ``(1 - exp(-h dt)) / (h dt) < 1``.
-    The target also moves that bin's own readings -- a parcel relaxes toward it for the part
-    of the bin it spends in the pipe -- which adds ``Dbar[0] Q dt (a - b) / (L dt)`` with
-    ``a``, ``b`` the sensitivities of the plain and weighted delivery readings. That term is
-    smaller than the first by of order ``h dt / 2`` and is what the measured gains below
-    include; it is the reason they are quoted as measured rather than derived.
-    Every other path through the map is strictly causal in time and runs strictly from
-    upstream to downstream within a bin, so the iteration matrix is block lower triangular and
-    its eigenvalues *are* those same-bin gains: the sweep contracts for every geometry and
-    every bin width, rather than only where the flux happened to be small. The price is that
-    the gain approaches one as the bins narrow, so the sweep count grows as ``1/(1 - g)`` --
-    the opposite trade from a flux read off the delivered water, which grew cheaper on fine
-    bins by charging standing water's heat to the bin it happened to leave in.
+    where ``Wface_p`` are the faces read against the time-moment weights
+    ``(t_end - t)**p exp(-h (t_end - t))`` -- the moment rows of the internal operator --
+    and ``m_p = dt**(p+1) E_p(h dt)`` their masses. The flux moments then telescope,
+
+        ``Psi_m L dt = y_m[j] - y_m[j+1] - q dt ((T_out)_dev - pi0_m (T_in)_dev)
+        + (q/V) (N @ int_y)_m``,
+
+    with the bins' time-integrated content assembled the same way from the readings
+    against the *running integrals* of the moment kernels -- the integrated rows -- so no
+    ``1/(h dt)`` ever divides a small difference: the weak-coupling noise floor the old
+    two-moment form paid for reconstructing in-bin means is gone. Because a parcel's heat
+    release over any interval *is* its temperature drop there, this books each parcel's
+    heat into the bins it actually occupied, at the positions it occupied. The
+    flux-moment increments convolve with the per-segment deficit kernel into the next
+    target modes, ``ctil_m = -(Dbar * da_m)`` with ``a_m = (2m + 1) Psi_m``: shapes pass
+    through the per-column soil memory unchanged.
+
+    Stagnation needs no special case -- ``q = 0`` drops every advective term and each
+    moment still leaks ``-h (y_m - V n_m ctil_m)``, the standing profile relaxing toward
+    its target shape. A bin whose readings the record does not constrain books the
+    model's own opening assumption instead: the water it delivers is settled onto the
+    undisturbed soil, so its readings are replaced by the undisturbed field times each
+    kernel's weight mass. That keeps the advective replacement of the opening water in
+    the budget -- dropping those bins' terms instead mis-books a first-transit flux by
+    the size of the standing contrast, and the halo memory's ``1/t`` tail drags that
+    error through days of record. What still contributes zero flux is the spin-up prefix,
+    and the bins whose flux the reverse direction suppresses to probe its dependence on
+    invented data.
+
+    A bin's own mode moves that bin's storage term and the lag-0 deficit brings it
+    straight back, so the sweep has a same-bin gain of about
+    ``Dbar[0] V (1 - rho) / (L dt)`` -- for every mode alike, because the projection onto
+    the shapes is idempotent -- which is strictly below one; every other path through the
+    map is causal in time and runs upstream to downstream within a bin, so the iteration
+    contracts for every geometry and every bin width. The price is that the gain
+    approaches one as the bins narrow, so the sweep count grows as ``1/(1 - g)``.
 
     Parameters
     ----------
     system : _HeatSystem
         Prebuilt operators and kernels.
     t_int : ndarray
-        The three internal readings from :func:`_internal_pass`.
-    targets : ndarray
-        Targets the readings were taken at; the same-bin solve needs them.
+        The internal readings from :func:`_internal_pass`.
+    modes : ndarray
+        Target modes the readings were taken at, shape ``(n_modes, n_seg, n_bins)``; the
+        same-bin storage terms need them.
     tin_padded : ndarray
         Source temperature on the padded input grid, the inflow of every root segment.
     fabricated : ndarray of bool or None, optional
-        Bins whose flux is to be suppressed, treated exactly like a bin the record does not
-        constrain. ``None`` (default) suppresses nothing.
+        Bins whose flux is to be suppressed -- the reverse direction's dependence probe.
+        ``None`` (default) suppresses nothing.
 
     Returns
     -------
     ndarray
-        Updated per-segment relaxation targets, shape ``(n_seg, n_bins)``.
+        Updated per-segment target modes, shape ``(n_modes, n_seg, n_bins)``.
+
+    Raises
+    ------
+    RuntimeError
+        If the internal operator carries no target terms or snapshots, which no public
+        entry point can produce.
     """
     n_seg = len(system.length)
-    t_out, d_out, d_in = t_int[:n_seg], t_int[n_seg : 2 * n_seg], t_int[2 * n_seg :]
+    n_modes = system.n_modes
+    dt = system.dt_days
+    blocks = t_int.reshape(4 * n_modes - 1, n_seg, -1)
+    plain_out = blocks[0]
+    mom_out, g_out = blocks[1 : 1 + n_modes], blocks[1 + n_modes : 2 * n_modes]
+    mom_in, g_in = blocks[2 * n_modes : 3 * n_modes], blocks[3 * n_modes :]
+
+    # The settled substitution: readings the record does not constrain carry the model's
+    # own opening assumption -- settled water at the undisturbed soil temperature, whose
+    # weighted readings are the field times each kernel's weight mass. The entry faces
+    # read the parent's field; a root segment's entry rows are always constrained.
+    parent_field = system.t_inf[np.maximum(system.parent, 0)]
+    theta_raw = [np.ones_like(system.theta)]
+    for _ in range(n_modes):
+        theta_raw.append(theta_raw[-1] * system.theta)
+    moment_mass = [theta_raw[p] * (system.bin_moment[p][:, None] / dt) for p in range(n_modes)]
+    integral_mass = [theta_raw[p] * (system.bin_integrated[p][:, None] / dt) for p in range(n_modes - 1)]
+    for block_set, field, masses in (
+        ((plain_out,), system.t_inf, [np.ones_like(system.theta)]),
+        (mom_out, system.t_inf, moment_mass),
+        (g_out, system.t_inf, integral_mass),
+        (mom_in, parent_field, moment_mass),
+        (g_in, parent_field, integral_mass),
+    ):
+        for block, mass in zip(block_set, masses, strict=True):
+            hole = ~np.isfinite(block)
+            if hole.any():
+                block[hole] = (field * mass)[hole]
+
     # A split leaves temperature unchanged and both flows are constant over a bin, so the
     # water entering a pipe is what its parent delivered; a root segment is fed the source.
-    t_in = np.where(system.parent[:, None] >= 0, t_out[system.parent], tin_padded)
+    t_in = np.where(system.parent[:, None] >= 0, plain_out[system.parent], tin_padded)
 
-    # The warm-start prefix is a fabricated hydraulic history, so it drives neither the wall
-    # flux nor the water the pipe is holding when the record opens: the record starts with the
-    # pipe in equilibrium with the undisturbed soil. That initial condition belongs to the
-    # model rather than to the caller's data, which is what lets the forward and the reverse
-    # direction agree about it -- the reverse cannot reconstruct a prefix no measurement
-    # constrains, and does not have to.
-    usable = np.zeros_like(t_out, dtype=bool)
+    # The warm-start prefix is a fabricated hydraulic history, so it drives neither the
+    # wall flux nor the water the pipes hold when the record opens: that initial condition
+    # belongs to the model, which is what lets the forward and the reverse direction agree
+    # about it. The reverse direction's suppressed bins are excluded the same way.
+    usable = np.zeros((n_seg, blocks.shape[-1]), dtype=bool)
     usable[:, system.n_pad :] = True
     usable &= ~(np.zeros_like(usable) if fabricated is None else fabricated)
     flowing = usable & (system.seg_flow > 0.0)
-    for reading in (t_in, t_out, d_in, d_out):
-        flowing &= np.isfinite(reading)
-    carried = system.seg_flow * system.dt_days
-    advected = np.where(flowing, carried * (t_in - t_out), 0.0)
-    storage = system.volume[:, None] * (1.0 - system.rho)[:, None] * (targets - system.t_inf[:, :1])
-    forcing = np.where(flowing, carried * (d_in - d_out), 0.0) + np.where(usable, storage, 0.0)
 
-    # The record opens with the pipes holding the warm start's own water; see _build_system.
-    # With no warm start there is no prior state to carry, and the leading bins are
-    # unconstrained anyway, so the slice is simply absent.
-    if system.n_pad:
-        forcing[:, system.n_pad - 1] += system.held_slope * tin_padded[0] + system.held_offset
+    t_ref = system.t_inf[:, :1]
+    vol = system.volume[:, None]
+    rate = system.rate[:, None]
+    carried = system.seg_flow * dt
+    pi0 = (-1.0) ** np.arange(n_modes)
+    norm = 1.0 / (2.0 * np.arange(n_modes) + 1.0)
+    factorial = np.cumprod(np.concatenate([[1.0], np.arange(1.0, n_modes + 1.0)]))
+    npow = [np.eye(n_modes)]
+    for _ in range(1, n_modes):
+        npow.append(npow[-1] @ system.nmat)
+    ctil = modes.copy()
+    ctil[0] -= t_ref
 
-    content = np.zeros_like(forcing)
-    for e in range(n_seg):
-        content[e] = lfilter([1.0], [1.0, -system.rho[e]], forcing[e])
-    psi = (np.concatenate([np.zeros((n_seg, 1)), content[:, :-1]], axis=1) - content + advected) / (
-        system.length[:, None] * system.dt_days
-    )
-    # The prefix sets the state the record opens from; it is not part of the record's flux
-    # history. Its own forcing is already zero, but the step onto that state would otherwise
-    # register as heat drawn from the soil in the bin before the record starts.
-    psi[:, : system.n_pad] = 0.0
-    dpsi = np.diff(psi, axis=1, prepend=0.0)
-    spectrum = rfft(dpsi, n=system.halo_length, axis=1) * system.dbar_spectrum
-    return system.t_inf - irfft(spectrum, n=system.halo_length, axis=1)[:, : system.n_bins]
+    # The per-bin drivers, as mode-vectors per kernel order: the faces in deviations from
+    # the reference times the bin width, and the modes' own storage with the kernel's
+    # weight mass. The advective parts carry the flow, so a standing bin keeps only the
+    # storage leak; NaN outside the usable region is masked before it can propagate.
+    def drivers(
+        face_out: npt.NDArray[np.floating],
+        face_in: npt.NDArray[np.floating],
+        masses: list[npt.NDArray[np.floating]],
+    ) -> npt.NDArray[np.floating]:
+        """Assemble ``B_p[m]`` for one kernel family.
+
+        Parameters
+        ----------
+        face_out, face_in : ndarray
+            Advected-kernel readings of the two faces, stacked per kernel order.
+        masses : list of ndarray
+            Weight mass of each kernel per segment and bin, over the bin width.
+
+        Returns
+        -------
+        ndarray
+            Drivers of shape ``(n_kernels, n_modes, n_seg, n_bins)``.
+        """
+        out = np.empty((len(face_out), n_modes, n_seg, blocks.shape[-1]))
+        for p in range(len(face_out)):
+            fo = np.where(flowing, system.seg_flow * dt * (face_out[p] - t_ref * masses[p]), 0.0)
+            fi = np.where(flowing, system.seg_flow * dt * (face_in[p] - t_ref * masses[p]), 0.0)
+            storage = np.where(usable, rate * vol * dt * masses[p] * ctil, 0.0)
+            for m in range(n_modes):
+                out[p, m] = -fo + pi0[m] * fi + norm[m] * storage[m]
+        return out
+
+    drive = drivers(mom_out, mom_in, moment_mass)
+    drive_int = drivers(g_out, g_in, integral_mass)
+
+    # The exact bin update, mode by mode: the coupling is strictly lower triangular, so
+    # each mode reads only already-updated histories and is one forgetting scan. The
+    # record opens with the pipes holding the warm start's own settled water, seeded per
+    # mode; with no warm start there is no prior state to carry.
+    # The content snapshots at the chunk anchors: the recursions restart from them, so
+    # a rounding error in the state can never ride the advective shear coupling for more
+    # than one chunk -- the polynomial error growth that coupling composes to over the
+    # decay memory is what set the old high-mode noise floor. The corrections propagate
+    # through plain forgetting factors only, because each mode is corrected before the
+    # next one's coupling reads it. Anchors inside the warm-start prefix, or whose
+    # in-pipe water the record does not fully cover, keep the free-running state.
+    terms = system.internal.target_terms
+    if terms is None or terms.snapshots is None:
+        msg = "the internal operator must carry target terms and content snapshots; this is a bug, please report it"
+        raise RuntimeError(msg)
+    snap_abs, snap_unit = apply_content_snapshots(system.internal, modes, tin_padded)
+    snapshot = snap_abs - t_ref[None] * snap_unit
+    snap_valid = terms.snapshots.anchor_valid & (np.arange(snapshot.shape[-1])[None, :] > system.n_pad)
+    chunk_start = terms.chunk_edge[:, 1:].astype(np.intp)
+    into_end = terms.rho_into[:, 1:]
+    into_start = into_end / system.rho[:, None]
+
+    theta_gated = np.where(flowing, system.theta, 0.0)
+    theta_pow = [np.ones_like(theta_gated)]
+    for _ in range(1, n_modes):
+        theta_pow.append(theta_pow[-1] * theta_gated)
+    q_over_v_dt = theta_gated / dt
+    y_end = np.zeros((n_modes, n_seg, blocks.shape[-1]))
+    y_start = np.zeros_like(y_end)
+    for m in range(n_modes):
+        forcing = np.zeros((n_seg, blocks.shape[-1]))
+        for p in range(n_modes):
+            for i in range(n_modes):
+                if npow[p][m, i] != 0.0:
+                    forcing += (npow[p][m, i] / factorial[p]) * drive[p, i]
+        for p in range(1, m + 1):
+            for i in range(n_modes):
+                if npow[p][m, i] != 0.0:
+                    forcing += system.rho[:, None] * (npow[p][m, i] / factorial[p]) * theta_pow[p] * y_start[i]
+        if system.n_pad:
+            forcing[:, system.n_pad - 1] += system.held_slope[m] * tin_padded[0] + system.held_offset[m]
+        free = np.empty((n_seg, blocks.shape[-1]))
+        for e in range(n_seg):
+            free[e] = lfilter([1.0], [1.0, -system.rho[e]], forcing[e])
+        free_edge = np.concatenate([np.zeros((n_seg, 1)), free], axis=1)
+        delta = np.where(snap_valid, free_edge - snapshot[m], 0.0)
+        delta_start = np.take_along_axis(delta, chunk_start, axis=1)
+        y_end[m] = free - into_end * delta_start
+        y_start[m] = free_edge[:, :-1] - into_start * delta_start
+
+    # The bins' time-integrated content, from the same drivers against the running
+    # integrals of the kernels: every term bounded, no small-denominator assembly.
+    int_y = np.zeros_like(y_end)
+    gated_mass = [np.where(flowing, dt * moment_mass[p], 0.0) if p else dt * moment_mass[0] for p in range(n_modes)]
+    for m in range(n_modes):
+        for p in range(n_modes - 1):
+            for i in range(n_modes):
+                if npow[p][m, i] != 0.0:
+                    int_y[m] += (npow[p][m, i] / factorial[p]) * (gated_mass[p] * y_start[i] + drive_int[p, i])
+
+    # The flux moments telescope; their increments convolve with the deficit kernel into
+    # the next target modes. The prefix sets the state the record opens from and is not
+    # part of the record's flux history: the step onto that state would otherwise register
+    # as heat drawn from the soil before the record starts.
+    dev_out = np.where(flowing, carried * (plain_out - t_ref), 0.0)
+    dev_in = np.where(flowing, carried * (t_in - t_ref), 0.0)
+    flux = np.empty_like(y_end)
+    for m in range(n_modes):
+        budget = y_start[m] - y_end[m] - (dev_out - pi0[m] * dev_in)
+        for i in range(n_modes):
+            if system.nmat[m, i] != 0.0:
+                budget += system.nmat[m, i] * q_over_v_dt * int_y[i]
+        flux[m] = (2 * m + 1) * budget / (system.length[:, None] * dt)
+        flux[m, :, : system.n_pad] = 0.0
+    increments = np.diff(flux, axis=2, prepend=0.0)
+    spectrum = rfft(increments, n=system.halo_length, axis=2) * system.dbar_spectrum
+    shift = -irfft(spectrum, n=system.halo_length, axis=2)[:, :, : system.n_bins]
+    shift[0] += system.t_inf
+    return shift
 
 
 def source_to_endmember(
@@ -1308,8 +1604,9 @@ def source_to_endmember(
     nodes: list[str] | tuple[str, ...] | None = None,
     kappa_pipe: float | pd.Series | None = None,
     film_coefficient: float | pd.Series | None = None,
+    n_modes: int = 6,
     max_sweeps: int = 5000,
-    atol: float = 1e-9,
+    atol: float = 1e-7,
     spinup: str | None = "constant",
 ) -> npt.NDArray[np.floating]:
     """Compute the delivered water temperature at each reporting node.
@@ -1359,28 +1656,45 @@ def source_to_endmember(
     film_coefficient : float or pandas.Series or None, optional
         Water-side film coefficient [m/day]; see :func:`segment_heat_rate`. Default None
         (film not limiting).
+    n_modes : int, optional
+        Axial Legendre modes of each pipe's wall-flux profile -- the model's spatial
+        resolution along a pipe, a model order like a mesh rather than a tuning knob.
+        1 is the classical one-history model, whose truncation under intermittent
+        demand reaches a quarter of the driving contrast; 6 (default) resolves an
+        overnight-stagnation profile to under 1 % of it. The bin width bounds what the
+        count can buy: a segment flushed more than about a pipe volume per bin cannot
+        drive modes finer than the bin resolves, and asking for them is refused by name
+        with the two remedies that work -- fewer modes for that geometry, or finer
+        ``tedges``. Runtime and memory grow with the count -- see ``max_sweeps`` for the
+        measured costs -- so a study that only needs the classical behaviour can ask
+        for less. Default 6.
     max_sweeps : int, optional
         Iteration cap. 1 is the one-way model. The sweep count is a property of the physics,
         not of the record length: it is set by how much of the steady soil resistance the
         first lag bin still holds, ``Dbar[0] / R_soil``, which rises toward 1 for wide pipes
-        on short bins. A hundred or two is typical (100 on the example network at
-        hourly bins, unchanged from 30 days of record to a year), and a 400 mm main run at a
-        0.5 m/s design velocity on hourly bins needs about 160. Exceeding the cap
-        raises rather than returning an unconverged answer. Default 5000.
+        on short bins. A hundred or two is typical. Exceeding the cap
+        raises rather than returning an unconverged answer, and a configuration whose sweep
+        genuinely diverges -- a pipe flushed several volumes per bin at a mode count its
+        bin width cannot drive -- is refused by name well before the cap. Default 5000.
 
-        The working set is the operator, and it scales with the record rather than with the
-        sweeps: measured on the example network at hourly bins, the peak is 1.3 MiB per day
-        of record -- 39 MiB over a month, 462 MiB over a year -- so a year of hourly data on
-        a network of this size is comfortable, and a network ten times larger is not.
+        The working set is the operator's stored cell factors, and it scales with the
+        record and roughly with the square of the mode count rather than with the sweeps:
+        measured on the example network at hourly bins, the peak is about 120 MiB per day
+        of record at the six-mode default (a month solves in a minute within 4 GiB) and
+        about 40 MiB per day at two modes. A year of hourly data wants either the two-mode
+        model or a machine with tens of GiB.
     atol : float, optional
         Convergence tolerance on the relaxation-target increment, absolute and in the unit of
-        the temperature inputs. Default 1e-9, several orders below anything a temperature
-        measurement resolves. It is absolute rather than relative so that the answer cannot
-        depend on whether the caller works in Celsius or in kelvin, and so that an iterate
-        that is diverging cannot widen its own convergence test. The delivered temperature
-        settles to a fraction of it -- measured about 0.4 -- and the sweep count grows only as
-        its logarithm, so there is little to buy by relaxing it: 1e-7 is the loosest value
-        that leaves the package's own tests meaningful, and costs a third of the runtime.
+        the temperature inputs. Default 1e-7, several orders below anything a temperature
+        measurement resolves and below the model's own axial truncation by more. It is
+        absolute rather than relative so that the answer cannot depend on whether the caller
+        works in Celsius or in kelvin, and so that an iterate that is diverging cannot widen
+        its own convergence test. The delivered temperature settles to a fraction of it --
+        measured about 0.4 -- and the sweep count grows only as its logarithm. The floor is
+        the sweep map's own round-off: evaluating six Legendre modes of an effective-target
+        profile that swings by tens of kelvin leaves a few 1e-8 of noise on segments whose
+        transit is shorter than a bin, so tolerances below that are reachable only on
+        well-resolved geometries or fewer modes.
     spinup : {"constant"} or None, optional
         Warm-start policy; see :func:`pipetransport.transport.source_to_endmember`.
 
@@ -1407,7 +1721,7 @@ def source_to_endmember(
     soil_temperature : The undisturbed field the targets are built from.
     segment_heat_rate : The exchange rates, as a standalone diagnostic.
     :ref:`concept-relaxation` : How the halo turns the one-way model into this one.
-    :ref:`assumption-uniform-wall-flux` : One wall-flux history per pipe, and what it costs.
+    :ref:`assumption-uniform-wall-flux` : The axial mode truncation, and what it costs.
     :ref:`assumption-effective-target` : Why the delivered temperature can leave its own hull.
 
     Examples
@@ -1463,6 +1777,9 @@ def source_to_endmember(
     if max_sweeps < 1:
         msg = "max_sweeps must be at least 1 (sweep 1 is the one-way model)"
         raise ValueError(msg)
+    if n_modes < 1:
+        msg = "n_modes must be at least 1 (mode 0 is the position-uniform flux history)"
+        raise ValueError(msg)
     system = _build_system(
         flow=flow,
         tedges=tedges,
@@ -1475,11 +1792,12 @@ def source_to_endmember(
         kappa_pipe=kappa_pipe,
         film_coefficient=film_coefficient,
         spinup=spinup,
+        n_modes=n_modes,
     )
     tin_padded = np.concatenate([np.full(system.n_pad, tin[0]), tin])
 
-    targets = _converge_targets(system, tin_padded, max_sweeps=max_sweeps, atol=atol)
-    out = apply_banded(system.reporting, tin_padded) + apply_segment_targets(system.reporting, targets)
+    modes = _converge_targets(system, tin_padded, max_sweeps=max_sweeps, atol=atol)
+    out = apply_banded(system.reporting, tin_padded) + apply_segment_targets(system.reporting, modes)
     out[~system.reporting.valid_out] = np.nan
     return out
 
@@ -1497,8 +1815,9 @@ def endmember_to_source(
     nodes: list[str] | tuple[str, ...] | None = None,
     kappa_pipe: float | pd.Series | None = None,
     film_coefficient: float | pd.Series | None = None,
+    n_modes: int = 6,
     max_sweeps: int = 5000,
-    atol: float = 1e-9,
+    atol: float = 1e-7,
     regularization_strength: float = 1e-10,
     gap_atol: float = 1e-3,
     spinup: str | None = "constant",
@@ -1517,7 +1836,7 @@ def endmember_to_source(
     tout : DataFrame, mapping, or array-like
         Measured temperature at the reporting nodes, constant over each ``cout_tedges``
         bin; a DataFrame or mapping is keyed by node name. NaN marks a gap.
-    flow, tedges, cout_tedges, network, soil, surface_temperature, surface_tedges, nodes, kappa_pipe, film_coefficient, max_sweeps, atol, spinup
+    flow, tedges, cout_tedges, network, soil, surface_temperature, surface_tedges, nodes, kappa_pipe, film_coefficient, n_modes, max_sweeps, atol, spinup
         As in :func:`source_to_endmember`.
     regularization_strength : float, optional
         Tikhonov parameter of each banded solve; see
@@ -1570,15 +1889,15 @@ def endmember_to_source(
     and 1.10 at 0.75 on a 100 mm main; a 400 mm main crosses nearer 1.0), the excess is
     broad-band, and nothing reaches the fixed point -- a 40 mm service line at a 1 h transit
     already sits at ``h*tau = 1.12``, which is why the two-way reverse is unavailable on fast
-    service lines however short their transit sounds. **Transit**: a segment that empties in
-    about a bin or less is nearly singular at the fastest alternation the record carries
-    whatever its coupling -- radius 21 at ``h*tau = 0.11`` for a 100 mm main at a half-bin
-    transit. That one is a resolution problem rather than a physics problem: the same pipe on
-    15-minute bins, where the transit spans two, reconstructs to 2e-4 K. Between the two,
-    transits near 1.5-2.5 bins put only isolated resonant modes above one, which the
-    extrapolation still reaches at a reconstruction error that grows as the transit shortens
-    (2e-4 K at a 1.5-bin transit against 2e-2 K at half a bin on a 400 mm main whose coupling
-    is negligible). The RuntimeError names whichever regime applies.
+    service lines however short their transit sounds. **Transit**: on the one-history
+    model a segment that emptied in about a bin was nearly singular at the fastest
+    alternation the record carries whatever its coupling -- radius 21 at ``h*tau = 0.11``
+    for a 100 mm main at a half-bin transit. The advected mode kernels changed that outer
+    map: the same pipe now reconstructs to 5e-8 K at the six-mode default, and finer bins
+    remain the sharper choice wherever a transit spans less than a bin. The regime
+    diagnosis stays: a configuration that does diverge with a sub-bin transit is still
+    told to refine ``tedges``, which is still the remedy that works there. The
+    RuntimeError names whichever regime applies.
 
     The reconstruction leans on a fabricated production series over the bins no measurement
     constrains, and the coupling carries that invention into bins the record *does* constrain
@@ -1611,7 +1930,11 @@ def endmember_to_source(
     >>> network = example_network()
     >>> network.segments["cover"] = "grass"
     >>> soil = pd.DataFrame(
-    ...     {"alpha": [0.05], "kappa": [0.025], "eta": [0.41]}, index=["grass"]
+    ...     # a light dry soil: it keeps every segment's h*tau inside the coupling
+    ...     # boundary the Notes describe, which is what makes the two-way reverse
+    ...     # well-posed on this network
+    ...     {"alpha": [0.05], "kappa": [0.015], "eta": [0.41]},
+    ...     index=["grass"],
     ... )
     >>> tedges = pd.date_range("2025-06-01", "2025-06-11", freq="h")
     >>> demand = example_demand(tedges=tedges, network=network)
@@ -1626,16 +1949,20 @@ def endmember_to_source(
     ...     soil=soil,
     ...     surface_temperature=surface,
     ...     nodes=["T1", "T4"],
+    ...     n_modes=2,  # the deconvolution does not depend on the mode count
     ... )
     >>> measured = source_to_endmember(tin=tin, **shared)
     >>> recovered = endmember_to_source(tout=measured, **shared)
     >>> inner = slice(36, -96)  # both edges lean on unconstrained bins; see Notes
     >>> residual = float(np.nanmax(np.abs(recovered[inner] - tin[inner])))
-    >>> residual < 1e-8  # the Tikhonov pull, O(lambda) once the target preserves constants
+    >>> residual < 1e-6  # a fraction of atol, down to the Tikhonov pull at tighter ones
     True
     """
     if max_sweeps < 1:
         msg = "max_sweeps must be at least 1 (sweep 1 is the one-way model)"
+        raise ValueError(msg)
+    if n_modes < 1:
+        msg = "n_modes must be at least 1 (mode 0 is the position-uniform flux history)"
         raise ValueError(msg)
     system = _build_system(
         flow=flow,
@@ -1649,6 +1976,7 @@ def endmember_to_source(
         kappa_pipe=kappa_pipe,
         film_coefficient=film_coefficient,
         spinup=spinup,
+        n_modes=n_modes,
     )
     cout_tedges = pd.DatetimeIndex(cout_tedges)
 
@@ -1672,8 +2000,11 @@ def endmember_to_source(
 
     n_source = len(pd.DatetimeIndex(tedges)) - 1
 
-    def solve(reporting: NetworkTransfer, targets: npt.NDArray[np.floating]) -> npt.NDArray[np.floating]:
-        bias = apply_segment_targets(reporting, targets)
+    def solve(
+        reporting: NetworkTransfer,
+        modes: npt.NDArray[np.floating],
+    ) -> npt.NDArray[np.floating]:
+        bias = apply_segment_targets(reporting, modes)
         band_vals = reporting.band_vals.reshape(-1, reporting.band_vals.shape[-1])
         rhs = np.where(reporting.valid_out.ravel(), (observed - bias).ravel(), np.nan)
         return solve_inverse_transport_banded(
@@ -1714,7 +2045,9 @@ def endmember_to_source(
     # residual is
     # measured on the bins the operator covers; that set is a property of the operator, not of
     # the iterate, so it is fixed once and asserted to stay fixed.
-    first = solve(system.reporting, system.t_inf)
+    resting = np.zeros((n_modes, *system.t_inf.shape))
+    resting[0] = system.t_inf
+    first = solve(system.reporting, resting)
     covered = np.isfinite(first)
 
     def converge(fabricated: npt.NDArray[np.bool_] | None) -> npt.NDArray[np.floating]:
@@ -1735,20 +2068,20 @@ def endmember_to_source(
         RuntimeError
             If the iteration diverges or exhausts ``max_sweeps``.
         """
-        recovered, targets = first, system.t_inf
+        recovered, state = first, resting
         increment, previous, best, growing = np.inf, np.inf, np.inf, 0
         history: list[tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]] = []
         for _ in range(max_sweeps - 1):
             inner_atol = max(atol, _INNER_FORCING * increment)
-            targets = _converge_targets(
+            state = _converge_targets(
                 system,
                 filled(recovered),
                 max_sweeps=max_sweeps,
                 atol=inner_atol,
-                initial=targets,
+                initial=state,
                 fabricated=fabricated,
             )
-            mapped = solve(system.reporting, targets)
+            mapped = solve(system.reporting, state)
             if not np.array_equal(np.isfinite(mapped), covered):
                 msg = "the reverse iterate changed which output bins the record covers; this is a bug, please report it"
                 raise RuntimeError(msg)
@@ -1788,7 +2121,7 @@ def endmember_to_source(
     if not covered.all():
         reads_invented = apply_banded(system.internal, (~covered).astype(float)) > 0.0
         n_seg = len(system.length)
-        honest = converge(reads_invented[:n_seg] | reads_invented[n_seg : 2 * n_seg] | reads_invented[2 * n_seg :])
+        honest = converge(reads_invented.reshape(4 * n_modes - 1, n_seg, -1).any(axis=0))
         with np.errstate(invalid="ignore"):
             recovered = np.where(np.abs(honest - recovered) > gap_atol, np.nan, recovered)
     return recovered[system.n_pad :]

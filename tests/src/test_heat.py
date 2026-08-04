@@ -682,7 +682,7 @@ def test_segment_heat_rate_rejects_a_pipe_that_is_not_fully_buried(soil):
 # ============================================================================
 
 
-def _build_operator(network, demand, tedges, rates, *, nodes=None, with_target_terms=True):
+def _build_operator(network, demand, tedges, rates, *, nodes=None, with_target_terms=True, n_target_modes=1):
     """Build one operator directly, bypassing the spin-up policy."""
     requested = list(network.endmembers if nodes is None else nodes)
     paths = [network.segments.index.get_indexer(list(network.paths[node])) for node in requested]
@@ -702,6 +702,7 @@ def _build_operator(network, demand, tedges, rates, *, nodes=None, with_target_t
         paths_idx=paths_idx,
         active=active,
         with_target_terms=with_target_terms,
+        n_target_modes=n_target_modes,
     )
 
 
@@ -804,6 +805,145 @@ def test_end_of_bin_weight_matches_the_brute_force_oracle_on_a_travelling_path(r
     np.testing.assert_allclose(read[covered], reference[covered], rtol=0.0, atol=3e-7)
 
 
+@pytest.mark.parametrize("rate", [0.0, 5.336])
+def test_ramp_weight_reduces_to_its_closed_form_without_travel(rate):
+    """A no-travel row with the ramp weight reads ``dt * E1(w dt)`` times its own input.
+
+    The ramp reading integrates ``(t_end - t) exp(-w (t_end - t))`` against the bin, so on
+    an empty path a piecewise-constant series must come back as
+    ``dt * (1 - (1 + w dt) e^{-w dt}) / (w dt)^2`` times itself -- ``dt / 2`` at ``w = 0``,
+    the plain first moment of a uniform bin.
+    """
+    n_bins = 48
+    tedges = pd.date_range("2025-06-01", periods=n_bins + 1, freq="h")
+    days = tedges_to_days(tedges)
+    dt = float(days[1] - days[0])
+    values = 10.0 + np.random.default_rng(1).normal(0.0, 3.0, n_bins)
+    flow = np.full((1, n_bins), 500.0)
+
+    transfer = paths_transfer(
+        tedges_days=days,
+        cout_tedges_days=days,
+        segment_volume=np.array([100.0]),
+        segment_flow=flow,
+        segment_decay=np.array([0.0]),
+        node_flow=flow,
+        paths_idx=np.zeros((1, 0), dtype=np.intp),
+        active=np.zeros((1, 0), dtype=bool),
+        bin_end_rate=np.array([rate]),
+        bin_end_power=np.array([1]),
+    )
+    columns = np.clip(transfer.col_start[..., None] + np.arange(transfer.band_vals.shape[-1]), 0, n_bins - 1)
+    read = np.einsum("nkb,nkb->nk", transfer.band_vals, values[columns])[0]
+
+    x = rate * dt
+    factor = dt * (1.0 - (1.0 + x) * np.exp(-x)) / x**2 if rate else dt / 2.0
+    np.testing.assert_allclose(read, factor * values, rtol=0.0, atol=1e-13)
+
+
+@pytest.mark.parametrize("rate", [0.0, 5.336])
+def test_ramp_weight_matches_the_brute_force_oracle_on_a_travelling_path(rate):
+    """The first-moment reading is as exact as the exponential one, parcel by parcel."""
+    n_bins = 60
+    tedges = pd.date_range("2025-06-01", periods=n_bins + 1, freq="h")
+    days = tedges_to_days(tedges)
+    hours = np.arange(n_bins)
+    cin = 10.0 + np.random.default_rng(7).normal(0.0, 2.0, n_bins)
+    downstream = 600.0 + 200.0 * np.sin(2.0 * np.pi * hours / 24.0)
+    segment_flow = np.vstack([downstream + 250.0 + 100.0 * np.cos(2.0 * np.pi * hours / 17.0), downstream])
+    volume, decay = np.array([120.0, 45.0]), np.array([0.35, 0.6])
+
+    transfer = paths_transfer(
+        tedges_days=days,
+        cout_tedges_days=days,
+        segment_volume=volume,
+        segment_flow=segment_flow,
+        segment_decay=decay,
+        node_flow=downstream[None, :],
+        paths_idx=np.array([[0, 1]], dtype=np.intp),
+        active=np.ones((1, 2), dtype=bool),
+        bin_end_rate=np.array([rate]),
+        bin_end_power=np.array([1]),
+    )
+    columns = np.clip(transfer.col_start[..., None] + np.arange(transfer.band_vals.shape[-1]), 0, n_bins - 1)
+    read = np.where(transfer.valid_out[0], np.einsum("nkb,nkb->nk", transfer.band_vals, cin[columns])[0], np.nan)
+
+    reference = OraclePath(
+        tedges_days=days,
+        segment_flow=segment_flow,
+        segment_volume=volume,
+        segment_decay=decay,
+        node_flow=downstream,
+    ).cout(cin=cin, cout_tedges_days=days, bin_end_rate=rate, bin_end_power=1)
+
+    assert np.array_equal(np.isnan(read), np.isnan(reference))
+    covered = np.isfinite(read)
+    assert covered.sum() > 40, "the comparison must cover most of the record"
+    # The reading is in kelvin-days (the ramp carries a day), so the oracle's quadrature
+    # floor scales with the bin width; 3e-7 * dt is the same relative floor as the
+    # exponential reading's.
+    np.testing.assert_allclose(read[covered], reference[covered], rtol=0.0, atol=3e-7 / 24.0)
+
+
+def test_ramp_readings_carry_the_bias_and_the_tilt_exactly(heat_network, short_tedges, diurnal_demand):
+    """The full affine reading through a ramp-weighted row, against the oracle.
+
+    The moment recursion of the axial model reads face temperatures through the weight
+    ``(t_end - t) exp(-h (t_end - t))``, and those temperatures include the relaxation bias
+    and its tilt. Every bias slab of a ramp row therefore carries the ramp factor -- for the
+    entry-position term that makes the cell mean a product of two affines against the
+    exponential, the ``E2`` closed form -- and this is the one comparison that exercises it.
+    """
+    demand = heat_network.flow_array(diurnal_demand(heat_network, short_tedges))
+    rng = np.random.default_rng(41)
+    n_seg, n_bins = len(heat_network.segments), len(short_tedges) - 1
+    rates = _rate(heat_network, depth=heat_network.segments["depth"]).to_numpy()
+    targets = rng.uniform(8.0, 24.0, size=(n_seg, n_bins))
+    tilts = rng.uniform(-6.0, 6.0, size=(n_seg, n_bins))
+    tin = rng.uniform(6.0, 14.0, size=n_bins)
+    node = "T4"
+    reading_rate = 3.1
+
+    requested = [node]
+    paths = [heat_network.segments.index.get_indexer(list(heat_network.paths[node]))]
+    days = tedges_to_days(short_tedges)
+    transfer = paths_transfer(
+        tedges_days=days,
+        cout_tedges_days=days,
+        segment_volume=heat_network.segments["volume"].to_numpy(dtype=float),
+        segment_flow=heat_network.segment_flow(flow=demand),
+        segment_decay=rates,
+        node_flow=heat_network.node_flow(flow=demand, nodes=requested),
+        paths_idx=np.array(paths, dtype=np.intp),
+        active=np.ones((1, len(paths[0])), dtype=bool),
+        bin_end_rate=np.array([reading_rate]),
+        bin_end_power=np.array([1]),
+        with_target_terms=True,
+        n_target_modes=2,
+    )
+    columns = np.clip(transfer.col_start[..., None] + np.arange(transfer.band_vals.shape[-1]), 0, n_bins - 1)
+    actual = np.einsum("nkb,nkb->nk", transfer.band_vals, tin[columns])[0]
+    # The tilt convention "tilt * (x/L - 1/2)" is mode 1 of the shifted Legendre basis at
+    # half its amplitude: P1(2 xi - 1) = 2 xi - 1.
+    actual += apply_segment_targets(transfer, np.stack([targets, tilts / 2.0]))[0]
+    actual = np.where(transfer.valid_out[0], actual, np.nan)
+
+    rows = paths[0]
+    expected = OraclePath(
+        tedges_days=days,
+        segment_flow=heat_network.segment_flow(flow=demand)[rows],
+        segment_volume=heat_network.segments["volume"].to_numpy(dtype=float)[rows],
+        segment_decay=rates[rows],
+        node_flow=heat_network.node_flow(flow=demand, nodes=requested)[0],
+        segment_target=targets[rows],
+        segment_target_modes=(tilts[rows] / 2.0)[None],
+    ).tout(tin=tin, cout_tedges_days=days, bin_end_rate=reading_rate, bin_end_power=1)
+
+    both = np.isfinite(actual) & np.isfinite(expected)
+    assert both.sum() > 0.5 * len(actual)
+    np.testing.assert_allclose(actual[both], expected[both], atol=1e-11)
+
+
 def test_bias_weights_are_non_negative_and_complete_the_row_sum(heat_network, short_tedges, diurnal_demand):
     """Every target bin enters with a non-negative weight, and the weights close the budget.
 
@@ -896,6 +1036,123 @@ def test_bias_matches_the_brute_force_oracle(heat_network, short_tedges, diurnal
     np.testing.assert_allclose(actual[both], expected[both], atol=1e-11)
 
 
+@pytest.mark.parametrize("node", ["T4", "B"])
+def test_tilt_bias_matches_the_brute_force_oracle(heat_network, short_tedges, diurnal_demand, node):
+    """Targets linear in position, against the oracle's exact ramp update.
+
+    The tilt reading decomposes by parts into halved boundary readings, an interior sum
+    whose jumps are weighted by the crossing edge's own position, an entry-position ramp
+    mean, and the traversal series ``tilt * q/(k V)`` read through the uniform-target
+    machinery. The oracle instead walks each parcel with the closed ramp update and shares
+    none of that arithmetic; the demand split is non-proportional, so entry positions and
+    edge crossings move between bins and the comparison exercises every term at once.
+    """
+    demand = heat_network.flow_array(diurnal_demand(heat_network, short_tedges))
+    rng = np.random.default_rng(29)
+    n_seg, n_bins = len(heat_network.segments), len(short_tedges) - 1
+    rates = _rate(heat_network, depth=heat_network.segments["depth"]).to_numpy()
+    targets = rng.uniform(8.0, 24.0, size=(n_seg, n_bins))
+    tilts = rng.uniform(-6.0, 6.0, size=(n_seg, n_bins))
+    tin = rng.uniform(6.0, 14.0, size=n_bins)
+
+    transfer = _build_operator(heat_network, demand, short_tedges, rates, nodes=[node], n_target_modes=2)
+    columns = np.clip(transfer.col_start[..., None] + np.arange(transfer.band_vals.shape[-1]), 0, n_bins - 1)
+    actual = np.einsum("nkb,nkb->nk", transfer.band_vals, tin[columns])[0]
+    # The tilt convention "tilt * (x/L - 1/2)" is mode 1 of the shifted Legendre basis at
+    # half its amplitude: P1(2 xi - 1) = 2 xi - 1.
+    actual += apply_segment_targets(transfer, np.stack([targets, tilts / 2.0]))[0]
+    actual = np.where(transfer.valid_out[0], actual, np.nan)
+
+    rows = heat_network.segments.index.get_indexer(list(heat_network.paths[node]))
+    days = tedges_to_days(short_tedges)
+    expected = OraclePath(
+        tedges_days=days,
+        segment_flow=heat_network.segment_flow(flow=demand)[rows],
+        segment_volume=heat_network.segments["volume"].to_numpy(dtype=float)[rows],
+        segment_decay=rates[rows],
+        node_flow=heat_network.node_flow(flow=demand, nodes=[node])[0],
+        segment_target=targets[rows],
+        segment_target_modes=(tilts[rows] / 2.0)[None],
+    ).tout(tin=tin, cout_tedges_days=days)
+
+    both = np.isfinite(actual) & np.isfinite(expected)
+    assert both.sum() > 0.5 * len(actual)
+    np.testing.assert_allclose(actual[both], expected[both], atol=1e-11)
+
+    # A zero tilt must not move a bit, and a zero-rate segment's tilt must not act at all.
+    plain = apply_segment_targets(transfer, targets)
+    np.testing.assert_array_equal(apply_segment_targets(transfer, np.stack([targets, np.zeros_like(tilts)])), plain)
+    conservative = _build_operator(heat_network, demand, short_tedges, np.zeros(n_seg), nodes=[node], n_target_modes=2)
+    np.testing.assert_array_equal(
+        apply_segment_targets(conservative, np.stack([targets, tilts / 2.0])),
+        apply_segment_targets(conservative, targets),
+    )
+
+
+def test_oracle_tilt_target_is_its_own_splitting_limit():
+    """The oracle's closed-form tilt update against the oracle's own splitting limit.
+
+    Groundwork for the axial-mode model of issue #32: the oracle gains targets linear in
+    position, ``target[j] + slope[j] * (x/L - 1/2)``, delivered by the exact ramp update.
+    Splitting the pipe into sub-segments whose *constant* targets sample the tilt at their
+    midpoints must converge to that closed form at second order -- the midpoint rule -- and
+    the split side exercises only the pre-existing constant-target path, so the two share no
+    arithmetic. Flow varies threefold over the day, so the position map behind the tilt is
+    read well away from the constant-flow case. Measured: 0.142 K at two pieces, 0.034 K at
+    four, ratio 4.2; and a zero slope reproduces the constant-target path bit for bit.
+    """
+    n = 48
+    tedges_days = np.arange(n + 1) / 24.0
+    hours = np.arange(n)
+    flow = 90.0 + 60.0 * np.sin(2.0 * np.pi * hours / 24.0)
+    volume, rate = 12.0, 4.0  # a 2-5 h transit at k*tau ~ 0.5
+    c0 = 15.0 + 3.0 * np.cos(2.0 * np.pi * hours / 24.0)
+    c1 = 4.0 * np.sin(2.0 * np.pi * hours / 16.0)
+    tin = 10.0 + 2.0 * np.sin(2.0 * np.pi * hours / 8.0)
+    shared = dict(tedges_days=tedges_days, node_flow=flow)
+
+    # The slope convention "slope * (x/L - 1/2)" is mode 1 at half its amplitude.
+    tilt = OraclePath(
+        segment_flow=flow[None],
+        segment_volume=[volume],
+        segment_decay=[rate],
+        segment_target=c0[None],
+        segment_target_modes=(c1 / 2.0)[None, None],
+        **shared,
+    ).tout(tin=tin, cout_tedges_days=tedges_days)
+    assert int(np.isfinite(tilt).sum()) > n // 2
+
+    def split(m):
+        mids = (np.arange(m) + 0.5) / m - 0.5
+        return OraclePath(
+            segment_flow=np.tile(flow, (m, 1)),
+            segment_volume=np.full(m, volume / m),
+            segment_decay=np.full(m, rate),
+            segment_target=c0[None] + np.outer(mids, c1),
+            **shared,
+        ).tout(tin=tin, cout_tedges_days=tedges_days)
+
+    coarse, fine = split(2), split(4)
+    assert np.array_equal(np.isfinite(coarse), np.isfinite(tilt))
+    gap_coarse = float(np.nanmax(np.abs(coarse - tilt)))
+    gap_fine = float(np.nanmax(np.abs(fine - tilt)))
+    assert gap_fine < 0.05, gap_fine
+    assert gap_fine < gap_coarse / 3.0, (gap_coarse, gap_fine)
+
+    zeroed = OraclePath(
+        segment_flow=flow[None],
+        segment_volume=[volume],
+        segment_decay=[rate],
+        segment_target=c0[None],
+        segment_target_modes=np.zeros((1, 1, n)),
+        **shared,
+    ).tout(tin=tin, cout_tedges_days=tedges_days)
+    plain = OraclePath(
+        segment_flow=flow[None], segment_volume=[volume], segment_decay=[rate], segment_target=c0[None], **shared
+    ).tout(tin=tin, cout_tedges_days=tedges_days)
+    np.testing.assert_array_equal(zeroed, plain)
+
+
 def test_bias_handles_transits_landing_exactly_on_bin_edges():
     """A segment face crossing exactly at a bin edge is the convention's failure mode.
 
@@ -969,15 +1226,16 @@ def test_target_terms_carry_only_the_rows_still_on_a_path(heat_network, short_te
     terms = _build_operator(heat_network, demand, short_tedges, rates, nodes=nodes).target_terms
 
     depths = np.array([len(heat_network.paths[node]) for node in nodes])
-    for depth, offset in enumerate(terms.row_offset):
+    assert len(terms.segment_of) == int(depths.max())
+    for depth, segs in enumerate(terms.segment_of):
         expected = int(np.count_nonzero(depths > depth))
-        for name in ("mean_shift", "bin_entry", "bin_exit", "gap"):
-            assert len(getattr(terms, name)[depth]) == expected, f"{name}[{depth}]"
-        assert len(offset) == expected
-        # Stage ``d + 1`` is also depth ``d + 1``'s entry piece, so it carries depth d's rows.
-        assert len(terms.mean_down[depth + 1]) == expected
-    assert len(terms.mean_down) == len(terms.row_offset) + 1
-    assert min(len(slab) for slab in terms.mean_shift) < len(nodes), "no depth was compacted"
+        assert segs.size == expected, f"segment_of[{depth}]"
+        # The mode slabs lead with the mode axis; the bin slabs are (rows, cells).
+        for name in ("exit_read", "entry_read", "position_exit", "position_mid", "position_entry"):
+            assert getattr(terms, name)[depth].shape[1] == expected, f"{name}[{depth}]"
+        for name in ("bin_entry", "bin_exit", "bin_mid"):
+            assert getattr(terms, name)[depth].shape[0] == expected, f"{name}[{depth}]"
+    assert min(slab.size for slab in terms.segment_of) < len(nodes), "no depth was compacted"
 
 
 # ============================================================================
@@ -985,7 +1243,7 @@ def test_target_terms_carry_only_the_rows_still_on_a_path(heat_network, short_te
 # ============================================================================
 
 
-def _uniform_case(network, tedges, *, tin, sol_air, flow):
+def _uniform_case(network, tedges, *, tin, sol_air, flow, **kwargs):
     """Run the coupled model with constant inputs."""
     n = len(tedges) - 1
     return heat.source_to_endmember(
@@ -996,6 +1254,7 @@ def _uniform_case(network, tedges, *, tin, sol_air, flow):
         network=network,
         soil=pd.DataFrame([GRASS], index=["grass"]),
         surface_temperature=pd.DataFrame({"grass": np.full(n, sol_air)}),
+        **kwargs,
     )
 
 
@@ -1013,6 +1272,12 @@ def _local_reference(*, tin, t_inf, dt, tau, n_slug, r_inner, d_eff, alpha, kapp
     ``T_eff = T_inf - memory`` through the *full* series resistance. That arrangement stays
     well behaved as the film and wall resistance shrink, and it reduces exactly to the one-way
     relaxation when the halo is switched off.
+
+    The record opens on the same pipe the package opens on: the warm start has fed the pipe
+    at ``tin[0]`` for longer than a transit with no halo yet, so the slug starts at the
+    settled profile toward the undisturbed soil rather than uniform at ``tin[0]``. The two
+    initial states agree in the settled window either way; starting from the same one makes
+    the opening bins comparable too (issue #32).
 
     Parameters
     ----------
@@ -1062,7 +1327,11 @@ def _local_reference(*, tin, t_inf, dt, tau, n_slug, r_inner, d_eff, alpha, kapp
     tin_fine, tinf_fine = np.asarray(tin)[sample], np.asarray(t_inf)[sample]
 
     gain = rate * area * (1.0 - survive) / (rate * step)  # psi = gain * (T_parcel - T_eff)
-    slug = np.full(n_slug, tin_fine[0])
+    # Cell i is delivered after n_slug - i more sub-steps, so at the record's opening its
+    # water has already relaxed toward the undisturbed soil over n_slug - i - 0.5 sub-steps
+    # (cell centres) of the warm start.
+    age = (n_slug - np.arange(n_slug) - 0.5) * step
+    slug = tinf_fine[0] + (tin_fine[0] - tinf_fine[0]) * np.exp(-rate * age)
     flux = np.zeros((n_steps, n_slug))
     increment = np.zeros((n_steps, n_slug))
     delivered = np.zeros(n_steps)
@@ -1118,22 +1387,23 @@ def _series_pipe(n_sub, *, transit_hours, tin, tedges, film_coefficient=0.454):
     )[0]
 
 
-@pytest.mark.parametrize(("transit_hours", "n_slug", "tolerance"), [(2.0, 8, 0.60), (6.0, 12, 1.15)])
+@pytest.mark.parametrize(("transit_hours", "n_slug", "tolerance"), [(2.0, 8, 0.012), (6.0, 12, 0.08)])
 def test_two_way_model_agrees_with_the_local_fine_step_reference(transit_hours, n_slug, tolerance):
     """The coupled fixed point against an independently integrated local reference.
 
-    The reference keeps one soil memory per axial cell; the package keeps one per pipe. The
-    gap between them is therefore that one modelling difference, and the test that they are
-    the same physics rather than two answers that happen to land near each other is that the
-    gap *closes* as the pipe is modelled as more series pieces.
+    The reference keeps one soil memory per axial cell; the package keeps the mean and the
+    tilt of one flux profile per pipe (issue #32). The gap between them is therefore the
+    truncation of the axial dimension to those two moments, plus the comparison's own time
+    discretisation -- the reference sub-steps at CFL 1 inside the package's bins, and the
+    sibling test below shows that part collapsing once the two share one grid.
 
-    It used to close at first order, because a second and larger error sat on top of the
-    axial one: the flux of a piece was read off the water it delivered, which smeared the flux
-    history over one piece transit and shrank only as fast as the pieces did. With the flux
-    booked over the residence time that term is gone, the unsplit gap falls several-fold, and
-    what is left drops steeply at the first refinement and then flattens onto a floor that
-    more pieces do not move -- so the assertions below pin the drop and the floor rather than
-    a rate. Issue #32 tracks attributing that floor.
+    Before the axial modes this gap was 0.066 K at the 2 h transit and 0.51 K at 6 h, and
+    the recommended remedy was declaring the pipe as series pieces. The two-mode model
+    resolves it unsplit: measured 0.0080 K and 0.054 K -- at 2 h transit already inside the
+    matched-grid floor, at 6 h the truncation's own size, matching the mode-truncated
+    prototype's 0.0051/0.057 K. Splitting is no longer a remedy and must no longer be
+    needed: the split gaps sit at the same floor rather than below the unsplit one, which is
+    what the second assertion pins.
 
     A film resistance is supplied deliberately. At the bare-pipe limit the reference's
     closed-form per-step solve is singular and it diverges below about 2 % of the soil
@@ -1163,11 +1433,43 @@ def test_two_way_model_agrees_with_the_local_fine_step_reference(transit_hours, 
                 np.abs(_series_pipe(n_sub, transit_hours=transit_hours, tin=tin, tedges=tedges) - reference)[settled]
             )
         )
-        for n_sub in (1, 4, 8)
+        for n_sub in (1, 4)
     ]
-    assert gaps[0] < tolerance, gaps
-    assert gaps[1] < 0.4 * gaps[0], gaps  # measured 0.09-0.34 of the unsplit gap
-    assert gaps[2] <= gaps[1], gaps  # the floor: measured 0.68-0.99, never a rise
+    assert gaps[0] < tolerance, gaps  # measured 0.0080 K at 2 h, 0.054 K at 6 h
+    assert gaps[1] < 0.012, gaps  # split or not, what remains is the shared-grid floor
+
+
+def test_the_agreement_floor_is_the_two_time_discretisations():
+    """On one shared grid the package and the local reference collapse onto each other.
+
+    The sibling test's residual floor -- about 0.01 K at hourly bins that more pieces do not
+    move -- measures the comparison rather than the model: the reference advances at CFL 1,
+    sub-stepping inside the package's bins, so the two discretise the same physics on
+    different time grids. Run both on the same one -- 15-minute bins, the reference's
+    sub-step equal to the bin width, eight pieces against eight axial cells -- and the
+    settled-window gap falls to 0.002 K, thirty-fold below the unsplit axial cost and
+    shrinking with the bin width (0.020 K at hourly, 0.006 K at half-hourly). With the
+    axial resolution matched as well, no unattributed physics is left between them; that
+    is the attribution issue #32 asked for.
+    """
+    tedges = pd.date_range("2025-06-01", periods=4 * 96 + 1, freq="15min")
+    n_bins = len(tedges) - 1
+    tin = 13.0 + 3.0 * np.sin(2.0 * np.pi * (np.arange(n_bins) + 0.5) / 96.0)
+    reference = _local_reference(
+        tin=tin,
+        t_inf=np.full(n_bins, 18.0),
+        dt=1.0 / 96.0,
+        tau=2.0 / 24.0,
+        n_slug=8,
+        r_inner=0.05,
+        d_eff=1.0 + GRASS["kappa"] / GRASS["eta"],
+        alpha=GRASS["alpha"],
+        kappa=GRASS["kappa"],
+        r_other=1.0 / (2.0 * np.pi * 0.05 * 0.454),
+    )
+    settled = slice(2 * 96, None)
+    gap = float(np.max(np.abs(_series_pipe(8, transit_hours=2.0, tin=tin, tedges=tedges) - reference)[settled]))
+    assert gap < 0.005, gap  # measured 0.0020 K
 
 
 def test_uniform_temperature_is_a_fixed_point(heat_network, hourly_tedges, diurnal_demand):
@@ -1192,7 +1494,8 @@ def test_converged_model_satisfies_the_steady_buried_pipe_law(heat_pipe, transit
     volume = float(heat_pipe.segments.loc["Plant-T1", "volume"])
     flow = np.full((1, len(tedges) - 1), volume / (transit_hours / 24.0))
 
-    out = _uniform_case(heat_pipe, tedges, tin=8.0, sol_air=20.0, flow=flow)
+    # n_modes=2 keeps the 400-day run near its old cost; the law under test is mode-free.
+    out = _uniform_case(heat_pipe, tedges, tin=8.0, sol_air=20.0, flow=flow, n_modes=2)
 
     rate = _rate(heat_pipe)["Plant-T1"]
     expected = 20.0 + (8.0 - 20.0) * np.exp(-rate * transit_hours / 24.0)
@@ -1215,10 +1518,13 @@ def test_the_quasi_steady_limit_is_the_steady_buried_pipe_law_across_the_geometr
     decays like ``3-5 / t`` in days, so a record that reaches the quasi-steady limit is a few
     thousand bins on a daily grid and a hundred thousand on an hourly one.
 
-    The tolerance is one-sided as well as two-sided. The remaining deficit still lets a
-    little more heat through than a fully developed halo would, so the fixed point sits just
-    *past* the law and never short of it --- which is the direction that discriminates: the
-    rejected early-time-resistance split lands several percent below.
+    The tolerance still discriminates what it always did: the rejected early-time-resistance
+    split lands several percent below the law. The two-mode fixed point itself sits a few
+    millikelvin *below* it -- the axial truncation's own quasi-steady residue, whose sign the
+    mode-truncated reference reproduces (-1.9e-3 K against the package's -2.1e-3 K on the
+    100 mm / 2-day case), where the exact per-cell physics sits just above (+7e-6 K). So the
+    check is two-sided at the same 2e-3, three orders above the truncation and three below
+    the failure mode it rejects.
     """
     tedges = pd.date_range("2025-01-01", periods=1501, freq="D")
     segments = pd.DataFrame(
@@ -1231,8 +1537,6 @@ def test_the_quasi_steady_limit_is_the_steady_buried_pipe_law_across_the_geometr
 
     delivered = float(_uniform_case(network, tedges, tin=8.0, sol_air=20.0, flow=flow)[0, -1])
     expected = 20.0 + (8.0 - 20.0) * np.exp(-_rate(network)["Plant-T1"] * transit_bins)
-    assert delivered > expected
-    # The worst measured excess over the nine cases is 9.4e-4, so 1e-3 would be 6 % of margin.
     np.testing.assert_allclose(delivered, expected, rtol=2e-3)
 
 
@@ -1262,6 +1566,7 @@ def test_one_way_model_is_the_first_iterate(heat_network, hourly_tedges, diurnal
         kappa_pipe=None,
         film_coefficient=None,
         spinup="constant",
+        n_modes=2,
     )
     padded = np.concatenate([np.full(system.n_pad, tin[0]), tin])
     expected = apply_banded(system.reporting, padded) + apply_segment_targets(system.reporting, system.t_inf)
@@ -1302,6 +1607,7 @@ def test_each_segment_relaxes_toward_its_own_cover_and_depth(
         kappa_pipe=None,
         film_coefficient=None,
         spinup="constant",
+        n_modes=2,
     )
     # The field is built on the padded grid, which the spin-up prepends to the caller's.
     width = hourly_tedges[1] - hourly_tedges[0]
@@ -1353,6 +1659,7 @@ def test_the_pipe_wall_moves_the_radius_the_halo_is_read_at(heat_pipe, soil):
         kappa_pipe=0.008,
         film_coefficient=None,
         spinup=None,
+        n_modes=2,
     )
     outer = heat._deficit_kernel(
         system.n_bins,
@@ -1419,7 +1726,10 @@ def test_the_delivered_temperature_overshoots_the_forcing_range_by_a_measured_am
 
     Pinning the size of it is the test that can fail. Loosening it into a range check with a
     few kelvin of slack --- which is what a hand-written pair of literals amounts to --- would
-    pass whether the overshoot were 0.2 K or 4 K.
+    pass whether the overshoot were 0.02 K or 4 K. At six axial modes the excursion on this
+    mild, continuously flowing case is a measured 2.4 % of the step -- the same 1-4 % band
+    the split-pipe adjudication of issue #32 put the resolved limit at, where the classical
+    one-history model paid 18 %.
     """
     tedges = pd.date_range("2025-06-01", periods=40 * 24 + 1, freq="h")
     n = len(tedges) - 1
@@ -1444,38 +1754,21 @@ def test_the_delivered_temperature_overshoots_the_forcing_range_by_a_measured_am
     # side, and there is none on the warm side.
     assert finite.max() <= 45.0 + 1e-9
     excursion = (21.0 - finite.min()) / contrast
-    assert 0.15 < excursion < 0.25, excursion
+    assert 0.015 < excursion < 0.035, excursion
 
-    # Two things bound it. The one-way model has a fixed target and is exactly inside the
-    # hull; and declaring the same pipe as two segments, which refines the flux history the
-    # halo is built from, cuts the excursion severalfold without removing it.
+    # The one-way model has a fixed target and is exactly inside the hull.
     one_way = heat.source_to_endmember(**shared, max_sweeps=1)[0]
     assert np.nanmin(one_way) >= 21.0 - 1e-9
-    halves = PipeNetwork(
-        segments=pd.DataFrame(
-            {
-                "from": ["Plant", "mid"],
-                "to": ["mid", "T1"],
-                "length": [500.0, 500.0],
-                "diameter": [0.1, 0.1],
-                "cover": ["grass", "grass"],
-            },
-            index=["a", "b"],
-        ),
-        source="Plant",
-    )
-    split = heat.source_to_endmember(**{**shared, "network": halves})[0]
-    assert (21.0 - np.nanmin(split)) / contrast < 0.5 * excursion
 
 
 @pytest.mark.parametrize(
     ("label", "diameter", "length", "flow", "ceiling"),
     [
-        # Two hours of flow in every 24, at 0.8 m/s: the running transit is shorter than one
+        # Two hours of flow in every 24, at 0.8 m/s: the running transit is a sixth of a
         # bin, so a delivery-bin flux charges a whole day of exchange to a couple of bins.
-        ("flushed twice a day", 0.4, 500.0, "flush", 1.2),
+        ("flushed twice a day", 0.4, 500.0, "flush", 0.5),
         # Ten days standing, then a normal four-hour transit.
-        ("stagnant for ten days", 0.3, 1000.0, "stagnant", 4.0),
+        ("stagnant for ten days", 0.3, 1000.0, "stagnant", 1.5),
     ],
 )
 def test_intermittent_demand_stays_near_the_range_of_its_inputs(label, diameter, length, flow, ceiling):
@@ -1522,6 +1815,11 @@ def test_intermittent_demand_stays_near_the_range_of_its_inputs(label, diameter,
         network=PipeNetwork(segments=segments, source="Plant"),
         soil=pd.DataFrame([GRASS], index=["grass"]),
         surface_temperature=pd.DataFrame({"grass": np.full(n, hull_hi)}),
+        # The flush shape passes six pipe volumes in a single bin, which supports no
+        # axial modes past the leading few: the delivered range is identical at two,
+        # three and four modes, and the sweep's divergence refusal past that is pinned by
+        # test_a_pipe_flushed_within_a_bin_refuses_the_modes_it_cannot_drive.
+        n_modes=4 if flow == "flush" else 6,
     )
     delivered = heat.source_to_endmember(**shared)
 
@@ -1534,23 +1832,56 @@ def test_intermittent_demand_stays_near_the_range_of_its_inputs(label, diameter,
     assert np.nanmax(np.abs(delivered - one_way)) > 0.1, label
 
 
-def test_stagnation_overshoot_stays_small_and_refining_settles_it(soil):
-    """The excursion under a duty cycle: small, warm-side, and *removed* by refining.
+def test_a_pipe_flushed_within_a_bin_refuses_the_modes_it_cannot_drive():
+    """Axial modes finer than the bin width can drive diverge, and the message says so.
 
-    Standing water is the case the wall flux has to get right. It exchanges heat with the soil
-    for as long as it stands, and the enthalpy budget books that heat into the bins it
-    actually stood in -- a bin with no throughflow still leaks ``-h (H - V Tb)``. Reading the
-    flux off the water a pipe delivers instead would charge a whole idle night to the single
-    bin the water finally left in, overstating it by the ratio of the standing time to the
-    transit; that is what used to drive the delivered temperature a quarter of the contrast
-    past the soil here, and several times the contrast on the shapes in issue #24.
+    The issue #24 flushing main passes six pipe volumes in a single hourly bin. Its axial
+    profile is uniform -- the delivered range is identical at two, three and four modes --
+    but asking for more modes than the bin resolves turns the sweep's reading feedback
+    into amplification, and the honest answer is a refusal naming the segment and the
+    remedies rather than an exhausted cap.
+    """
+    diameter, length = 0.4, 500.0
+    peak = 0.8 * np.pi * (diameter / 2.0) ** 2 * 86400.0
+    demand = np.tile(np.concatenate([np.full(2, peak), np.zeros(22)]), 10)
+    n = len(demand)
+    tedges = pd.date_range("2025-06-01", periods=n + 1, freq="h")
+    segments = pd.DataFrame(
+        {"from": ["Plant"], "to": ["T1"], "length": [length], "diameter": [diameter], "cover": ["grass"]},
+        index=["P"],
+    )
+    with pytest.raises(RuntimeError, match="pipe volumes in a single bin") as raised:
+        heat.source_to_endmember(
+            tin=np.full(n, 8.0),
+            flow=demand[None, :],
+            tedges=tedges,
+            cout_tedges=tedges,
+            network=PipeNetwork(segments=segments, source="Plant"),
+            soil=pd.DataFrame([GRASS], index=["grass"]),
+            surface_temperature=pd.DataFrame({"grass": np.full(n, 22.0)}),
+        )
+    message = str(raised.value)
+    assert "refine tedges" in message.lower() or "lower n_modes" in message.lower(), message
 
-    So the excursion is now small, and -- the discriminating part -- declaring the pipe as a
-    chain of shorter segments *reduces* it monotonically and takes the answer back inside the
-    hull, where it used to grow. A model whose refinement diverges cannot be trusted at any
-    resolution; one that settles can.
 
-    This is also the only configuration in the file with zero flow anywhere, so it is what
+def test_stagnation_overshoot_stays_small_and_raising_the_modes_settles_it(soil):
+    """The excursion under a duty cycle: small at the default, and the modes are why.
+
+    Standing water is the case the wall flux has to get right. It exchanges heat with the
+    soil for as long as it stands, and the moment budgets book that heat into the bins it
+    actually stood in, at the positions it stood at -- a bin with no throughflow still leaks
+    ``-h (y_m - V n_m c_m)`` in every mode. What truncating the axial profile costs is
+    measured by the mode ladder: the classical one-history model delivers water a quarter of
+    the driving contrast past the soil here, two modes cut that to 8 %, and the six-mode
+    default to under 1 % -- the band the Eulerian duty-cycle adjudication of issue #32 put
+    the class truncation at. The discriminating part is the ladder itself: a model whose
+    refinement did not settle could not be trusted at any order.
+
+    Declaring the pipe as shorter segments must then leave the settled answer alone -- the
+    modes already resolve what splitting used to approximate -- and the record opens idle,
+    so this also exercises the running-value warm start end to end.
+
+    This is the only configuration in the file with zero flow anywhere, so it is what
     exercises the stagnation assumption end to end rather than as a statement in the docs.
     """
     days, idle = 6, 8
@@ -1558,7 +1889,7 @@ def test_stagnation_overshoot_stays_small_and_refining_settles_it(soil):
     tedges = pd.date_range("2025-06-01", periods=n + 1, freq="h")
     contrast = 20.0 - 8.0
 
-    def excursion(pieces):
+    def excursion(pieces, n_modes):
         """Warm-side excursion past the soil, as a fraction of the contrast."""
         nodes = ["Plant", *[f"n{i}" for i in range(1, pieces)], "T1"]
         segments = pd.DataFrame(
@@ -1582,16 +1913,18 @@ def test_stagnation_overshoot_stays_small_and_refining_settles_it(soil):
             network=network,
             soil=soil,
             surface_temperature=pd.DataFrame({"grass": np.full(n, 20.0), "paved": np.full(n, 20.0)}),
+            n_modes=n_modes,
         )
         one_way = heat.source_to_endmember(**shared, max_sweeps=1)
         assert np.nanmax(one_way) <= 20.0 + 1e-9, "the one-way model must stay inside its hull"
         return (np.nanmax(heat.source_to_endmember(**shared)) - 20.0) / contrast
 
-    whole, halved, refined = excursion(1), excursion(2), excursion(4)
-    assert 0.05 < whole < 0.11, whole
-    assert halved < whole, (whole, halved)
-    assert refined < halved, (halved, refined)
-    assert refined < 0.0, f"four pieces must bring the delivered temperature back inside the hull: {refined}"
+    one_history, two_modes, default = excursion(1, 1), excursion(1, 2), excursion(1, 6)
+    assert 0.20 < one_history < 0.35, one_history
+    assert 0.04 < two_modes < 0.12, two_modes
+    assert abs(default) < 0.01, default
+    refined = excursion(4, 6)
+    assert abs(refined) < 0.01, f"splitting must leave the settled answer alone: {refined}"
 
 
 def test_the_model_is_linear_in_every_temperature_input(heat_network, hourly_tedges, diurnal_demand, soil, surface):
@@ -1610,6 +1943,7 @@ def test_the_model_is_linear_in_every_temperature_input(heat_network, hourly_ted
         cout_tedges=hourly_tedges,
         network=heat_network,
         soil=soil,
+        n_modes=2,  # linearity is mode-free; two modes keep the four runs near their old cost
     )
     base = heat.source_to_endmember(
         tin=np.full(n, 9.0), surface_temperature=surface(hourly_tedges, amplitude=4.0), **shared
@@ -1619,14 +1953,17 @@ def test_the_model_is_linear_in_every_temperature_input(heat_network, hourly_ted
     )
     np.testing.assert_allclose(scaled, 2.0 * base, rtol=1e-12, atol=1e-7, equal_nan=True)
 
-    tight = dict(shared, atol=1e-11)
+    # The moment pass assembles readings scaled by 1/(h tau), which lifts the sweep's
+    # round-off floor to about 1e-10 on the wide trunk; 1e-10 is the tightest tolerance the
+    # iteration can still cross.
+    tight = dict(shared, atol=1e-10)
     base = heat.source_to_endmember(
         tin=np.full(n, 9.0), surface_temperature=surface(hourly_tedges, amplitude=4.0), **tight
     )
     scaled = heat.source_to_endmember(
         tin=np.full(n, 18.0), surface_temperature=2.0 * surface(hourly_tedges, amplitude=4.0), **tight
     )
-    np.testing.assert_allclose(scaled, 2.0 * base, rtol=1e-12, atol=1e-9, equal_nan=True)
+    np.testing.assert_allclose(scaled, 2.0 * base, rtol=1e-12, atol=1e-8, equal_nan=True)
 
 
 def test_the_answer_does_not_depend_on_the_temperature_origin(
@@ -1648,6 +1985,7 @@ def test_the_answer_does_not_depend_on_the_temperature_origin(
         cout_tedges=hourly_tedges,
         network=heat_network,
         soil=soil,
+        n_modes=2,  # origin invariance is mode-free; two modes keep the runs near their old cost
     )
     base = heat.source_to_endmember(tin=tin, surface_temperature=surface(hourly_tedges, amplitude=4.0), **shared)
     shifted = heat.source_to_endmember(
@@ -1660,14 +1998,15 @@ def test_the_answer_does_not_depend_on_the_temperature_origin(
 
 
 def test_the_inflow_rows_read_the_water_the_parent_delivered(heat_network, short_tedges, diurnal_demand, surface):
-    """With nothing to exchange, the three readings of a segment must collapse onto two.
+    """With nothing to exchange, the readings of a segment must collapse onto each other.
 
-    The flux pass reads each pipe three ways: what it delivers, that reading weighted toward
-    the bin end, and the weighted reading of what *enters* it. The weight is the pipe's own
-    exchange rate, so driving every rate to zero must collapse the weighted delivery onto the
-    plain one, and must leave the inflow row reading exactly what the pipe upstream delivered
-    -- the source series itself for a segment fed by the plant. If the inflow rows were wired
-    to the wrong path, or the weight applied at the wrong end, neither would hold.
+    The flux pass reads each pipe ``4 n_modes - 1`` ways: what it delivers, that reading
+    against the time-moment and integrated kernels toward the bin end, and the same weighted
+    families of what *enters* it. The weight is the pipe's own exchange rate, so driving every rate to zero
+    must collapse the weighted delivery onto the plain one, and must leave the inflow row
+    reading exactly what the pipe upstream delivered -- the source series itself for a
+    segment fed by the plant. If the inflow rows were wired to the wrong path, or the weight
+    applied at the wrong end, neither would hold.
     """
     heat_network.segments["cover"] = "grass"
     inert = pd.DataFrame([{"alpha": GRASS["alpha"], "kappa": 1e-9, "eta": GRASS["eta"]}], index=["grass"])
@@ -1683,12 +2022,19 @@ def test_the_inflow_rows_read_the_water_the_parent_delivered(heat_network, short
         kappa_pipe=None,
         film_coefficient=None,
         spinup=None,
+        n_modes=2,
     )
     rng = np.random.default_rng(41)
     tin = 9.0 + rng.normal(0.0, 1.0, system.n_bins)
-    t_int = heat._internal_pass(system, apply_banded(system.internal, tin), system.t_inf)
+    modes = np.zeros((system.n_modes, *system.t_inf.shape))
+    modes[0] = system.t_inf
+    t_int = heat._internal_pass(system, apply_banded(system.internal, tin), modes)
     n_seg = len(heat_network.segments)
-    delivered, weighted, inflow = t_int[:n_seg], t_int[n_seg : 2 * n_seg], t_int[2 * n_seg :]
+    # Row layout: [plain delivery] + [moment delivery p=0..n_modes-1] + [integrated delivery
+    # p=0..n_modes-2] + [moment entry p=0..] + [integrated entry p=0..]. The plain-exponential
+    # readings are the p=0 moment rows of each family.
+    delivered, weighted = t_int[:n_seg], t_int[n_seg : 2 * n_seg]
+    inflow = t_int[2 * system.n_modes * n_seg : (2 * system.n_modes + 1) * n_seg]
 
     both = np.isfinite(delivered) & np.isfinite(weighted)
     assert both.sum() > 0.5 * delivered.size
@@ -1723,6 +2069,7 @@ def test_leaf_delivery_rows_agree_with_the_transport_module(heat_network, short_
         kappa_pipe=None,
         film_coefficient=None,
         spinup=None,
+        n_modes=2,
     )
     tin = np.full(n, 9.0)
     n_seg = len(heat_network.segments)
@@ -1771,15 +2118,21 @@ def test_wall_flux_vanishes_without_a_temperature_difference(heat_network, hourl
         kappa_pipe=None,
         film_coefficient=None,
         spinup="constant",
+        n_modes=2,
     )
     uniform = np.full(system.n_bins, 14.0)
-    targets = heat._update_targets(
+    resting = np.zeros((system.n_modes, *system.t_inf.shape))
+    resting[0] = system.t_inf
+    updated = heat._update_targets(
         system,
-        heat._internal_pass(system, apply_banded(system.internal, uniform), system.t_inf),
-        system.t_inf,
+        heat._internal_pass(system, apply_banded(system.internal, uniform), resting),
+        resting,
         uniform,
     )
-    np.testing.assert_allclose(targets, system.t_inf, atol=1e-11)
+    np.testing.assert_allclose(updated[0], system.t_inf, atol=1e-11)
+    # The mode residual is round-off of the moment assembly on 14 K readings (~2e-12
+    # relative); measured 3.1e-11 max on this network, anchored at 3x that.
+    np.testing.assert_allclose(updated[1:], 0.0, atol=1e-10)
 
 
 def test_pre_history_transient_decays_with_a_longer_lead_in(heat_pipe):
@@ -1867,6 +2220,7 @@ def test_declaring_a_pipe_as_series_segments_leaves_the_transport_operator_alone
             kappa_pipe=None,
             film_coefficient=None,
             spinup="constant",
+            n_modes=2,
         )
 
     whole = system(heat_network)
@@ -1952,6 +2306,7 @@ def test_an_over_cap_branch_does_not_void_the_warm_start_of_the_whole_network(so
         network=network,
         soil=soil,
         surface_temperature=surface(tedges),
+        n_modes=2,  # the warm-start bookkeeping is mode-free; two modes keep the old cost
     )
 
     out = heat.source_to_endmember(nodes=["T1", "T2"], **shared)
@@ -2002,9 +2357,10 @@ def _reverse_case(network, tedges, demand, soil, surface_frame, *, nodes, tin, *
         soil=soil,
         surface_temperature=surface_frame,
         nodes=nodes,
-        # What these test is the deconvolution and its refusals, none of which the internal
-        # split touches; carrying it here would multiply their cost to re-measure what
-        # test_the_reverse_direction_survives_splitting_the_pipes already covers.
+        # What these test is the deconvolution and its refusals, which the axial mode
+        # count does not touch; two modes keep the outer-times-inner iteration at the
+        # cost these cases were calibrated on.
+        n_modes=2,
     )
     measured = heat.source_to_endmember(tin=tin, **shared)
     recovered = heat.endmember_to_source(tout=measured, **shared, **kwargs)
@@ -2105,8 +2461,14 @@ def test_reverse_tolerates_a_measurement_outage(heat_network, hourly_tedges, diu
         tedges=hourly_tedges,
         cout_tedges=hourly_tedges,
         network=heat_network,
-        soil=soil,
+        # Halved conductivity keeps every segment -- the T4 service line above all --
+        # inside the h*tau coupling boundary the reverse is well-posed within; the
+        # fixture's soil puts C-T4 at 1.27, past it, where no gap handling can converge.
+        soil=soil.assign(kappa=soil["kappa"] * 0.5),
         surface_temperature=surface(hourly_tedges, amplitude=4.0),
+        # What this tests is the deconvolution around a gap, which the mode count does
+        # not touch; two modes keep the outer-times-inner cost at the old scale.
+        n_modes=2,
     )
     measured = heat.source_to_endmember(tin=tin, **shared)
     gapped = measured.copy()
@@ -2171,6 +2533,10 @@ def test_a_measurement_outage_does_not_corrupt_the_record_around_it():
         network=network,
         soil=pd.DataFrame([GRASS], index=["grass"]),
         surface_temperature=pd.DataFrame({"grass": np.full(n, 20.0)}),
+        # The gap contract is a deconvolution property; two modes and a tight tolerance
+        # keep the no-gap premise at the 1e-8 sharpness it was calibrated on.
+        n_modes=2,
+        atol=1e-9,
     )
     measured = heat.source_to_endmember(tin=tin, **shared)
     gap = slice(96, 168)
@@ -2272,15 +2638,17 @@ def test_the_warm_start_prefix_drives_no_wall_flux(heat_pipe, soil, surface):
         kappa_pipe=None,
         film_coefficient=None,
         spinup="constant",
+        n_modes=2,
     )
     assert system.n_pad > 0, "the configuration must actually warm-start, or this pins nothing"
 
     padded = np.concatenate([np.full(system.n_pad, tin[0]), tin])
-    targets = heat._converge_targets(system, padded, max_sweeps=5000, atol=1e-12)
+    targets, tilts = heat._converge_targets(system, padded, max_sweeps=5000, atol=1e-10)
     # A target that never moved from the undisturbed field over the prefix is what "no flux
     # was booked there" looks like from outside: the halo is a causal convolution, so any
     # prefix flux would have shifted these bins first.
     np.testing.assert_allclose(targets[:, : system.n_pad], system.t_inf[:, : system.n_pad], rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(tilts[:, : system.n_pad], 0.0, rtol=0.0, atol=1e-12)
     assert np.max(np.abs(targets[:, system.n_pad :] - system.t_inf[:, system.n_pad :])) > 1e-3, (
         "the record itself must build a halo, or the assertion above is vacuous"
     )
@@ -2336,33 +2704,26 @@ def test_the_reverse_names_the_regime_it_cannot_invert(h_tau):
     assert np.isfinite(one_way).any()
 
 
-def test_the_reverse_names_a_sub_bin_transit_rather_than_the_coupling():
-    """A transit under a bin diverges far below the coupling boundary, and the message says why.
+def test_the_reverse_reconstructs_the_sub_bin_transit_it_once_refused():
+    """The resonant half-bin-transit regime reconstructs on the mode kernels.
 
     A 100 mm main emptied in half an hour on hourly bins couples at only ``h*tau = 0.11``,
-    yet the outer map's spectral radius is 21 (measured by power iteration, issue #40): a
-    parcel crosses the pipe inside a bin, so the deconvolution is nearly singular at the
-    fastest alternation the record carries while the halo coupling still feeds that
-    alternation back. Blaming the coupling here would tell the user to shorten the segment
-    -- which shortens the transit and makes it worse. The message has to name the transit,
-    and the remedy it points at is the one that measurably works: finer bins.
+    yet on the one-history model the outer map's spectral radius was 21 (measured by power
+    iteration, issue #40): a parcel crosses the pipe inside a bin, so the deconvolution is
+    nearly singular at the fastest alternation the record carries while the halo coupling
+    feeds that alternation back. The advected mode kernels changed the outer map -- the
+    same pipe now round-trips to a measured 5e-8 K at the six-mode default, pinned here
+    with a twenty-fold margin. The regime diagnosis stays in the code for whoever still
+    reaches it on harder configurations; what this pins is that this one no longer does.
     """
     # h*tau = rate * (0.5 h): the transit spans half a bin at the median flow.
     shared, tin = _equilibrating_pipe(0.1112, days=8)
     measured = heat.source_to_endmember(tin=tin, **shared)
+    recovered = heat.endmember_to_source(tout=measured, **shared)
+    inner = slice(48, -96)
+    assert float(np.nanmax(np.abs(recovered[inner] - tin[inner]))) < 1e-6
 
-    with pytest.raises(RuntimeError, match="did not converge") as raised:
-        heat.endmember_to_source(tout=measured, **shared)
-    message = str(raised.value)
-    assert "'main'" in message, message
-    assert "transit" in message, message
-    assert "bins" in message, message
-    assert "max_sweeps=1" in message, message
-    assert "past about 0.7" not in message, "a coupling of 0.11 is not past 0.7; the boundary must not be misquoted"
-
-    # The remedy the message names, measured: the same pipe, flow and coupling on 15-minute
-    # bins puts the transit at two bins, and the reverse round-trips. Only the resolution
-    # failed, not the physics.
+    # Finer bins put the transit at two bins and remain the sharper reconstruction.
     network = shared["network"]
     tedges = pd.date_range("2025-06-01", periods=6 * 96 + 1, freq="15min")
     n = len(tedges) - 1
@@ -2396,6 +2757,7 @@ def test_a_service_line_at_a_one_bin_transit_is_the_coupling_regime():
     """
     # h*tau = rate * (1 h) for a 40 mm grass line at depth 1: a one-bin transit.
     shared, tin = _equilibrating_pipe(1.1166, days=8, diameter=0.04)
+    shared["n_modes"] = 2  # the coupling diagnosis is mode-free; two modes keep the old cost
     measured = heat.source_to_endmember(tin=tin, **shared)
 
     with pytest.raises(RuntimeError, match=r"h\*tau = 1\.12") as raised:
@@ -2484,6 +2846,7 @@ def test_a_year_of_hourly_data_converges_and_stays_physical(heat_network, soil, 
         network=heat_network,
         soil=soil,
         surface_temperature=pd.DataFrame({"grass": 12.0 + 10.0 * seasonal, "paved": 16.0 + 12.0 * seasonal}),
+        n_modes=2,  # boundedness over a long record is mode-free; two modes keep the old cost
     )
     finite = out[np.isfinite(out)]
     assert finite.size > 0.9 * out.size
@@ -2509,6 +2872,7 @@ def test_strict_validity_marks_the_same_bins_as_transport(heat_network, hourly_t
         soil=soil,
         surface_temperature=surface(hourly_tedges),
         spinup=None,
+        n_modes=2,  # the NaN mask under test is transport coverage, which the modes cannot move
     )
     conservative = transport.source_to_endmember(
         cin=np.full(n, 8.0),
@@ -2638,6 +3002,7 @@ def test_the_public_surface_holds_at_its_edges(heat_network, soil, surface):
         "network": heat_network,
         "soil": soil,
         "surface_temperature": surface(tedges, amplitude=2.0),
+        "n_modes": 2,  # none of the six shapes is about mode behavior; two modes keep the old cost
     }
 
     # an internal node, and the source itself: a depth-0 path delivers the source unchanged
