@@ -902,6 +902,15 @@ def test_steady_conceptual_gap_has_the_predicted_order_and_unit_coefficient(name
     np.testing.assert_allclose(gap * (2.0 * z) ** 2, 1.0, atol=tolerance)
 
 
+# Mesh for the transient solves, and its half in each direction for the refinement check. The
+# rectangle is deliberately tall rather than square: the discretisation error lives almost
+# entirely in ``v``, across the halo, while the field is smooth around the pipe in ``u``.
+# Measured on the geometry that binds -- the 100 mm line, whose ``v`` extent ``arccosh(d/r_o)``
+# is the largest at 3.75 -- halving ``nu`` from 128 to 96 costs 0.0007 ``g`` where halving
+# ``nv`` from 192 to 128 costs 0.03 ``g``, so the resolution is spent where it buys something.
+_HALO_MESH = (96, 256)
+_HALO_MESH_HALVED = (48, 128)
+
 # Lag schedules ``(dt, n_bins, sub-steps per bin)``. ``hourly`` resolves the first hours,
 # where the cylinder carries the response and the surface is not yet felt; ``daily`` spans the
 # image arrival time ``(2 d_eff)**2/(4 alpha)`` -- 22.5 d at a metre, 5 d for the shallow case
@@ -955,15 +964,16 @@ def test_halo_kernel_matches_the_two_dimensional_reference(geometry, schedule, c
       ``ln(t)/t``: after 1200 days the service line and the main have reached 0.73 and 0.77
       ``g``, the shallow geometry -- whose image time is 16 times shorter -- 0.95 ``g``.
 
-    The reference resolves all of it: doubling the mesh moves these curves by under 0.05
-    ``g``, some two orders below the dip they report.
+    The reference resolves all of it: halving the mesh in both directions moves these curves by
+    at most 0.07 ``g``, so the mesh actually used sits a further four times nearer -- two orders
+    below the dip it reports.
     """
     r_o, d_eff = _HALO_GEOMETRIES[geometry]
     dt_bin, n_bins, sub = _HALO_SCHEDULES[schedule]
     settings = dict(r_o=r_o, d=d_eff, alpha=_HALO_ALPHA, kappa=_HALO_KAPPA, dt_bin=dt_bin, n_bins=n_bins, sub=sub)
     package = _halo_kernel_response(n_bins, dt_bin, r_o, d_eff)
-    fine, stored, injected = _bipolar_halo_transient(192, 256, **settings)
-    coarse, _, _ = _bipolar_halo_transient(96, 128, **settings)
+    fine, stored, injected = _bipolar_halo_transient(*_HALO_MESH, **settings)
+    coarse, _, _ = _bipolar_halo_transient(*_HALO_MESH_HALVED, **settings)
 
     steady_gap = (_steady_shape_factor_series(d_eff / r_o) - np.log(2.0 * d_eff / r_o)) / (2.0 * np.pi * _HALO_KAPPA)
     settled = slice(_HALO_SETTLED[schedule], None)
@@ -1012,15 +1022,23 @@ def test_the_two_dimensional_reference_conserves_heat_and_settles_in_time():
     for name in ("service_100mm", "main_400mm"):
         r_o, d_eff = _HALO_GEOMETRIES[name]
         _, stored, injected = _bipolar_halo_transient(
-            96, 128, r_o=r_o, d=d_eff, alpha=_HALO_ALPHA, kappa=_HALO_KAPPA, dt_bin=0.25 / 6, n_bins=6, sub=24
+            *_HALO_MESH_HALVED,
+            r_o=r_o,
+            d=d_eff,
+            alpha=_HALO_ALPHA,
+            kappa=_HALO_KAPPA,
+            dt_bin=0.25 / 6,
+            n_bins=6,
+            sub=24,
         )
         np.testing.assert_allclose(stored / injected, 1.0, rtol=2e-5, err_msg=name)
 
     r_o, d_eff = _HALO_GEOMETRIES["service_100mm"]
     steady_gap = (_steady_shape_factor_series(d_eff / r_o) - np.log(2.0 * d_eff / r_o)) / (2.0 * np.pi * _HALO_KAPPA)
     settings = dict(r_o=r_o, d=d_eff, alpha=_HALO_ALPHA, kappa=_HALO_KAPPA, dt_bin=20.0, n_bins=60)
-    coarse_step, _, _ = _bipolar_halo_transient(96, 128, **settings, sub=12)
-    fine_step, _, _ = _bipolar_halo_transient(96, 128, **settings, sub=24)
+    # On the halved mesh: this isolates the step, and the mesh is the other test's business.
+    coarse_step, _, _ = _bipolar_halo_transient(*_HALO_MESH_HALVED, **settings, sub=12)
+    fine_step, _, _ = _bipolar_halo_transient(*_HALO_MESH_HALVED, **settings, sub=24)
     assert np.abs(fine_step - coarse_step)[1:].max() < 0.10 * steady_gap
 
 
