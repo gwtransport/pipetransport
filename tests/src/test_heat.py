@@ -838,7 +838,7 @@ def _deficit_kernel_with_nodes(n_bins, dt_bin, *, nodes, r_o, depth, alpha, kapp
     thing that differs and the surrounding arithmetic is this file's own.
     """
     mirror = 2.0 * depth
-    r_inf = ((np.log(mirror / r_o) + 2.0 * hyperu(1, 1, mirror * eta / kappa)) / (2.0 * np.pi * kappa))[:, None]
+    r_inf = ((np.log(mirror / r_o) + heat._image_correction(mirror * eta / kappa)) / (2.0 * np.pi * kappa))[:, None]
     edge = np.arange(n_bins + 1)
     lag = dt_bin * edge[None, :]
     cylinder = heat._cylinder_integral((alpha * dt_bin / r_o**2)[:, None] * edge[None, :])
@@ -3862,16 +3862,22 @@ def test_segment_heat_rate_rejects_a_plain_pipe_network(network):
 
 
 def test_a_pipe_that_is_not_fully_buried_is_rejected_at_construction():
-    """The guard is the geometric minimum ``d_eff > r_o``, not half of it.
+    """The guard is the geometric minimum ``depth > r_o``, not half of it.
 
-    ``ln(2 d_eff/r_o)`` stays positive all the way down to ``d_eff = r_o/2``, so a guard
+    ``ln(2 depth/r_o)`` stays positive all the way down to ``depth = r_o/2``, so a guard
     written on its domain admits pipes standing half out of the ground, where the exact
-    ``acosh(d_eff/r_o)`` it approximates does not exist at all. The resistance then collapses
+    ``acosh(depth/r_o)`` it approximates does not exist at all. The resistance then collapses
     toward zero and the rate diverges: a 1 m main whose axis sits at 0.2505 m is twenty times
     faster than a 100 mm service line. That rate drives the whole coupled solve, which is why
     the second half of this test matters -- with the loose guard the two-way model converged,
     quietly and without exceeding ``max_sweeps``, on a delivered temperature far below every
     input.
+
+    The guard reads the *physical* depth. It once read ``depth + kappa/eta``, which let the
+    surface film buy a pipe its way past: under a poor surface the radiation length is tens of
+    centimetres, so a pipe genuinely standing out of the ground could clear a guard written on
+    the displaced depth. With the image at the true mirrored distance there is no displacement
+    left to hide behind (issue #49).
     """
     segments = pd.DataFrame(
         {
@@ -3895,6 +3901,12 @@ def test_a_pipe_that_is_not_fully_buried_is_rejected_at_construction():
     # clear the walled one -- which is why the guard is written on r_o rather than r_i.
     with pytest.raises(ValueError, match="burial depth must exceed the outer pipe radius"):
         heat.HeatNetwork(segments=segments.assign(depth=0.5001, wall_thickness=0.02), source="P")
+
+    # And a poor surface no longer buys a pipe past the guard: with eta = 0.02 the radiation
+    # length is 1.25 m, which the displaced depth would have added to a pipe half out of the
+    # ground. The physical depth is what is asked about.
+    with pytest.raises(ValueError, match="burial depth must exceed the outer pipe radius"):
+        heat.HeatNetwork(segments=segments.assign(depth=0.4, eta=0.02), source="P")
 
 
 # ============================================================================

@@ -392,6 +392,33 @@ def _cylinder_integral(fo: npt.NDArray[np.floating]) -> npt.NDArray[np.floating]
     return peeled / (2.0 * np.pi) + quadrature.reshape(fo.shape)
 
 
+def _image_correction(x: npt.NDArray[np.floating]) -> npt.NDArray[np.floating]:
+    """``2 exp(x) E1(x)``, the Robin surface's addition to ``ln(2 depth/r_o)``, elementwise.
+
+    The radiating surface weakens the image tail and so *raises* the soil resistance above the
+    prescribed-temperature value: 4 % at 5 W/(m² K) and 21 % at 1, and exactly nothing at
+    ``eta = inf``, where ``x`` is infinite and the correction vanishes.
+
+    That limit is taken here rather than left to ``hyperu``, whose value at an infinite argument
+    is platform-dependent -- 0 on some builds and NaN on others, and a NaN here would propagate
+    through ``R_inf * lag`` into every Dirichlet kernel in the package.
+
+    Parameters
+    ----------
+    x : ndarray
+        ``2 depth eta / kappa`` [-], non-negative; ``inf`` is a prescribed-temperature surface.
+
+    Returns
+    -------
+    ndarray
+        ``2 exp(x) E1(x)`` [-], same shape as ``x``, exactly 0 where ``x`` is infinite.
+    """
+    finite = np.isfinite(x)
+    out = np.zeros(np.shape(x))
+    out[finite] = 2.0 * hyperu(1, 1, x[finite])
+    return out
+
+
 def _deficit_kernel(
     n_bins: int,
     dt_days: float,
@@ -451,7 +478,7 @@ def _deficit_kernel(
         ``Dbar`` [day/m²] per segment and lag bin; ``Dbar[:, 0]`` is ``R_inf - Gbar(dt)``.
     """
     mirror = 2.0 * depth
-    r_inf = ((np.log(mirror / r_o) + 2.0 * hyperu(1, 1, mirror * eta / kappa)) / (2.0 * np.pi * kappa))[:, None]
+    r_inf = ((np.log(mirror / r_o) + _image_correction(mirror * eta / kappa)) / (2.0 * np.pi * kappa))[:, None]
     edge = np.arange(n_bins + 1)[None, :]
     lag = dt_days * edge
     fo_bin, segment_of = np.unique(alpha * dt_days / r_o**2, return_inverse=True)
@@ -930,7 +957,7 @@ def segment_heat_rate(*, network: HeatNetwork) -> dict[str, float]:
     # divide error, so no errstate either.
     film = 1.0 / (2.0 * np.pi * r_i * segments["film_coefficient"].to_numpy(dtype=float))
     wall = np.log(r_o / r_i) / (2.0 * np.pi * segments["kappa_pipe"].to_numpy(dtype=float))
-    soil = (np.log(mirror / r_o) + 2.0 * hyperu(1, 1, mirror * segments["eta"].to_numpy(dtype=float) / kappa_soil)) / (
+    soil = (np.log(mirror / r_o) + _image_correction(mirror * segments["eta"].to_numpy(dtype=float) / kappa_soil)) / (
         2.0 * np.pi * kappa_soil
     )
     rate = 1.0 / ((film + wall + soil) * np.pi * r_i**2)
