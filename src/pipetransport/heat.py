@@ -484,16 +484,24 @@ def _deficit_kernel(
     fo_bin, segment_of = np.unique(alpha * dt_days / r_o**2, return_inverse=True)
     cylinder = _cylinder_integral(fo_bin[:, None] * edge)[segment_of]
 
-    # The image tail, ``2 beta int exp(-beta s) I(c(s)) ds``, as a Gauss-Laguerre rule in
-    # ``u = beta s``. Accumulated one node at a time rather than broadcast: the full
-    # (segment, node, lag) array would be forty times the kernel it collapses to, and a year of
-    # hourly lag bins already fills the kernel. ``eta = inf`` puts every node back at the
-    # mirror, where the rule sums to ``2 I(c(0))`` and leaves the Dirichlet sink -- so the
-    # neutral element needs no branch here either.
-    offsets = mirror[:, None] + _IMAGE_NODES[0] / (eta / kappa)[:, None]
-    image = -_halo_integral((np.square(mirror) / (4.0 * alpha))[:, None], lag)
-    for weight, offset in zip(_IMAGE_NODES[1], offsets.T, strict=True):
-        image += 2.0 * weight * _halo_integral((np.square(offset) / (4.0 * alpha))[:, None], lag)
+    # The image: the mirror at ``2 depth``, plus for a radiating surface the tail of sinks above
+    # it, ``2 beta int exp(-beta s) I(c(s)) ds`` as a Gauss-Laguerre rule in ``u = beta s``. The
+    # tail is accumulated one node at a time rather than broadcast, because the full
+    # (segment, node, lag) array would be forty times the kernel it collapses to and a year of
+    # hourly lag bins already fills the kernel.
+    #
+    # A prescribed-temperature surface puts every node back on the mirror, where the rule sums to
+    # twice it and leaves the classical sink. Those segments are answered with that closed form
+    # rather than by evaluating one integral forty times at the same distance -- which is the
+    # default surface, so it is the common case that would have paid for nothing.
+    image = _halo_integral((np.square(mirror) / (4.0 * alpha))[:, None], lag)
+    radiating = np.isfinite(eta)
+    if radiating.any():
+        offsets = mirror[radiating, None] + _IMAGE_NODES[0] / (eta / kappa)[radiating, None]
+        warmth = -image[radiating]
+        for weight, offset in zip(_IMAGE_NODES[1], offsets.T, strict=True):
+            warmth += 2.0 * weight * _halo_integral((np.square(offset) / (4.0 * alpha[radiating]))[:, None], lag)
+        image[radiating] = warmth
 
     cumulative = r_inf * lag + image / (4.0 * np.pi * kappa[:, None]) - (r_o**2 / (kappa * alpha))[:, None] * cylinder
     return np.diff(cumulative, axis=1) / dt_days
