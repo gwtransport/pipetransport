@@ -604,46 +604,38 @@ def _bipolar_halo_system(nu, nv, *, r_o, d, alpha, kappa, eta=np.inf):
     u = (np.arange(nu) + 0.5) * du
     grid_u, grid_v = np.meshgrid(u, np.arange(1, nv + 1) * dv, indexing="ij")
     scale = a / (np.cosh(grid_v) - np.cos(grid_u))
-    wall_flux = a / (2.0 * np.pi * r_o * kappa * (np.cosh(v0) - np.cos(u)))
-    robin = 2.0 * dv * (eta / kappa) * a / (1.0 - np.cos(u)) if np.isfinite(eta) else None
+    node = np.arange(nu * nv).reshape(nu, nv)
+    column = np.broadcast_to(np.arange(1, nv + 1), (nu, nv))
 
-    rows, cols, vals = [], [], []
-    affine = np.zeros(nu * nv)
-    for i in range(nu):
-        for j in range(1, nv + 1):
-            node = i * nv + (j - 1)
-            diagonal = -2.0 / du**2 - 2.0 / dv**2
-            for neighbour in (i - 1, i + 1):
-                rows.append(node)
-                cols.append(min(max(neighbour, 0), nu - 1) * nv + (j - 1))
-                vals.append(1.0 / du**2)
-            if j == nv:
-                # Wall ghost ``T[nv+1] = T[nv-1] + 2 dv phi``: the outward neighbour folds
-                # back onto the inward one and the flux becomes an affine term.
-                rows.append(node)
-                cols.append(node - 1)
-                vals.append(2.0 / dv**2)
-                affine[node] = 2.0 * wall_flux[i] / dv
-            else:
-                rows.append(node)
-                cols.append(node + 1)
-                vals.append(1.0 / dv**2)
-                if j > 1:
-                    rows.append(node)
-                    cols.append(node - 1)
-                    vals.append(1.0 / dv**2)
-                elif robin is not None:
-                    # ``T0 = (4 T1 - T2)/(3 + gamma)`` from the one-sided surface derivative;
-                    # a Dirichlet surface is ``T0 = 0`` and contributes nothing at all.
-                    weight = 1.0 / ((3.0 + robin[i]) * dv**2)
-                    rows.extend((node, node))
-                    cols.extend((node, node + 1))
-                    vals.extend((4.0 * weight, -weight))
-            rows.append(node)
-            cols.append(node)
-            vals.append(diagonal)
+    # The five-point stencil, then the two boundaries on top of it. The ``u`` neighbours are
+    # clipped rather than wrapped, which is the mirror: at ``i = 0`` the left neighbour is the
+    # node itself, and ``csc_matrix`` summing duplicate entries lands its weight on the diagonal.
+    rows = [node, node, node]
+    cols = [node, node[np.clip(np.arange(nu) - 1, 0, nu - 1)], node[np.clip(np.arange(nu) + 1, 0, nu - 1)]]
+    vals = [
+        np.full(node.shape, -2.0 / du**2 - 2.0 / dv**2),
+        np.full(node.shape, 1.0 / du**2),
+        np.full(node.shape, 1.0 / du**2),
+    ]
+    affine = np.zeros((nu, nv))
 
-    laplacian = csc_matrix((vals, (rows, cols)), shape=(nu * nv, nu * nv))
+    outward = column < nv
+    rows.append(node[outward]), cols.append(node[outward] + 1), vals.append(np.full(outward.sum(), 1.0 / dv**2))
+    inward = outward & (column > 1)
+    rows.append(node[inward]), cols.append(node[inward] - 1), vals.append(np.full(inward.sum(), 1.0 / dv**2))
+    # Wall ghost ``T[nv+1] = T[nv-1] + 2 dv phi``: the outward neighbour folds back onto the
+    # inward one and the flux becomes an affine term.
+    rows.append(node[:, -1]), cols.append(node[:, -1] - 1), vals.append(np.full(nu, 2.0 / dv**2))
+    affine[:, -1] = a / (np.pi * r_o * kappa * dv * (np.cosh(v0) - np.cos(u)))
+    if np.isfinite(eta):
+        # ``T0 = (4 T1 - T2)/(3 + gamma)`` from the one-sided surface derivative; a Dirichlet
+        # surface is ``T0 = 0`` and contributes nothing at all, so it needs no branch of its own.
+        weight = 1.0 / ((3.0 + 2.0 * dv * (eta / kappa) * a / (1.0 - np.cos(u))) * dv**2)
+        rows.append(node[:, 0]), cols.append(node[:, 0]), vals.append(4.0 * weight)
+        rows.append(node[:, 0]), cols.append(node[:, 0] + 1), vals.append(-weight)
+
+    flat = [np.concatenate([part.reshape(-1) for part in stack]) for stack in (vals, rows, cols)]
+    laplacian = csc_matrix((flat[0], (flat[1], flat[2])), shape=(nu * nv, nu * nv))
     wall_weight = a / (np.cosh(v0) - np.cos(u))
     # Cell areas ``h**2 du dv``, doubled for the reflected half. Midpoint in ``u`` (the grid is
     # cell-centred) but trapezoidal in ``v``, where the nodes sit *on* the boundaries: the wall
@@ -651,7 +643,7 @@ def _bipolar_halo_system(nu, nv, *, r_o, d, alpha, kappa, eta=np.inf):
     # weights instead leave a first-order bias that does not settle under refinement.
     area = np.square(scale) * du * dv * 2.0
     area[:, -1] *= 0.5
-    return laplacian, (alpha / np.square(scale)).reshape(-1), affine, wall_weight, area.reshape(-1)
+    return laplacian, (alpha / np.square(scale)).reshape(-1), affine.reshape(-1), wall_weight, area.reshape(-1)
 
 
 def _bipolar_wall_mean(temperature, wall_weight, nv):
@@ -680,16 +672,12 @@ def _bipolar_halo_isothermal(nu, nv, *, r_o, d, kappa):
     v0 = np.arccosh(d / r_o)
     dv = v0 / nv
     laplacian, _, _, wall_weight, _ = _bipolar_halo_system(nu, nv, r_o=r_o, d=d, alpha=1.0, kappa=kappa)
-    # Wall held at 1, surface at 0: only the wall rows carry an affine term, and the ghost
-    # elimination of the flux condition is replaced by the prescribed value.
-    node = np.arange(wall_weight.size) * nv + (nv - 1)
-    interior = laplacian.tolil()
-    for k in node:
-        interior[k, :] = 0.0
-        interior[k, k] = 1.0
-    rhs = np.zeros(wall_weight.size * nv)
-    rhs[node] = 1.0
-    temperature = np.asarray(spsolve(interior.tocsc(), rhs)).reshape(wall_weight.size, nv)
+    # Wall held at 1, surface at 0: the wall rows drop their ghost elimination of the flux
+    # condition for the prescribed value, which is a diagonal mask on the assembled system.
+    held = np.zeros(wall_weight.size * nv)
+    held[np.arange(wall_weight.size) * nv + (nv - 1)] = 1.0
+    interior = (diags(1.0 - held) @ laplacian + diags(held)).tocsc()
+    temperature = np.asarray(spsolve(interior, held)).reshape(wall_weight.size, nv)
     # Flux out of the wall by the second-order one-sided derivative; the metric cancels in
     # ``kappa h**-1 T_v * h du``, so the total is a plain sum over the u grid, doubled.
     gradient = (3.0 * temperature[:, -1] - 4.0 * temperature[:, -2] + temperature[:, -3]) / (2.0 * dv)
@@ -732,10 +720,11 @@ def _bipolar_halo_transient(nu, nv, *, r_o, d, alpha, kappa, dt_bin, n_bins, sub
         temperature = crank.solve(explicit @ temperature + dt * source)
         trace.append(_bipolar_wall_mean(temperature, wall_weight, nv))
 
-    trace = np.asarray(trace).reshape(-1)
-    edges = np.arange(n_bins) * sub
-    gbar = np.array([(0.5 * trace[e] + trace[e + 1 : e + sub].sum() + 0.5 * trace[e + sub]) / sub for e in edges])
-    return gbar, (kappa / alpha) * float(temperature @ area), n_bins * dt_bin
+    # Trapezoid within each lag bin, taken as differences of one cumulative trapezoid so the
+    # sub-step endpoints each bin shares with the next are summed once.
+    wall = np.asarray(trace)
+    cumulative = np.concatenate(([0.0], np.cumsum(0.5 * (wall[:-1] + wall[1:]))))
+    return np.diff(cumulative[::sub]) / sub, (kappa / alpha) * float(temperature @ area), n_bins * dt_bin
 
 
 def _steady_shape_factor_series(z, n=400):
