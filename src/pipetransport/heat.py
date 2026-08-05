@@ -111,27 +111,30 @@ Validity
   branch cut of its Laplace transform, once per distinct ``alpha dt / r_o**2`` at build
   time, and holds about 1e-13 relative over every Fourier number reachable here. The image
   keeps its line source, and the whole conceptual model -- cylinder, line image, saturation at
-  ``ln(2 d_eff/r_o)`` -- has been measured against an independent 2-D solve of the true
+  ``ln(2 depth/r_o)`` -- has been measured against an independent 2-D solve of the true
   boundary-value problem, which carries no image and is never told a resistance (issue #43).
-  Steadily it costs ``(r_o/2 d_eff)**2/(2 pi kappa)`` with a coefficient measured at 1.00,
-  0.995 and 0.98 for ``d_eff/r_o`` of 21, 5.3 and 2.5: 1.5e-4 of ``R_soil`` for a 100 mm
+  Steadily it costs ``(r_o/2 depth)**2/(2 pi kappa)`` with a coefficient measured at 1.00,
+  0.995 and 0.98 for ``depth/r_o`` of 21, 5.3 and 2.5: 1.5e-4 of ``R_soil`` for a 100 mm
   service line buried a metre, 3.7e-3 for a 400 mm main, 2.4e-2 at two and a half radii. The
-  sign says ``ln(2 d_eff/r_o)`` sits midway between the two wall conditions, above the
-  isothermal ``acosh(d_eff/r_o)`` by what it falls short of the uniform-flux answer by.
+  sign says ``ln(2 depth/r_o)`` sits midway between the two wall conditions, above the
+  isothermal ``acosh(depth/r_o)`` by what it falls short of the uniform-flux answer by.
   Transiently the gap is larger, not smaller: the true surface starts cooling the wall before
-  the line image does -- the image is read from the axis at ``2 d_eff`` while the near side of
-  the wall sees its own at ``2(d_eff - r_o)`` -- so while it arrives the model over-credits the
+  the line image does -- the image is read from the axis at ``2 depth`` while the near side of
+  the wall sees its own at ``2(depth - r_o)`` -- so while it arrives the model over-credits the
   resistance that has reached the wall, by 2.7 times the steady gap over the geometries
-  measured (``d_eff/r_o`` of 2.5 to 21, the ratio itself growing about as ``ln(2 d_eff/r_o)``
+  measured (``depth/r_o`` of 2.5 to 21, the ratio itself growing about as ``ln(2 depth/r_o)``
   while the absolute error shrinks), returning to it only as ``1/t``. All of it grows as the
   burial approaches ``r_o``. Before the surface is felt at all the kernel is exact to 3e-6 of
   ``R_soil``, which is that same solve confirming the cylinder quadrature by a route sharing
-  nothing with it. The surface film, folded in as a perfect surface displaced down by
-  ``kappa/eta``, is measured the same way: against a genuine Robin surface -- and against the
-  closed form of its exact image distribution, ``ln(2 d/r_o) + 2 exp(x) E1(x)`` at
-  ``x = 2 d eta/kappa`` -- the displacement captures 99.95 % of what the film does and errs
-  low, 2.0e-4 day/m² at ``eta = 0.41``, which is 8.5e-6 of ``R_soil`` and so a good order below
-  the cylinder-image gap it is combined with.
+  nothing with it. The surface film is *not* approximated: a radiating surface images a source
+  as a positive mirror at the true ``2 depth`` plus a tail of sinks at ``2 depth + s`` weighted
+  ``2 beta exp(-beta s)``, ``beta = eta/kappa``, and that whole distribution is what the halo
+  carries (issue #49). It sums in closed form steadily and reuses the same ``E1`` in time, so
+  the cost is one Gauss-Laguerre rule; both classical surfaces fall out of it without a branch,
+  ``eta = inf`` giving the Dirichlet sink and ``eta -> 0`` the insulated mirror. What this
+  replaced -- a perfect surface displaced down by the radiation length -- understated the
+  resistance by 2.0e-4 day/m² under a 20 W/(m² K) surface but by 0.26, about 1 % of ``R_soil``,
+  under a 1 W/(m² K) one.
   What the cylinder buys is the first lag bin, where a line source read at ``r = r_o``
   understates the arrived resistance badly because the heat has not yet diffused past the
   pipe: ``Dbar[0]/R_soil`` is 0.8568 for a 100 mm service line and 0.9323 for a 400 mm main
@@ -199,7 +202,7 @@ import numpy.typing as npt
 import pandas as pd
 from scipy.fft import irfft, next_fast_len, rfft
 from scipy.signal import fftconvolve, lfilter
-from scipy.special import erfc, erfcx, exp1, j1, y1
+from scipy.special import erfc, erfcx, exp1, hyperu, j1, roots_laguerre, y1
 
 from pipetransport._transfer import (
     NetworkTransfer,
@@ -248,6 +251,13 @@ _DIVERGENCE_STEPS = 5
 # the transit diagnosis remains for configurations that still reach it.
 _COUPLING_LIMIT = 0.7
 _SHORT_TRANSIT_BINS = 1.5
+# Gauss-Laguerre rule for the Robin image tail, ``2 beta int exp(-beta s) f(2 depth + s) ds``.
+# The integrand is a diffusion kernel read at a distance that grows with the node, so the rule
+# converges faster the stronger the film: at the 20 W/(m² K) of a typical surface eight nodes
+# already hold 1e-13 day/m², and the count is set by the weakest film worth serving. At
+# 1 W/(m² K) -- a still, insulating cover, where the tail reaches ten times as far -- eight
+# nodes hold only 2e-4 and twenty 2e-7, while forty reach 8e-11 against a 320-node rule.
+_IMAGE_NODES = roots_laguerre(40)
 
 
 def _step_response_integral(
@@ -387,24 +397,38 @@ def _deficit_kernel(
     dt_days: float,
     *,
     r_o: npt.NDArray[np.floating],
-    d_eff: npt.NDArray[np.floating],
+    depth: npt.NDArray[np.floating],
     alpha: npt.NDArray[np.floating],
     kappa: npt.NDArray[np.floating],
+    eta: npt.NDArray[np.floating],
 ) -> npt.NDArray[np.floating]:
     """Bin-averaged transient deficit ``Dbar[m]`` of every segment, shape ``(n_seg, n_bins)``.
 
     The wall-temperature step response is the constant-flux cylinder at the outer pipe radius
-    (:func:`_cylinder_integral`) minus a mirror-image line sink at ``2 d_eff``, which is what
-    makes the halo saturate at the steady buried-pipe resistance
-    ``R_inf = ln(2 d_eff/r_o)/(2 pi kappa)``. The image keeps its closed form
-    ``E1(c_i/t)/(4 pi kappa)``: a cylinder read from ``2 d_eff`` away rather than from its own
-    wall is a line to the same order the *steady* resistance above already is. What the
-    conceptual model as a whole costs against the true boundary-value problem is measured, not
-    assumed, in ``test_heat.py``'s two-dimensional reference: ``(r_o/2 d_eff)**2/(2 pi kappa)``
-    at steady state with a coefficient of 1.00 to 0.98 over ``d_eff/r_o`` from 21 down to 2.5,
-    and 2.7 times that transiently while the image arrives -- over that same range of
-    ``d_eff/r_o``, the ratio growing about as ``ln(2 d_eff/r_o)`` beyond it. Both grow as the
-    burial approaches ``r_o``.
+    (:func:`_cylinder_integral`) minus the half space's image of it, which is what makes the
+    halo saturate instead of growing without bound.
+
+    A radiating surface does not mirror a source into a single sink. Its exact image is a
+    *positive* mirror at the true ``2 depth`` followed by a tail of sinks continuing upward,
+    at ``2 depth + s`` with weight ``2 beta exp(-beta s)`` and ``beta = eta/kappa`` the inverse
+    radiation length. Both classical limits fall out of that one expression without a branch:
+    as ``beta -> inf`` the tail collapses onto the mirror and flips it to the familiar
+    Dirichlet sink, and at ``beta = 0`` the bare positive mirror is the insulated surface.
+
+    Steadily the tail sums in closed form, so the halo saturates at
+
+    ``R_inf = (ln(2 depth/r_o) + 2 exp(x) E1(x)) / (2 pi kappa)``,  ``x = 2 depth eta / kappa``
+
+    with ``2 exp(x) E1(x) = 2 hyperu(1, 1, x)``, which is exactly 0 at ``eta = inf``. In time
+    the ``s`` integral commutes with the time integral, so each image in the tail contributes
+    the same closed form :func:`_halo_integral` the single sink used to, and the tail becomes a
+    Gauss-Laguerre rule over ``s``.
+
+    What the conceptual model as a whole costs against the true boundary-value problem is
+    measured, not assumed, in ``test_heat.py``'s two-dimensional reference:
+    ``(r_o/2 depth)**2/(2 pi kappa)`` at steady state with a coefficient of 1.00 to 0.98 over
+    ``depth/r_o`` from 21 down to 2.5, and 2.7 times that transiently while the image arrives.
+    Both grow as the burial approaches ``r_o``.
 
     The deficit ``D = R_inf - G`` is what has *not yet arrived*; its bin average over lag bin
     ``m`` comes from the time integral of ``G``, closed-form for the image and quadrature for
@@ -417,26 +441,34 @@ def _deficit_kernel(
         Number of lag bins.
     dt_days : float
         Bin width [days].
-    r_o, d_eff, alpha, kappa : ndarray
-        Outer radius [m], effective burial depth [m], diffusivity and conductivity ratio
-        [m²/day] of every segment, length ``n_seg``.
+    r_o, depth, alpha, kappa, eta : ndarray
+        Outer radius [m], burial depth to the axis [m], diffusivity and conductivity ratio
+        [m²/day], and surface film coefficient [m/day] of every segment, length ``n_seg``.
 
     Returns
     -------
     ndarray
         ``Dbar`` [day/m²] per segment and lag bin; ``Dbar[:, 0]`` is ``R_inf - Gbar(dt)``.
     """
-    c_i = ((2.0 * d_eff) ** 2 / (4.0 * alpha))[:, None]
-    r_inf = (np.log(2.0 * d_eff / r_o) / (2.0 * np.pi * kappa))[:, None]
+    mirror = 2.0 * depth
+    r_inf = ((np.log(mirror / r_o) + 2.0 * hyperu(1, 1, mirror * eta / kappa)) / (2.0 * np.pi * kappa))[:, None]
     edge = np.arange(n_bins + 1)[None, :]
     lag = dt_days * edge
     fo_bin, segment_of = np.unique(alpha * dt_days / r_o**2, return_inverse=True)
     cylinder = _cylinder_integral(fo_bin[:, None] * edge)[segment_of]
-    cumulative = (
-        r_inf * lag
-        - (r_o**2 / (kappa * alpha))[:, None] * cylinder
-        + _halo_integral(c_i, lag) / (4.0 * np.pi * kappa[:, None])
-    )
+
+    # The image tail, ``2 beta int exp(-beta s) I(c(s)) ds``, as a Gauss-Laguerre rule in
+    # ``u = beta s``. Accumulated one node at a time rather than broadcast: the full
+    # (segment, node, lag) array would be forty times the kernel it collapses to, and a year of
+    # hourly lag bins already fills the kernel. ``eta = inf`` puts every node back at the
+    # mirror, where the rule sums to ``2 I(c(0))`` and leaves the Dirichlet sink -- so the
+    # neutral element needs no branch here either.
+    offsets = mirror[:, None] + _IMAGE_NODES[0] / (eta / kappa)[:, None]
+    image = -_halo_integral((np.square(mirror) / (4.0 * alpha))[:, None], lag)
+    for weight, offset in zip(_IMAGE_NODES[1], offsets.T, strict=True):
+        image += 2.0 * weight * _halo_integral((np.square(offset) / (4.0 * alpha))[:, None], lag)
+
+    cumulative = r_inf * lag + image / (4.0 * np.pi * kappa[:, None]) - (r_o**2 / (kappa * alpha))[:, None] * cylinder
     return np.diff(cumulative, axis=1) / dt_days
 
 
@@ -673,24 +705,28 @@ class HeatNetwork(PipeNetwork):
             capacity of water [m²/day].
         ``depth``
             Burial depth to the pipe axis [m]. Default 1.0. It must put the pipe below the
-            surface, ``d_eff > r_o``; the exact shape factors do not exist below that and the
-            ``ln(2 d_eff/r_o)`` used here runs away to a divergent rate rather than to an
+            surface, ``depth > r_o``; the exact shape factors do not exist below that and the
+            ``ln(2 depth/r_o)`` used here runs away to a divergent rate rather than to an
             error. That log is the large-``d/r`` limit of both exact factors, and it sits
-            between them: ``1/(4 (d_eff/r_o)**2)`` above the isothermal-wall
-            ``acosh(d_eff/r_o)`` and, *while* ``d_eff >> r_o``, the same amount below the
+            between them: ``1/(4 (depth/r_o)**2)`` above the isothermal-wall
+            ``acosh(depth/r_o)`` and, *while* ``depth >> r_o``, the same amount below the
             uniform-flux wall this model actually imposes (measured in ``test_heat.py`` at
-            ``d_eff/r_o`` of 21, 5.3 and 2.5). So accuracy is a matter of how far above the
+            ``depth/r_o`` of 21, 5.3 and 2.5). So accuracy is a matter of how far above the
             guard the pipe is: 0.015 % for a 100 mm service line and 0.4 % for a 400 mm main
-            at a metre, 5.3 % at ``d_eff = 2 r_o``, 24 % for a DN1600 there, and 117 % for a
+            at a metre, 5.3 % at ``depth = 2 r_o``, 24 % for a DN1600 there, and 117 % for a
             DN2000 -- leaving the default depth on a transmission main is the mis-entry to
             watch. Those last figures are against ``acosh``; near the guard the two wall
-            conditions part company entirely (as ``d_eff -> r_o`` the isothermal resistance
+            conditions part company entirely (as ``depth -> r_o`` the isothermal resistance
             goes to zero while the uniform-flux one stays finite), so against the flux wall
             the same two rows read 13 % and 25 %. Either way the pipe is in the wrong regime.
+            The guard reads the *physical* depth: the surface film no longer displaces it, so
+            a shallow pipe under a poor surface that once slipped past is now refused.
         ``eta``
             Surface film coefficient [m/day]. Default ``inf``, a prescribed-temperature
-            surface: the radiation length ``kappa_soil / eta`` is then exactly zero and the
-            surface displaces the effective depth by nothing.
+            surface, which the exact image reaches without a branch: ``hyperu(1, 1, inf)`` is
+            exactly 0, leaving the classical sink at ``2 depth``. Lowering it lengthens the
+            tail of images above the surface and raises the soil resistance -- by 4 % at
+            5 W/(m² K) and 21 % at 1, against a perfect surface.
         ``wall_thickness``, ``kappa_pipe``
             Pipe wall geometry [m] and conductivity over the water heat capacity [m²/day].
             Defaults 0.0 and ``inf``, which together are exactly the bare pipe: the wall
@@ -820,11 +856,8 @@ class HeatNetwork(PipeNetwork):
             msg = "wall_thickness must be non-negative (0 is the bare pipe)"
             raise ValueError(msg)
         r_o = segments["diameter"].to_numpy(dtype=float) / 2.0 + thickness
-        d_eff = segments["depth"].to_numpy(dtype=float) + (
-            segments["kappa_soil"].to_numpy(dtype=float) / segments["eta"].to_numpy(dtype=float)
-        )
-        if not np.all(d_eff > r_o):
-            msg = "burial depth must exceed the outer pipe radius (d_eff > r_o); the line-source geometry needs d >> r"
+        if not np.all(segments["depth"].to_numpy(dtype=float) > r_o):
+            msg = "burial depth must exceed the outer pipe radius (depth > r_o); the line-source geometry needs d >> r"
             raise ValueError(msg)
 
 
@@ -838,7 +871,8 @@ def segment_heat_rate(*, network: HeatNetwork) -> dict[str, float]:
     ``h = 1 / ((R_film + R_wall + R_soil) * pi * r_i**2)``, with
     ``R_film = 1 / (2 pi r_i * film_coefficient)``,
     ``R_wall = ln(r_o/r_i) / (2 pi kappa_pipe)`` and
-    ``R_soil = ln(2 d_eff / r_o) / (2 pi kappa_soil)`` (``d_eff = depth + kappa_soil/eta``).
+    ``R_soil = (ln(2 depth / r_o) + 2 exp(x) E1(x)) / (2 pi kappa_soil)``,
+    ``x = 2 depth eta / kappa_soil``.
 
     ``R_soil`` is the steady buried-pipe resistance -- the fully developed halo, whose
     saturation the mirror image above the surface provides. The rate inherits the
@@ -890,12 +924,15 @@ def segment_heat_rate(*, network: HeatNetwork) -> dict[str, float]:
     r_i = segments["diameter"].to_numpy(dtype=float) / 2.0
     r_o = r_i + segments["wall_thickness"].to_numpy(dtype=float)
     kappa_soil = segments["kappa_soil"].to_numpy(dtype=float)
-    d_eff = segments["depth"].to_numpy(dtype=float) + kappa_soil / segments["eta"].to_numpy(dtype=float)
-    # ``x / inf`` is exactly 0.0 and ``ln(r_i/r_i)`` is exactly 0.0, so the neutral elements
-    # need no branch -- and dividing by inf is not a divide error, so no errstate either.
+    mirror = 2.0 * segments["depth"].to_numpy(dtype=float)
+    # ``x / inf`` is exactly 0.0, ``ln(r_i/r_i)`` is exactly 0.0 and ``hyperu(1, 1, inf)`` is
+    # exactly 0.0, so the neutral elements need no branch -- and dividing by inf is not a
+    # divide error, so no errstate either.
     film = 1.0 / (2.0 * np.pi * r_i * segments["film_coefficient"].to_numpy(dtype=float))
     wall = np.log(r_o / r_i) / (2.0 * np.pi * segments["kappa_pipe"].to_numpy(dtype=float))
-    soil = np.log(2.0 * d_eff / r_o) / (2.0 * np.pi * kappa_soil)
+    soil = (np.log(mirror / r_o) + 2.0 * hyperu(1, 1, mirror * segments["eta"].to_numpy(dtype=float) / kappa_soil)) / (
+        2.0 * np.pi * kappa_soil
+    )
     rate = 1.0 / ((film + wall + soil) * np.pi * r_i**2)
     return {str(name): float(value) for name, value in zip(segments.index, rate, strict=True)}
 
@@ -1059,8 +1096,7 @@ def _build_system(
 
     rate = np.array([segment_heat_rate(network=network)[str(name)] for name in segments.index])
     r_o = segments["diameter"].to_numpy(dtype=float) / 2.0 + segments["wall_thickness"].to_numpy(dtype=float)
-    d_eff = depth_seg + kappa_seg / eta_seg
-    dbar = _deficit_kernel(n_bins, dt_days, r_o=r_o, d_eff=d_eff, alpha=alpha_seg, kappa=kappa_seg)
+    dbar = _deficit_kernel(n_bins, dt_days, r_o=r_o, depth=depth_seg, alpha=alpha_seg, kappa=kappa_seg, eta=eta_seg)
     # The halo memory convolves this frozen kernel with a new flux history on every sweep, so
     # the kernel is transformed once here, at the length ``scipy.signal.fftconvolve`` would
     # have picked itself -- which makes the per-sweep multiply-and-invert bit-identical to it.

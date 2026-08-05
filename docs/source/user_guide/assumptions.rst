@@ -352,34 +352,47 @@ transform, once per distinct :math:`\alpha \Delta t / r_o^2` when the system is 
 them is exact only to a stated tolerance rather than in closed form.
 
 The image keeps its line source, and what that whole conceptual choice costs --- cylinder at the wall,
-line image at :math:`2 d_\text{eff}`, saturating at :math:`\ln(2 d_\text{eff}/r_o)` --- is measured
-rather than bounded. An independent two-dimensional solve of the true problem in the cross-sectional
-plane, which carries no image at all and is never told a resistance, puts the steady uniform-flux wall
-temperature *above* the package's by :math:`(r_o/2 d_\text{eff})^2/(2\pi\kappa)`, the measured
-coefficient being 1.00, 0.995 and 0.98 at :math:`d_\text{eff}/r_o` of 21, 5.3 and 2.5 --- so
-:math:`1.5\times10^{-4}` of :math:`R_\text{soil}` for a 100 mm service line buried a metre,
-:math:`3.7\times10^{-3}` for a 400 mm main and :math:`2.4\times10^{-2}` at two and a half radii. The
-sign is worth reading: to leading order :math:`\ln(2 d_\text{eff}/r_o)` sits midway between the two
-wall conditions, exceeding the isothermal :math:`\operatorname{acosh}(d_\text{eff}/r_o)` by what it
+line image, resistance saturating at :math:`\ln(2 d/r_o)` --- is measured rather than bounded. An
+independent two-dimensional solve of the true problem in the cross-sectional plane, which carries no
+image at all and is never told a resistance, puts the steady uniform-flux wall temperature *above* the
+package's by :math:`(r_o/2 d)^2/(2\pi\kappa)`, the measured coefficient being 1.00, 0.995 and 0.98 at
+:math:`d/r_o` of 21, 5.3 and 2.5 --- so :math:`1.5\times10^{-4}` of :math:`R_\text{soil}` for a 100 mm
+service line buried a metre, :math:`3.7\times10^{-3}` for a 400 mm main and :math:`2.4\times10^{-2}` at
+two and a half radii. The sign is worth reading: to leading order :math:`\ln(2 d/r_o)` sits midway
+between the two wall conditions, exceeding the isothermal :math:`\operatorname{acosh}(d/r_o)` by what it
 falls short of the uniform-flux answer by --- only to leading order, since the quartic terms differ.
-Transiently the gap is *larger* rather than smaller. The true surface starts cooling the wall before
-the line image does --- the image is read from the axis at :math:`2 d_\text{eff}`, while the near side
-of the wall sees its own at :math:`2(d_\text{eff} - r_o)` --- so while it arrives the model credits the
-wall with more resistance than has reached it, by 2.7 times the steady gap over the geometries measured
-(:math:`d_\text{eff}/r_o` of 2.5 to 21; the ratio itself keeps growing roughly as
-:math:`\ln(2 d_\text{eff}/r_o)`, though the absolute error shrinks). It returns to the steady gap only
-as :math:`1/t`. All of it grows as the burial approaches :math:`r_o`.
 
-The surface film is folded into the same picture by displacing the surface downward by the radiation
-length :math:`\kappa/\eta` and treating it as perfect --- the effective depth
-:math:`d_\text{eff} = d + \kappa/\eta`. A genuine Robin surface is not one image but a distribution of
-them, and summing that distribution in closed form gives
-:math:`2\pi\kappa R = \ln(2 d/r_o) + 2 e^{x} E_1(x)` with :math:`x = 2 d \eta/\kappa`. Measured against
-it --- and independently against the two-dimensional solve, which agrees with the closed form to its
-own discretisation floor --- the displacement captures 99.95 % of what the film does, and always
-errs low: :math:`2.0\times10^{-4}` day/m² at :math:`h_s = 20` W/(m² K), which is
-:math:`8.5\times10^{-6}` of :math:`R_\text{soil}` and so more than an order below the cylinder-image
-gap it is combined with. It grows as the film weakens.
+Transiently the gap is *larger* rather than smaller. The true surface starts cooling the wall before
+the line image does --- the image is read from the axis at :math:`2 d`, while the near side of the wall
+sees its own at :math:`2(d - r_o)` --- so while it arrives the model credits the wall with more
+resistance than has reached it, by 2.7 times the steady gap over the geometries measured
+(:math:`d/r_o` of 2.5 to 21; the ratio itself keeps growing roughly as :math:`\ln(2 d/r_o)`, though the
+absolute error shrinks). It returns to the steady gap only as :math:`1/t`. All of it grows as the
+burial approaches :math:`r_o`.
+
+The surface film is not approximated. A radiating surface does not mirror a source into one sink: its
+exact image is a *positive* mirror at the true :math:`2 d` followed by a tail of sinks at
+:math:`2 d + s` weighted :math:`2\beta e^{-\beta s}`, with :math:`\beta = \eta/\kappa` the inverse
+radiation length. That whole distribution is what the halo carries. It sums in closed form at steady
+state,
+
+.. math::
+
+   2 \pi \kappa R_\text{soil} = \ln(2 d / r_o) + 2 e^{x} E_1(x), \qquad x = 2 d \eta / \kappa,
+
+and in time the :math:`s` integral commutes with the time integral, so each image in the tail
+contributes the same exponential-integral form the single sink did and the tail becomes one
+Gauss-Laguerre rule. Both classical surfaces are limits of that one expression, reached without a
+branch: as :math:`\beta \to \infty` the tail collapses onto the mirror and flips it to the familiar
+Dirichlet sink, and at :math:`\beta = 0` the bare positive mirror is the insulated surface.
+
+Earlier versions instead displaced the surface downward by the radiation length and solved a Dirichlet
+problem there. Measured against a two-dimensional solve holding the Robin condition itself, that
+displacement understated the resistance --- always in the same direction --- by
+:math:`2.0\times10^{-4}` day/m² at :math:`h_s = 20` W/(m² K), :math:`8.3\times10^{-3}` at 5, and 0.26,
+about 1 % of :math:`R_\text{soil}`, at 1, where the radiation length reaches a quarter of the burial
+depth. The exact image tracks the same solve to :math:`3\times10^{-3}` day/m² over the whole approach
+and to :math:`3\times10^{-6}` at saturation.
 
 **What breaks if it is violated.** Two mains sharing a trench warm each other's soil, which this
 model does not represent --- each segment sees only its own halo, so the delivered temperature of

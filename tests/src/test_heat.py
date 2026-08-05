@@ -24,7 +24,7 @@ from scipy.integrate import quad
 from scipy.linalg import solve_banded
 from scipy.sparse import csc_matrix, diags, identity
 from scipy.sparse.linalg import splu, spsolve
-from scipy.special import erfc, erfcx, exp1, hyperu, j1, kve, y1
+from scipy.special import erfc, erfcx, exp1, hyperu, j1, kve, roots_laguerre, y1
 
 from pipetransport import heat, transport
 from pipetransport._transfer import apply_banded, apply_segment_targets, paths_transfer
@@ -373,7 +373,13 @@ def test_deficit_kernel_matches_the_gaussian_line_source():
     r_outer, d_eff, dt = 0.05, 1.0605, 20.0
     alpha, kappa = GRASS["alpha"], GRASS["kappa"]
     dbar = heat._deficit_kernel(
-        6, dt, r_o=np.array([r_outer]), d_eff=np.array([d_eff]), alpha=np.array([alpha]), kappa=np.array([kappa])
+        6,
+        dt,
+        r_o=np.array([r_outer]),
+        depth=np.array([d_eff]),
+        alpha=np.array([alpha]),
+        kappa=np.array([kappa]),
+        eta=np.array([np.inf]),
     )[0]
     r_inf = np.log(2.0 * d_eff / r_outer) / (2.0 * np.pi * kappa)
     # Dbar = R_inf - Gbar_pipe + Gbar_image, so the image is what is left over.
@@ -474,7 +480,8 @@ def test_deficit_kernel_pins_the_first_lag_bin_share_of_the_soil_resistance():
             1,
             dt,
             r_o=np.array([r_outer]),
-            d_eff=np.array([d_eff]),
+            depth=np.array([d_eff]),
+            eta=np.array([np.inf]),
             alpha=np.array([GRASS["alpha"]]),
             kappa=np.array([GRASS["kappa"]]),
         )[0]
@@ -494,7 +501,8 @@ def test_deficit_kernel_shares_one_solve_between_identical_geometries():
         5,
         1.0 / 24.0,
         r_o=np.array([0.05, 0.2, 0.05, 0.05]),
-        d_eff=d_eff,
+        depth=d_eff,
+        eta=np.full(4, np.inf),
         alpha=np.array([0.05, 0.05, 0.05, 0.05]),
         kappa=np.array([0.025, 0.025, 0.025, 0.025]),
     )
@@ -508,7 +516,13 @@ def test_deficit_kernel_saturates_at_the_steady_buried_pipe_resistance():
     """The deficit vanishes at long lag: the halo stops growing because of the mirror image."""
     r_outer, d_eff = 0.05, 1.0605
     dbar = heat._deficit_kernel(
-        2, 4000.0, r_o=np.array([r_outer]), d_eff=np.array([d_eff]), alpha=np.array([0.05]), kappa=np.array([0.025])
+        2,
+        4000.0,
+        r_o=np.array([r_outer]),
+        depth=np.array([d_eff]),
+        alpha=np.array([0.05]),
+        kappa=np.array([0.025]),
+        eta=np.array([np.inf]),
     )[0]
     r_inf = np.log(2.0 * d_eff / r_outer) / (2.0 * np.pi * 0.025)
     assert dbar[-1] / r_inf < 1e-3
@@ -529,7 +543,13 @@ def test_deficit_kernel_tail_follows_the_physical_law():
     r_outer, d_eff, alpha, kappa = 0.05, 1.0605, 0.05, 0.025
     dt = 200.0
     dbar = heat._deficit_kernel(
-        60, dt, r_o=np.array([r_outer]), d_eff=np.array([d_eff]), alpha=np.array([alpha]), kappa=np.array([kappa])
+        60,
+        dt,
+        r_o=np.array([r_outer]),
+        depth=np.array([d_eff]),
+        alpha=np.array([alpha]),
+        kappa=np.array([kappa]),
+        eta=np.array([np.inf]),
     )[0]
     lag = dt * (np.arange(60) + 0.5)
     image = ((2.0 * d_eff) ** 2 - r_outer**2) / (16.0 * np.pi * kappa * alpha)
@@ -540,7 +560,13 @@ def test_deficit_kernel_tail_follows_the_physical_law():
 def test_deficit_kernel_is_finite_at_zero_lag(recwarn):
     """The first lag bin is the largest deficit, and evaluating it emits no warning."""
     dbar = heat._deficit_kernel(
-        3, 1.0 / 24.0, r_o=np.array([0.05]), d_eff=np.array([1.0605]), alpha=np.array([0.05]), kappa=np.array([0.025])
+        3,
+        1.0 / 24.0,
+        r_o=np.array([0.05]),
+        depth=np.array([1.0605]),
+        alpha=np.array([0.05]),
+        kappa=np.array([0.025]),
+        eta=np.array([np.inf]),
     )[0]
     assert np.all(np.isfinite(dbar))
     assert np.all(np.diff(dbar) < 0.0)
@@ -805,13 +831,36 @@ _HALO_ALPHA, _HALO_KAPPA = GRASS["alpha"], GRASS["kappa"]
 _HALO_GEOMETRIES = {"service_100mm": (0.05, 1.0605), "main_400mm": (0.2, 1.0605), "shallow_400mm": (0.2, 0.5)}
 
 
+def _deficit_kernel_with_nodes(n_bins, dt_bin, *, nodes, r_o, depth, alpha, kappa, eta):
+    """``Dbar`` rebuilt here with a Gauss-Laguerre rule of ``nodes`` points for the image tail.
+
+    Written out rather than parametrising the package, so the node count under test is the only
+    thing that differs and the surrounding arithmetic is this file's own.
+    """
+    mirror = 2.0 * depth
+    r_inf = ((np.log(mirror / r_o) + 2.0 * hyperu(1, 1, mirror * eta / kappa)) / (2.0 * np.pi * kappa))[:, None]
+    edge = np.arange(n_bins + 1)
+    lag = dt_bin * edge[None, :]
+    cylinder = heat._cylinder_integral((alpha * dt_bin / r_o**2)[:, None] * edge[None, :])
+
+    node, weight = roots_laguerre(nodes)
+    offsets = mirror[:, None] + node[None, :] * (kappa / eta)[:, None]
+    image = -heat._halo_integral((np.square(mirror) / (4.0 * alpha))[:, None], lag)
+    for w, offset in zip(weight, offsets.T, strict=True):
+        image += 2.0 * w * heat._halo_integral((np.square(offset) / (4.0 * alpha))[:, None], lag)
+
+    cumulative = r_inf * lag + image / (4.0 * np.pi * kappa[:, None]) - (r_o**2 / (kappa * alpha))[:, None] * cylinder
+    return np.diff(cumulative, axis=1) / dt_bin
+
+
 def _halo_kernel_response(n_bins, dt_bin, r_o, d_eff):
     """The package's cumulative wall response ``R_inf - Dbar`` [day/m²], per lag bin."""
     dbar = heat._deficit_kernel(
         n_bins,
         dt_bin,
         r_o=np.array([r_o]),
-        d_eff=np.array([d_eff]),
+        depth=np.array([d_eff]),
+        eta=np.array([np.inf]),
         alpha=np.array([_HALO_ALPHA]),
         kappa=np.array([_HALO_KAPPA]),
     )[0]
@@ -1039,58 +1088,146 @@ def test_the_two_dimensional_reference_conserves_heat_and_settles_in_time():
     assert np.abs(fine_step - coarse_step)[1:].max() < 0.10 * steady_gap
 
 
-def test_effective_depth_reduction_measured_against_a_robin_surface():
-    """``d_eff = depth + kappa/eta`` against a genuine Robin surface, at steady state.
+@pytest.mark.parametrize(("film_coefficient", "displaced_error"), [(20.0, 1.97e-4), (5.0, 8.27e-3), (1.0, 2.64e-1)])
+def test_the_robin_image_saturates_where_a_genuine_robin_surface_does(film_coefficient, displaced_error):
+    """The halo's steady limit against a genuine Robin surface, at three film strengths.
 
-    The package never solves a Robin problem: it displaces the surface downward by the
-    radiation length and solves a Dirichlet one. What that displacement costs is measured here
-    twice over, by routes that share no arithmetic.
+    A radiating surface does not mirror a source into one sink. Its exact image is a positive
+    mirror at the true ``2 depth`` plus a tail at ``2 depth + s`` weighted
+    ``2 beta exp(-beta s)``, ``beta = eta/kappa``, and integrating that tail against the line
+    source closes in ``2 pi kappa R = ln(2 depth/r_o) + 2 exp(x) E1(x)``, ``x = 2 depth beta``.
+    That is what the kernel now saturates at.
 
-    The exact Robin half space is not one image but a *distribution* of them: a positive mirror
-    at the true ``2 depth`` followed by a tail at ``2 depth + s`` weighted
-    ``2 beta exp(-beta s)``, ``beta = eta/kappa``. Integrating that tail against the line
-    source closes in
+    Two things are measured. First that the package agrees with a 2-D solve holding the Robin
+    condition itself -- no image anywhere in it -- to the solve's own discretisation floor,
+    once the uniform-flux cylinder's ``(r_o/2 d_eff)**2`` term is allowed for; that term is
+    read at the *effective* depth even here, which is the one place ``d_eff`` still earns its
+    name (measured 3.534e-3 against 3.535e-3, where the physical depth would give 3.979e-3).
 
-    ``2 pi kappa R = ln(2 depth/r_o) + 2 exp(x) E1(x)``,  ``x = 2 depth eta / kappa``
-
-    -- the ``hyperu(1, 1, x)`` below, which is exactly 0 at ``eta = inf``, recovering the
-    Dirichlet law without a branch. Adding the uniform-flux cylinder's own
-    ``(r_o/(2 d_eff))**2`` term to that gives an analytic prediction for the *whole* geometry
-    this file's 2-D solve computes numerically, and the two agree to 9e-7 day/m², the solve's
-    own discretisation floor. That is the mutual check: a closed form and a mesh, neither
-    holding the other's assumptions.
-
-    Against either of them the displacement's residual is the same number to four figures --
-    2.026e-4 day/m² from the mesh, 2.025e-4 from the closed form, against a film effect of
-    0.377 -- so ``d_eff`` captures 99.95 % of what the surface film does, and always from
-    below. That is an order below the cylinder-image gap it is combined with, which is why the
-    model can carry one ``d_eff`` through both. Issue #49 proposes replacing the displacement
-    with the exact image distribution above; 2.03e-4 day/m² is the number it has to beat, and
-    the closed form here is the anchor to beat it against.
+    Second, what the displaced surface this replaces used to cost, which is the reason the
+    change is worth making at all. It is negligible under a typical surface and is not
+    negligible under a poor one: the displacement understates the true resistance by 2.0e-4
+    day/m² at 20 W/(m² K), 8.3e-3 at 5, and 0.26 -- about 1 % of ``R_soil`` -- at 1, where the
+    radiation length is a quarter of the burial depth and the surface is barely a boundary at
+    all. All three errs the same way, low, because displacing the surface downward always
+    weakens the image.
     """
-    r_o, depth, eta = 0.05, 1.0, GRASS["eta"]
+    r_o, depth = 0.05, 1.0
+    eta = 0.0207 * film_coefficient
     scale = 2.0 * np.pi * _HALO_KAPPA
     d_eff = depth + _HALO_KAPPA / eta
 
-    coarse = _bipolar_halo_steady(96, 128, r_o=r_o, d=depth, kappa=_HALO_KAPPA, eta=eta)
-    robin = _bipolar_halo_steady(192, 256, r_o=r_o, d=depth, kappa=_HALO_KAPPA, eta=eta)
-    assert abs(robin - coarse) < 1e-5
+    coarse = _bipolar_halo_steady(48, 128, r_o=r_o, d=depth, kappa=_HALO_KAPPA, eta=eta)
+    robin = _bipolar_halo_steady(96, 256, r_o=r_o, d=depth, kappa=_HALO_KAPPA, eta=eta)
+    # A weaker film pushes the surface's influence deeper, which the mesh resolves less well.
+    assert abs(robin - coarse) < 2e-3
 
-    # The analytic anchor: exact Robin image distribution for the line, plus the cylinder's own
-    # steady term read at the effective depth -- the image distance that actually sets it.
     exact_line = (np.log(2.0 * depth / r_o) + 2.0 * hyperu(1, 1, 2.0 * depth * eta / _HALO_KAPPA)) / scale
-    anchor = exact_line + (r_o / (2.0 * d_eff)) ** 2 / scale
-    assert abs(robin - anchor) < 3e-6, "the Robin solve and the closed-form image distribution disagree"
+    assert abs(robin - (exact_line + (r_o / (2.0 * d_eff)) ** 2 / scale)) < 2e-5, (
+        "the kernel's saturation and the Robin solve disagree by more than the mesh's own error"
+    )
 
-    bare = _steady_shape_factor_series(depth / r_o) / scale
-    displaced = _steady_shape_factor_series(d_eff / r_o) / scale
-    film = robin - bare
-    assert film > 0.0, "a finite surface film can only add resistance"
-    # Signed: displacing the surface downward always understates the true Robin resistance.
-    residual = robin - displaced
-    assert 0.0 < residual < 8e-4 * film
-    # And the same residual falls out of the closed form alone, with no mesh anywhere in it.
-    np.testing.assert_allclose(residual, exact_line - np.log(2.0 * d_eff / r_o) / scale, rtol=2e-3)
+    # What the displacement used to give up, from the closed form alone -- no mesh in it.
+    displaced = np.log(2.0 * d_eff / r_o) / scale
+    np.testing.assert_allclose(exact_line - displaced, displaced_error, rtol=5e-3)
+    assert exact_line > displaced, "displacing the surface downward always weakens the image"
+
+
+def test_the_robin_image_tracks_the_two_dimensional_reference_in_time():
+    """The whole image distribution in time, under the poor surface where it matters most.
+
+    The steady test above pins where the halo ends up; this pins the path. At 1 W/(m² K) the
+    radiation length is a quarter of the burial depth, so the displaced surface this replaces
+    sat a quarter of a metre too deep and its error is the largest the model admits.
+
+    Against a 2-D solve holding the Robin condition itself, the image distribution tracks the
+    whole approach to within 3e-3 day/m² -- a hundred times closer than the displacement, whose
+    error is a near-constant 0.27 day/m² offset it never recovers from because it is a steady
+    error, not a timing one. At full saturation the two agree to 3e-6, which is the mesh's own
+    floor: there is nothing left of the assumption to measure.
+    """
+    r_o, depth, eta = 0.05, 1.0, 0.0207
+    scale = 2.0 * np.pi * _HALO_KAPPA
+    box = {
+        "r_o": np.array([r_o]),
+        "depth": np.array([depth]),
+        "alpha": np.array([_HALO_ALPHA]),
+        "kappa": np.array([_HALO_KAPPA]),
+    }
+    reference, _, _ = _bipolar_halo_transient(
+        *_HALO_MESH, r_o=r_o, d=depth, alpha=_HALO_ALPHA, kappa=_HALO_KAPPA, dt_bin=20.0, n_bins=60, sub=12, eta=eta
+    )
+    r_inf = (np.log(2.0 * depth / r_o) + 2.0 * hyperu(1, 1, 2.0 * depth * eta / _HALO_KAPPA)) / scale
+    exact = r_inf - heat._deficit_kernel(60, 20.0, **box, eta=np.array([eta]))[0]
+
+    # The assumption this replaces: a perfect surface at the displaced depth, which is exactly
+    # what the kernel computes when handed ``d_eff`` and ``eta = inf``.
+    d_eff = depth + _HALO_KAPPA / eta
+    displaced = (
+        np.log(2.0 * d_eff / r_o) / scale
+        - heat._deficit_kernel(60, 20.0, **{**box, "depth": np.array([d_eff])}, eta=np.array([np.inf]))[0]
+    )
+
+    assert np.abs(exact - reference)[1:].max() < 3e-3, "the image distribution does not track the true surface"
+    assert abs(exact[-1] - reference[-1]) < 1e-5, "and it must land exactly where the true surface does"
+    # The assumption this replaces, on the same lags: a standing offset a hundred times larger.
+    assert np.abs(displaced - reference)[1:].min() > 0.25
+
+
+def test_the_robin_image_reaches_both_classical_surfaces_without_a_branch():
+    """``eta = inf`` is the Dirichlet sink and ``eta -> 0`` the insulated mirror, from one form.
+
+    The image distribution carries both textbook boundaries as limits of the same expression:
+    as ``beta -> inf`` the exponential tail collapses onto the mirror and doubles it, flipping
+    the positive mirror into the familiar sink, and as ``beta -> 0`` the tail vanishes and the
+    bare positive mirror is left, which is the insulated surface. Neither needs a branch, and
+    the Dirichlet end has to be *exact* rather than nearly so, because it is the module's
+    default and every pinned number elsewhere in this file rides on it.
+    """
+    r_o, depth, alpha, kappa = 0.05, 1.0605, GRASS["alpha"], GRASS["kappa"]
+    box = {"r_o": np.array([r_o]), "depth": np.array([depth]), "alpha": np.array([alpha]), "kappa": np.array([kappa])}
+
+    # Dirichlet: the classical line sink at 2 depth, written out here rather than taken from
+    # the kernel, so the reduction is checked against the physics and not against itself.
+    lag = 20.0 * np.arange(61)
+    r_inf = np.log(2.0 * depth / r_o) / (2.0 * np.pi * kappa)
+    cumulative = (
+        r_inf * lag
+        - (r_o**2 / (kappa * alpha)) * heat._cylinder_integral(alpha * lag / r_o**2)
+        + heat._halo_integral(np.array([(2.0 * depth) ** 2 / (4.0 * alpha)]), lag) / (4.0 * np.pi * kappa)
+    )
+    # Not bitwise: the tail is accumulated over forty nodes that all collapse onto the mirror
+    # here, so it carries forty additions' worth of round-off where the closed form carries one.
+    reduction = heat._deficit_kernel(60, 20.0, **box, eta=np.array([np.inf]))[0] - np.diff(cumulative) / 20.0
+    assert np.abs(reduction).max() < 1e-12 * r_inf
+
+    # Insulated: no image sink at all, so the halo never saturates and the deficit stays at the
+    # full steady resistance -- there is none to arrive. A weak film approaches that from below.
+    weak = [heat._deficit_kernel(1, 1.0, **box, eta=np.array([e]))[0, 0] for e in (1e-3, 1e-4, 1e-5)]
+    assert weak[0] < weak[1] < weak[2], "a weaker film must leave more of the resistance still to arrive"
+
+
+def test_the_robin_image_quadrature_is_converged_at_the_shipped_node_count():
+    """The Gauss-Laguerre rule for the image tail, against a much finer rule of its own family.
+
+    The integrand is a diffusion kernel read at a distance that grows with the node, so the
+    rule converges faster the stronger the film: the tail of a strong film is short and nearly
+    all the weight sits at small ``s``. The shipped count is therefore set by the weakest film
+    worth serving, and the ladder below is what set it -- at 1 W/(m² K) eight nodes hold only
+    2e-4 day/m² and twenty 2e-7, while forty reach 1e-10.
+    """
+    r_o, depth = 0.05, 1.0
+    box = {
+        "r_o": np.array([r_o]),
+        "depth": np.array([depth]),
+        "alpha": np.array([GRASS["alpha"]]),
+        "kappa": np.array([GRASS["kappa"]]),
+    }
+    for film_coefficient, ceiling in ((20.0, 1e-12), (5.0, 1e-12), (1.0, 1e-9)):
+        eta = np.array([0.0207 * film_coefficient])
+        shipped = heat._deficit_kernel(60, 1.0, **box, eta=eta)
+        finer = _deficit_kernel_with_nodes(60, 1.0, nodes=320, **box, eta=eta)
+        assert np.abs(shipped - finer).max() < ceiling, f"h_s = {film_coefficient}"
 
 
 # ============================================================================
@@ -1127,8 +1264,8 @@ def test_segment_heat_rate_reproduces_the_documented_values():
 
     # Fully developed laminar flow in the 100 mm pipe: the film is 29 % of the soil term.
     film = rate(film_coefficient=0.4539)
-    d_eff = 1.0 + GRASS["kappa"] / GRASS["eta"]
-    r_soil = np.log(2.0 * d_eff / 0.05) / (2.0 * np.pi * GRASS["kappa"])
+    x = 2.0 * 1.0 * GRASS["eta"] / GRASS["kappa"]
+    r_soil = (np.log(2.0 * 1.0 / 0.05) + 2.0 * hyperu(1, 1, x)) / (2.0 * np.pi * GRASS["kappa"])
     r_film = 1.0 / (2.0 * np.pi * 0.05 * 0.4539)
     assert r_film / r_soil == pytest.approx(0.294, abs=2e-3)
     np.testing.assert_allclose(film["service"], 1.0 / ((r_film + r_soil) * np.pi * 0.05**2), rtol=1e-12)
@@ -1773,7 +1910,7 @@ def _uniform_case(network, tedges, *, tin, sol_air, flow, **kwargs):
     )
 
 
-def _local_reference(*, tin, t_inf, dt, tau, n_slug, r_inner, d_eff, alpha, kappa, r_other):
+def _local_reference(*, tin, t_inf, dt, tau, n_slug, r_inner, depth, alpha, kappa, eta, r_other):
     """Integrate the coupled model directly, with one soil memory per axial cell.
 
     The package keeps one wall-flux history per pipe; the physics keeps one per axial
@@ -1804,9 +1941,10 @@ def _local_reference(*, tin, t_inf, dt, tau, n_slug, r_inner, d_eff, alpha, kapp
     n_slug : int
         Axial cells; ``dt * n_slug / tau`` must be an integer, or a bin average of the fine
         output would not be a bin average of the same grid.
-    r_inner, d_eff, alpha, kappa : float
-        Inner radius [m], effective burial depth [m], soil diffusivity and conductivity ratio
-        [m²/day]. The line source is read at ``r_inner`` (bare pipe).
+    r_inner, depth, alpha, kappa, eta : float
+        Inner radius [m], burial depth to the axis [m], soil diffusivity and conductivity
+        ratio [m²/day], surface film coefficient [m/day]. The line source is read at
+        ``r_inner`` (bare pipe).
     r_other : float
         Film plus pipe-wall resistance [day/m²] -- everything in series except the soil.
 
@@ -1818,20 +1956,35 @@ def _local_reference(*, tin, t_inf, dt, tau, n_slug, r_inner, d_eff, alpha, kapp
     per = round(dt * n_slug / tau)
     assert abs(dt * n_slug / tau - per) < 1e-9, "n_slug must make dt/dtf an integer"
     area = np.pi * r_inner**2
-    r_inf = np.log(2.0 * d_eff / r_inner) / (2.0 * np.pi * kappa)
+    r_inf = (np.log(2.0 * depth / r_inner) + 2.0 * hyperu(1, 1, 2.0 * depth * eta / kappa)) / (2.0 * np.pi * kappa)
     step = tau / n_slug
     n_steps = len(tin) * per
 
     # Bin-averaged deficit on the sub-step grid, from the physical parameters: the
     # constant-flux cylinder at the wall, inverted from its Laplace transform rather than
-    # taken from the package, minus its mirror image at 2 d_eff, which is a line source and
-    # integrates in closed form.
+    # taken from the package, minus the half space's image of it. The image is the exact Robin
+    # one -- a positive mirror at ``2 depth`` and a tail of sinks above it -- integrated here
+    # by an adaptive quadrature over the tail rather than by the package's Gauss-Laguerre rule.
     lag = step * np.arange(n_steps + 2)
-    c_image = (2.0 * d_eff) ** 2 / (4.0 * alpha)
-    image = np.zeros(len(lag))
-    with np.errstate(divide="ignore", over="ignore"):
-        x = c_image / lag[1:]
-        image[1:] = (lag[1:] + c_image) * exp1(x) - lag[1:] * np.exp(-x)
+
+    def line_integral(distance):
+        """``int_0^lag E1(distance**2/(4 alpha t)) dt`` for each distance, shape (distance, lag)."""
+        c = np.atleast_1d(distance)[:, None] ** 2 / (4.0 * alpha)
+        out = np.zeros((c.size, len(lag)))
+        with np.errstate(divide="ignore", over="ignore"):
+            x = c / lag[None, 1:]
+            out[:, 1:] = (lag[None, 1:] + c) * exp1(x) - lag[None, 1:] * np.exp(-x)
+        return out
+
+    # The exact Robin image: a positive mirror at ``2 depth`` and a tail of sinks above it,
+    # ``2 beta int exp(-beta s) f(2 depth + s) ds``, on the same Gauss-Laguerre rule the package
+    # uses. Sharing the rule is deliberate *here*: this reference exists to isolate the axial
+    # assumption, so its soil model has to be the package's to round-off or the comparison
+    # measures the wrong difference. The rule's own accuracy is pinned separately, against an
+    # adaptive quadrature and against the 2-D solve.
+    node, weight = roots_laguerre(40)
+    tail = 2.0 * weight @ line_integral(2.0 * depth + node * kappa / eta)
+    image = tail - line_integral(2.0 * depth)[0]
     pipe = r_inner**2 / (kappa * alpha) * _cylinder_integral_by_laplace(alpha * lag / r_inner**2)
     deficit = np.diff(r_inf * lag - pipe + image / (4.0 * np.pi * kappa)) / step
 
@@ -1936,9 +2089,10 @@ def test_two_way_model_agrees_with_the_local_fine_step_reference(transit_hours, 
         tau=transit_hours / 24.0,
         n_slug=n_slug,
         r_inner=0.05,
-        d_eff=1.0 + GRASS["kappa"] / GRASS["eta"],
+        depth=1.0,
         alpha=GRASS["alpha"],
         kappa=GRASS["kappa"],
+        eta=GRASS["eta"],
         r_other=1.0 / (2.0 * np.pi * 0.05 * 0.454),
     )
 
@@ -1978,9 +2132,10 @@ def test_the_agreement_floor_is_the_two_time_discretisations():
         tau=2.0 / 24.0,
         n_slug=8,
         r_inner=0.05,
-        d_eff=1.0 + GRASS["kappa"] / GRASS["eta"],
+        depth=1.0,
         alpha=GRASS["alpha"],
         kappa=GRASS["kappa"],
+        eta=GRASS["eta"],
         r_other=1.0 / (2.0 * np.pi * 0.05 * 0.454),
     )
     settled = slice(2 * 96, None)
@@ -2175,9 +2330,10 @@ def test_the_pipe_wall_moves_the_radius_the_halo_is_read_at(heat_pipe):
         system.n_bins,
         1.0 / 24.0,
         r_o=np.array([0.05 + 0.0065]),
-        d_eff=np.array([1.0 + GRASS["kappa"] / GRASS["eta"]]),
+        depth=np.array([1.0]),
         alpha=np.array([GRASS["alpha"]]),
         kappa=np.array([GRASS["kappa"]]),
+        eta=np.array([GRASS["eta"]]),
     )
     # The system carries the kernel transformed -- it is convolved with a fresh flux history
     # on every sweep -- so the reference goes through the same batched transform at the same
@@ -2840,7 +2996,13 @@ def test_halo_memory_converges_under_bin_refinement():
     """
     r_outer, d_eff, alpha, kappa = 0.05, 1.0 + GRASS["kappa"] / GRASS["eta"], GRASS["alpha"], GRASS["kappa"]
     span = 40.0
-    geometry = dict(r_o=np.array([r_outer]), d_eff=np.array([d_eff]), alpha=np.array([alpha]), kappa=np.array([kappa]))
+    geometry = dict(
+        r_o=np.array([r_outer]),
+        depth=np.array([d_eff]),
+        alpha=np.array([alpha]),
+        kappa=np.array([kappa]),
+        eta=np.array([np.inf]),
+    )
 
     def flux(t):
         return 1.0 - np.exp(-t / 6.0) * np.cos(2.0 * np.pi * t / 11.0)
