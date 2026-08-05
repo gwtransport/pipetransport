@@ -288,7 +288,7 @@ def test_invalid_network_raises(segments, source, message):
 def test_segment_flow_equals_summed_demand_below_each_segment(network, short_tedges, diurnal_demand):
     # Deliberately non-proportional demand, so a fixed-fraction shortcut could not reproduce this.
     demand = diurnal_demand(network, short_tedges)
-    t1, t2, t3, t4 = (demand[name].to_numpy(dtype=float) for name in ("T1", "T2", "T3", "T4"))
+    t1, t2, t3, t4 = (demand[name] for name in ("T1", "T2", "T3", "T4"))
     expected = np.stack([
         t1 + t2 + t3 + t4,  # Plant-A carries the whole production
         t1 + t2,  # A-B feeds the T1/T2 district
@@ -322,10 +322,10 @@ def test_node_flow_at_source_endmember_and_junction(network, short_tedges, diurn
     row_of_segment = {name: i for i, name in enumerate(network.segments.index)}
 
     # Source: total production.
-    np.testing.assert_allclose(node_flow[row_of_node["Plant"]], demand.sum(axis=1).to_numpy(dtype=float), rtol=1e-15)
+    np.testing.assert_allclose(node_flow[row_of_node["Plant"]], sum(demand.values()), rtol=1e-15)
     # Endmember: its own demand, exactly.
     for name in network.endmembers:
-        np.testing.assert_allclose(node_flow[row_of_node[name]], demand[name].to_numpy(dtype=float), rtol=0.0, atol=0.0)
+        np.testing.assert_allclose(node_flow[row_of_node[name]], demand[name], rtol=0.0, atol=0.0)
     # Junction: the flow of the segment feeding it. Precision floor 1e-15: node_flow and
     # segment_flow are matmuls of differently shaped selector matrices, and BLAS picks a
     # different summation order per shape, which costs ~1 ULP on the 2- and 4-term sums.
@@ -383,27 +383,36 @@ def test_effective_volume_of_a_path_under_a_constant_split(
 # ============================================================================
 
 
-def test_flow_array_accepts_dataframe_in_any_column_order(network):
+def test_flow_array_orders_by_endmember_not_by_insertion(network):
+    """The key names the row; the order they were written in cannot reach the answer."""
     values = {"T1": [240.0, 250.0], "T2": [360.0, 350.0], "T3": [120.0, 130.0], "T4": [80.0, 70.0]}
-    shuffled = pd.DataFrame({name: values[name] for name in ("T3", "T1", "T4", "T2")})
+    shuffled = {name: values[name] for name in ("T3", "T1", "T4", "T2")}
     expected = np.array([values[name] for name in network.endmembers])
+    np.testing.assert_allclose(network.flow_array(values), expected, rtol=0.0, atol=0.0)
     np.testing.assert_allclose(network.flow_array(shuffled), expected, rtol=0.0, atol=0.0)
 
 
-def test_flow_array_accepts_dict_and_plain_array(network):
+def test_flow_array_passes_its_own_output_through_unchanged(network):
+    """The coerced array is accepted back, which is what lets internal callers coerce once."""
     values = {"T1": [240.0, 250.0], "T2": [360.0, 350.0], "T3": [120.0, 130.0], "T4": [80.0, 70.0]}
-    expected = np.array([values[name] for name in network.endmembers])
-    np.testing.assert_allclose(network.flow_array(values), expected, rtol=0.0, atol=0.0)
-    np.testing.assert_allclose(network.flow_array(expected.tolist()), expected, rtol=0.0, atol=0.0)
-    np.testing.assert_allclose(network.flow_array(expected), expected, rtol=0.0, atol=0.0)
+    coerced = network.flow_array(values)
+    np.testing.assert_array_equal(network.flow_array(coerced), coerced)
 
 
 def test_flow_array_rejects_missing_endmember(network):
     values = {"T1": [240.0], "T3": [120.0], "T4": [80.0]}
     with pytest.raises(ValueError, match=re.escape("flow is missing endmember(s): ['T2']")):
         network.flow_array(values)
-    with pytest.raises(ValueError, match=re.escape("flow is missing endmember(s): ['T2']")):
-        network.flow_array(pd.DataFrame(values))
+
+
+def test_flow_array_rejects_a_key_that_is_not_an_endmember(network):
+    """An extra key is a typo or a modelling error, and either way the demand it carries is
+    not part of the network -- silently dropping it would hide both."""
+    values = {"T1": [240.0], "T2": [360.0], "T3": [120.0], "T4": [80.0], "T5": [10.0]}
+    with pytest.raises(ValueError, match=re.escape("flow holds key(s) that are not endmembers: ['T5']")):
+        network.flow_array(values)
+    with pytest.raises(ValueError, match=re.escape("['B']")):
+        network.flow_array({**{k: v for k, v in values.items() if k != "T5"}, "B": [1.0]})
 
 
 @pytest.mark.parametrize(
@@ -416,7 +425,7 @@ def test_flow_array_rejects_missing_endmember(network):
     ],
 )
 def test_flow_array_rejects_wrong_shape(network, flow):
-    message = re.escape("flow must have shape (n_endmembers, n_bins) = (4, n_bins) ordered as network.endmembers")
+    message = re.escape("flow must be a mapping keyed by endmember, or the (4, n_bins) array")
     with pytest.raises(ValueError, match=message):
         network.flow_array(flow)
 
@@ -444,3 +453,41 @@ def test_zero_demand_is_allowed_and_propagates(two_branch, short_tedges, constan
     n_bins = len(short_tedges) - 1
     expected = np.stack([np.full(n_bins, 45.0), np.zeros(n_bins), np.full(n_bins, 45.0)])
     np.testing.assert_allclose(two_branch.segment_flow(flow=demand), expected, rtol=0.0, atol=0.0)
+
+
+def test_segments_accept_a_mapping_of_row_dicts_and_the_table_they_become():
+    """Two input forms, one validated artifact -- and the artifact is accepted back.
+
+    The mapping is the input form: each pipe's properties travel together, so there are no
+    parallel column lists to keep aligned. The DataFrame form is the one :attr:`segments`
+    exposes, which is what lets a table read from file, or a network being rebuilt from
+    another, pass straight in.
+    """
+    mapping = {
+        "Plant-A": {"from": "Plant", "to": "A", "volume": 300.0},
+        "A-T1": {"from": "A", "to": "T1", "volume": 40.0},
+    }
+    from_mapping = PipeNetwork(segments=mapping, source="Plant")
+    round_tripped = PipeNetwork(segments=from_mapping.segments, source="Plant")
+
+    assert from_mapping.nodes == round_tripped.nodes == ("Plant", "A", "T1")
+    pd.testing.assert_frame_equal(round_tripped.segments, from_mapping.segments)
+    # Insertion order is row order, which is what the doc promises about the derived table.
+    assert list(from_mapping.segments.index) == ["Plant-A", "A-T1"]
+
+
+def test_a_mapping_is_never_read_column_wise():
+    """The row-dict mapping must not go through ``pd.DataFrame(...)``, which transposes it.
+
+    ``pd.DataFrame`` reads a dict of dicts *column*-wise, so delegating to it would turn each
+    segment into a column and each property into a row -- silently, since the result is still
+    a DataFrame. The guard is that the segment names come back as the index.
+    """
+    built = PipeNetwork(segments={"only": {"from": "Plant", "to": "T1", "volume": 100.0}}, source="Plant")
+    assert list(built.segments.index) == ["only"]
+    assert {"from", "to", "volume"} <= set(built.segments.columns)
+
+
+def test_segments_rejects_anything_but_the_two_forms():
+    with pytest.raises(TypeError, match="mapping of segment name"):
+        PipeNetwork(segments=[{"from": "Plant", "to": "T1", "volume": 100.0}], source="Plant")

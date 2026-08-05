@@ -26,11 +26,57 @@ from scipy.special import erfc, erfcx, exp1, j1, kve, y1
 
 from pipetransport import heat, transport
 from pipetransport._transfer import apply_banded, apply_segment_targets, paths_transfer
+from pipetransport.examples import example_network
 from pipetransport.network import PipeNetwork
 from pipetransport.utils import tedges_to_days
 
 GRASS = {"alpha": 0.05, "kappa": 0.025, "eta": 0.41}
 PAVED = {"alpha": 0.075, "kappa": 0.035, "eta": 0.41}
+_SOIL = {"grass": GRASS, "paved": PAVED}
+# What ``soil_temperature`` actually reads: the diffusivity and the radiation length kappa/eta.
+GRASS_FIELD = {"alpha": GRASS["alpha"], "radiation_length": GRASS["kappa"] / GRASS["eta"]}
+PAVED_FIELD = {"alpha": PAVED["alpha"], "radiation_length": PAVED["kappa"] / PAVED["eta"]}
+
+
+def _soil_columns(covers):
+    """Per-segment soil columns for a list of cover classes."""
+    return {
+        "alpha": [_SOIL[c]["alpha"] for c in covers],
+        "kappa_soil": [_SOIL[c]["kappa"] for c in covers],
+        "eta": [_SOIL[c]["eta"] for c in covers],
+    }
+
+
+def _with_soil(segments):
+    """Add the per-segment soil columns a HeatNetwork needs, read off each row's cover class."""
+    return segments.assign(**_soil_columns(list(segments["cover"])))
+
+
+def _grass_pipe(**columns):
+    """One 100 mm grass pipe carrying whatever heat columns a test wants to vary."""
+    segments = pd.DataFrame(
+        {
+            "from": ["Plant"],
+            "to": ["T1"],
+            "length": [1000.0],
+            "diameter": [0.1],
+            "cover": ["grass"],
+            **_soil_columns(["grass"]),
+            **{name: [value] for name, value in columns.items()},
+        },
+        index=["Plant-T1"],
+    )
+    return heat.HeatNetwork(segments=segments, source="Plant")
+
+
+def _stack(result):
+    """Stack a per-node result mapping back into rows, in the mapping's own (report) order."""
+    return np.stack(list(result.values()))
+
+
+def _by_node(shared, values):
+    """Key a forward result by the endmember each row belongs to, ready to pass back as ``tout``."""
+    return dict(zip(shared["network"].endmembers, values, strict=True))
 
 
 # ============================================================================
@@ -39,45 +85,34 @@ PAVED = {"alpha": 0.075, "kappa": 0.035, "eta": 0.41}
 
 
 @pytest.fixture
-def soil():
-    """Two cover classes: grass and paved."""
-    return pd.DataFrame([GRASS, PAVED], index=["grass", "paved"])
-
-
-@pytest.fixture
 def heat_pipe():
     """One 100 mm, 1 km pipe under grass: every quantity has a closed form."""
-    segments = pd.DataFrame(
-        {"from": ["Plant"], "to": ["T1"], "length": [1000.0], "diameter": [0.1], "cover": ["grass"]},
-        index=["Plant-T1"],
-    )
-    return PipeNetwork(segments=segments, source="Plant")
+    return _grass_pipe()
 
 
 @pytest.fixture
-def heat_network(network):
+def heat_network():
     """The example network with land cover assigned and a mix of depths."""
-    network.segments["cover"] = ["grass", "grass", "paved", "paved", "grass", "paved", "grass"]
-    network.segments["depth"] = [1.2, 1.0, 1.0, 0.9, 1.0, 1.0, 0.8]
-    return network
+    covers = ["grass", "grass", "paved", "paved", "grass", "paved", "grass"]
+    segments = example_network().segments.drop(columns="volume")
+    segments["cover"] = covers
+    segments["depth"] = [1.2, 1.0, 1.0, 0.9, 1.0, 1.0, 0.8]
+    for column, values in _soil_columns(covers).items():
+        segments[column] = values
+    return heat.HeatNetwork(segments=segments, source="Plant")
 
 
 @pytest.fixture
 def surface():
-    """Build a per-cover sol-air DataFrame on a time grid."""
+    """Build a per-cover sol-air mapping on a time grid."""
 
     def _make(tedges, *, grass=20.0, paved=28.0, amplitude=0.0):
         n = len(tedges) - 1
         hours = np.arange(n)
         wave = amplitude * np.sin(2.0 * np.pi * hours / 24.0)
-        return pd.DataFrame({"grass": grass + wave, "paved": paved + wave})
+        return {"grass": grass + wave, "paved": paved + wave}
 
     return _make
-
-
-def _rate(network, **kwargs):
-    """Steady exchange rate of every segment, with the fixture soil parameters."""
-    return heat.segment_heat_rate(network=network, kappa=GRASS["kappa"], eta=GRASS["eta"], **kwargs)
 
 
 # ============================================================================
@@ -153,8 +188,7 @@ def test_soil_temperature_superposes_the_kernel_exactly():
         tedges=tedges,
         depth=1.0,
         t_pre=t_pre,
-        **{k: GRASS[k] for k in ("alpha", "kappa")},
-        eta=GRASS["eta"],
+        **GRASS_FIELD,
     )
 
     # Hand-assembled superposition: each surface step contributes its bin-averaged response.
@@ -210,7 +244,12 @@ def test_soil_temperature_matches_a_finite_difference_solve():
     surface = np.where(np.arange(n_days) < 7, 25.0, 10.0)
 
     package = heat.soil_temperature(
-        surface_temperature=surface, tedges=tedges, depth=depth, alpha=alpha, kappa=kappa, eta=eta, t_pre=10.0
+        surface_temperature=surface,
+        tedges=tedges,
+        depth=depth,
+        alpha=alpha,
+        radiation_length=kappa / eta,
+        t_pre=10.0,
     )
     settings = dict(n_days=n_days, alpha=alpha, kappa=kappa, eta=eta, depth=depth)
     coarse = _crank_nicolson(surface, **settings, dz=0.01, sub=96)
@@ -235,7 +274,7 @@ def test_soil_temperature_reproduces_the_published_attenuation(
     surface coupling jointly: they move by several percentage points between the Robin and
     the prescribed-temperature surface, and by more between the two cover classes.
     """
-    parameters = GRASS if cover == "grass" else PAVED
+    parameters = GRASS_FIELD if cover == "grass" else PAVED_FIELD
 
     hourly = pd.date_range("2025-01-01", periods=60 * 24 + 1, freq="h")
     pulse = np.zeros(60 * 24)
@@ -255,47 +294,6 @@ def test_soil_temperature_reproduces_the_published_attenuation(
     )
     tail = wave[-28 * 24 :]
     assert 0.5 * (tail.max() - tail.min()) == pytest.approx(weekly_amplitude, abs=5e-4)
-
-
-def test_soil_temperature_holds_the_pre_history_before_the_surface_record():
-    """Output bins preceding the surface record are exactly the pre-history temperature."""
-    surface_tedges = pd.date_range("2025-02-01", periods=31, freq="D")
-    tedges = pd.date_range("2025-01-01", periods=62, freq="D")
-    out = heat.soil_temperature(
-        surface_temperature=np.full(30, 25.0),
-        tedges=tedges,
-        surface_tedges=surface_tedges,
-        depth=1.0,
-        t_pre=9.0,
-        **GRASS,
-    )
-    np.testing.assert_array_equal(out[:31], 9.0)
-    assert out[-1] > 9.0
-
-
-@pytest.mark.parametrize(
-    "surface_freq",
-    ["12h", "D"],
-    ids=["finer than the output grid", "coarser than the output grid"],
-)
-def test_soil_temperature_rejects_a_surface_grid_of_a_different_width(surface_freq):
-    """The superposition is a convolution only while both grids share one bin width.
-
-    The lag of an (output edge, surface step) pair is then a function of their index
-    difference alone, which is what turns a quadratic matrix product into a transform. A
-    surface record on its own spacing has to be resampled by the caller, who knows whether
-    interpolating or bin-averaging it is the right thing to do.
-    """
-    tedges = pd.date_range("2025-01-01", periods=25, freq="h")
-    surface_tedges = pd.date_range("2025-01-01", periods=5, freq=surface_freq)
-    with pytest.raises(ValueError, match="uniform bin width"):
-        heat.soil_temperature(
-            surface_temperature=np.full(len(surface_tedges) - 1, 20.0),
-            tedges=tedges,
-            surface_tedges=surface_tedges,
-            depth=1.0,
-            **GRASS,
-        )
 
 
 # ============================================================================
@@ -560,22 +558,27 @@ def test_segment_heat_rate_reproduces_the_documented_values():
             "to": ["A", "B"],
             "length": [1000.0, 1000.0],
             "diameter": [0.1, 0.4],
-            "wall_thickness": [0.0065, 0.0235],
+            "cover": ["grass", "grass"],
         },
         index=["service", "trunk"],
     )
-    network = PipeNetwork(segments=segments, source="P")
+    thickness = pd.Series([0.0065, 0.0235], index=segments.index)
 
-    bare = _rate(network)
+    def rate(**columns):
+        return heat.segment_heat_rate(
+            network=heat.HeatNetwork(segments=_with_soil(segments).assign(**columns), source="P")
+        )
+
+    bare = rate()
     assert bare["service"] == pytest.approx(5.3361, abs=5e-4)
     assert bare["trunk"] == pytest.approx(0.5293, abs=5e-4)
 
     # The PE wall adds about a tenth of the soil resistance, so the rate drops by ~6 %.
-    walled = _rate(network, kappa_pipe=0.008)
+    walled = rate(wall_thickness=thickness, kappa_pipe=0.008)
     assert walled["service"] / bare["service"] == pytest.approx(0.935, abs=2e-3)
 
     # Fully developed laminar flow in the 100 mm pipe: the film is 29 % of the soil term.
-    film = _rate(network, film_coefficient=0.4539)
+    film = rate(film_coefficient=0.4539)
     d_eff = 1.0 + GRASS["kappa"] / GRASS["eta"]
     r_soil = np.log(2.0 * d_eff / 0.05) / (2.0 * np.pi * GRASS["kappa"])
     r_film = 1.0 / (2.0 * np.pi * 0.05 * 0.4539)
@@ -595,16 +598,24 @@ def test_segment_heat_rate_approaches_the_exact_buried_cylinder_resistance():
     """
     kappa = GRASS["kappa"]
     segments = pd.DataFrame(
-        {"from": ["P", "P"], "to": ["A", "B"], "length": [1000.0, 1000.0], "diameter": [0.1, 0.4]},
+        {
+            "from": ["P", "P"],
+            "to": ["A", "B"],
+            "length": [1000.0, 1000.0],
+            "diameter": [0.1, 0.4],
+            "cover": ["grass", "grass"],
+            "alpha": [GRASS["alpha"]] * 2,
+            "kappa_soil": [kappa] * 2,
+        },
         index=["service", "trunk"],
     )
-    network = PipeNetwork(segments=segments, source="P")
     radius = segments["diameter"].to_numpy() / 2.0
 
     gaps = {}
     for depth in (1.0, 2.0, 4.0):
         # eta=None keeps d_eff = depth, so the geometry is exactly the textbook one.
-        rate = heat.segment_heat_rate(network=network, kappa=kappa, depth=depth).to_numpy()
+        network = heat.HeatNetwork(segments=segments.assign(depth=depth), source="P")
+        rate = np.array(list(heat.segment_heat_rate(network=network).values()))
         soil_resistance = 1.0 / (rate * np.pi * radius**2)
         gap = 2.0 * np.pi * kappa * soil_resistance - np.arccosh(depth / radius)
         # The next term of the expansion is 3/(32 z**4), which is why the trunk main -- at
@@ -616,65 +627,16 @@ def test_segment_heat_rate_approaches_the_exact_buried_cylinder_resistance():
     np.testing.assert_allclose(gaps[2.0] / gaps[4.0], 4.0, rtol=0.02)
 
 
-def test_segment_heat_rate_resistances_add_in_series(heat_pipe):
+def test_segment_heat_rate_resistances_add_in_series():
     """Film, wall and soil are one series sum: adding a term can only lower the rate."""
-    heat_pipe.segments["wall_thickness"] = 0.0065
-    bare = _rate(heat_pipe)["Plant-T1"]
-    walled = _rate(heat_pipe, kappa_pipe=0.008)["Plant-T1"]
-    both = _rate(heat_pipe, kappa_pipe=0.008, film_coefficient=0.4539)["Plant-T1"]
+    bare = heat.segment_heat_rate(network=_grass_pipe(wall_thickness=0.0065))["Plant-T1"]
+    walled = heat.segment_heat_rate(network=_grass_pipe(wall_thickness=0.0065, kappa_pipe=0.008))["Plant-T1"]
+    both = heat.segment_heat_rate(
+        network=_grass_pipe(wall_thickness=0.0065, kappa_pipe=0.008, film_coefficient=0.4539)
+    )["Plant-T1"]
     assert both < walled < bare
     resistance = lambda rate: 1.0 / (rate * np.pi * 0.05**2)  # noqa: E731
     np.testing.assert_allclose(resistance(both) - resistance(walled), 1.0 / (2.0 * np.pi * 0.05 * 0.4539), rtol=1e-12)
-
-
-def test_segment_heat_rate_accepts_per_segment_series(heat_network):
-    """Per-segment parameters are honoured, and a scalar is the uniform case of them."""
-    per_segment = pd.Series(GRASS["kappa"], index=heat_network.segments.index)
-    per_segment.iloc[0] = 0.04
-    rates = heat.segment_heat_rate(
-        network=heat_network, kappa=per_segment, depth=heat_network.segments["depth"], eta=GRASS["eta"]
-    )
-    uniform = heat.segment_heat_rate(
-        network=heat_network, kappa=GRASS["kappa"], depth=heat_network.segments["depth"], eta=GRASS["eta"]
-    )
-    assert rates.iloc[0] != uniform.iloc[0]
-    np.testing.assert_allclose(rates.iloc[1:], uniform.iloc[1:], rtol=1e-14)
-
-
-def test_segment_heat_rate_rejects_a_pipe_that_is_not_fully_buried(soil):
-    """The guard is the geometric minimum ``d_eff > r_o``, not half of it.
-
-    ``ln(2 d_eff/r_o)`` stays positive all the way down to ``d_eff = r_o/2``, so a guard
-    written on its domain admits pipes standing half out of the ground, where the exact
-    ``acosh(d_eff/r_o)`` it approximates does not exist at all. The resistance then collapses
-    toward zero and the rate diverges: a 1 m main whose axis sits at 0.2505 m is twenty times
-    faster than a 100 mm service line. That rate drives the whole coupled solve, which is why
-    the second half of this test matters -- with the loose guard the two-way model converged,
-    quietly and without exceeding ``max_sweeps``, on a delivered temperature far below every
-    input.
-    """
-    segments = pd.DataFrame({"from": ["P"], "to": ["A"], "length": [1000.0], "diameter": [1.0]}, index=["main"])
-    network = PipeNetwork(segments=segments, source="P")
-    for depth in (0.2505, 0.4, 0.5):
-        with pytest.raises(ValueError, match="burial depth must exceed the pipe radius"):
-            heat.segment_heat_rate(network=network, kappa=GRASS["kappa"], depth=depth)
-    just_buried = heat.segment_heat_rate(network=network, kappa=GRASS["kappa"], depth=0.5001)
-    assert np.isfinite(just_buried).all()
-    assert (just_buried > 0.0).all()
-
-    network.segments["cover"] = "grass"
-    network.segments["depth"] = 0.2
-    tedges = pd.date_range("2025-06-01", periods=25, freq="h")
-    with pytest.raises(ValueError, match="burial depth must exceed the pipe radius"):
-        heat.source_to_endmember(
-            tin=np.full(24, 8.0),
-            flow=np.full((1, 24), 500.0),
-            tedges=tedges,
-            cout_tedges=tedges,
-            network=network,
-            soil=soil,
-            surface_temperature=pd.DataFrame({"grass": np.full(24, 20.0)}),
-        )
 
 
 # ============================================================================
@@ -709,7 +671,7 @@ def _build_operator(network, demand, tedges, rates, *, nodes=None, with_target_t
 def test_target_terms_leave_the_transport_operator_bit_identical(heat_network, hourly_tedges, diurnal_demand):
     """Requesting the bias factors changes nothing about ``W`` itself."""
     demand = heat_network.flow_array(diurnal_demand(heat_network, hourly_tedges))
-    rates = _rate(heat_network, depth=heat_network.segments["depth"]).to_numpy()
+    rates = np.array(list(heat.segment_heat_rate(network=heat_network).values()))
     plain = _build_operator(heat_network, demand, hourly_tedges, rates, with_target_terms=False)
     with_terms = _build_operator(heat_network, demand, hourly_tedges, rates)
 
@@ -897,7 +859,7 @@ def test_ramp_readings_carry_the_bias_and_the_tilt_exactly(heat_network, short_t
     demand = heat_network.flow_array(diurnal_demand(heat_network, short_tedges))
     rng = np.random.default_rng(41)
     n_seg, n_bins = len(heat_network.segments), len(short_tedges) - 1
-    rates = _rate(heat_network, depth=heat_network.segments["depth"]).to_numpy()
+    rates = np.array(list(heat.segment_heat_rate(network=heat_network).values()))
     targets = rng.uniform(8.0, 24.0, size=(n_seg, n_bins))
     tilts = rng.uniform(-6.0, 6.0, size=(n_seg, n_bins))
     tin = rng.uniform(6.0, 14.0, size=n_bins)
@@ -953,7 +915,7 @@ def test_bias_weights_are_non_negative_and_complete_the_row_sum(heat_network, sh
     which is what makes a spatially uniform temperature a fixed point.
     """
     demand = heat_network.flow_array(diurnal_demand(heat_network, short_tedges))
-    rates = _rate(heat_network, depth=heat_network.segments["depth"]).to_numpy()
+    rates = np.array(list(heat.segment_heat_rate(network=heat_network).values()))
     transfer = _build_operator(heat_network, demand, short_tedges, rates)
     n_seg, n_bins = len(heat_network.segments), len(short_tedges) - 1
 
@@ -973,7 +935,7 @@ def test_bias_weights_are_non_negative_and_complete_the_row_sum(heat_network, sh
 def test_constant_target_telescopes_to_the_surviving_fraction(heat_network, hourly_tedges, diurnal_demand):
     """A spatially and temporally constant target is delivered as ``c (1 - W row sum)``."""
     demand = heat_network.flow_array(diurnal_demand(heat_network, hourly_tedges))
-    rates = _rate(heat_network, depth=heat_network.segments["depth"]).to_numpy()
+    rates = np.array(list(heat.segment_heat_rate(network=heat_network).values()))
     transfer = _build_operator(heat_network, demand, hourly_tedges, rates)
 
     constant = 17.3
@@ -1009,7 +971,7 @@ def test_bias_matches_the_brute_force_oracle(heat_network, short_tedges, diurnal
     demand = heat_network.flow_array(diurnal_demand(heat_network, short_tedges))
     rng = np.random.default_rng(17)
     n_seg, n_bins = len(heat_network.segments), len(short_tedges) - 1
-    rates = _rate(heat_network, depth=heat_network.segments["depth"]).to_numpy()
+    rates = np.array(list(heat.segment_heat_rate(network=heat_network).values()))
     targets = rng.uniform(8.0, 24.0, size=(n_seg, n_bins))
     tin = rng.uniform(6.0, 14.0, size=n_bins)
 
@@ -1050,7 +1012,7 @@ def test_tilt_bias_matches_the_brute_force_oracle(heat_network, short_tedges, di
     demand = heat_network.flow_array(diurnal_demand(heat_network, short_tedges))
     rng = np.random.default_rng(29)
     n_seg, n_bins = len(heat_network.segments), len(short_tedges) - 1
-    rates = _rate(heat_network, depth=heat_network.segments["depth"]).to_numpy()
+    rates = np.array(list(heat.segment_heat_rate(network=heat_network).values()))
     targets = rng.uniform(8.0, 24.0, size=(n_seg, n_bins))
     tilts = rng.uniform(-6.0, 6.0, size=(n_seg, n_bins))
     tin = rng.uniform(6.0, 14.0, size=n_bins)
@@ -1200,7 +1162,7 @@ def test_bias_handles_transits_landing_exactly_on_bin_edges():
 def test_batched_nodes_of_mixed_depth_agree_with_single_node_calls(heat_network, short_tedges, diurnal_demand):
     """A shallow node padded to a deeper path's width must contribute nothing extra."""
     demand = heat_network.flow_array(diurnal_demand(heat_network, short_tedges))
-    rates = _rate(heat_network, depth=heat_network.segments["depth"]).to_numpy()
+    rates = np.array(list(heat.segment_heat_rate(network=heat_network).values()))
     rng = np.random.default_rng(29)
     targets = rng.uniform(8.0, 24.0, size=(len(heat_network.segments), len(short_tedges) - 1))
 
@@ -1221,7 +1183,7 @@ def test_target_terms_carry_only_the_rows_still_on_a_path(heat_network, short_te
     implementation detail; the counts are the contract.
     """
     demand = heat_network.flow_array(diurnal_demand(heat_network, short_tedges))
-    rates = _rate(heat_network, depth=heat_network.segments["depth"]).to_numpy()
+    rates = np.array(list(heat.segment_heat_rate(network=heat_network).values()))
     nodes = ["A", "B", "T4"]  # paths of depth 1, 2 and 3
     terms = _build_operator(heat_network, demand, short_tedges, rates, nodes=nodes).target_terms
 
@@ -1246,15 +1208,16 @@ def test_target_terms_carry_only_the_rows_still_on_a_path(heat_network, short_te
 def _uniform_case(network, tedges, *, tin, sol_air, flow, **kwargs):
     """Run the coupled model with constant inputs."""
     n = len(tedges) - 1
-    return heat.source_to_endmember(
-        tin=np.full(n, tin),
-        flow=flow,
-        tedges=tedges,
-        cout_tedges=tedges,
-        network=network,
-        soil=pd.DataFrame([GRASS], index=["grass"]),
-        surface_temperature=pd.DataFrame({"grass": np.full(n, sol_air)}),
-        **kwargs,
+    return _stack(
+        heat.source_to_endmember(
+            tin=np.full(n, tin),
+            flow=flow,
+            tedges=tedges,
+            cout_tedges=tedges,
+            network=network,
+            surface_temperature={"grass": np.full(n, sol_air)},
+            **kwargs,
+        )
     )
 
 
@@ -1372,19 +1335,19 @@ def _series_pipe(n_sub, *, transit_hours, tin, tedges, film_coefficient=0.454, n
         },
         index=[f"s{i}" for i in range(n_sub)],
     )
-    network = PipeNetwork(segments=segments, source="Plant")
+    network = heat.HeatNetwork(segments=_with_soil(segments).assign(film_coefficient=film_coefficient), source="Plant")
     n_bins = len(tedges) - 1
     volume = float(network.segments["volume"].sum())
-    return heat.source_to_endmember(
-        tin=tin,
-        flow=np.full((1, n_bins), volume / (transit_hours / 24.0)),
-        tedges=tedges,
-        cout_tedges=tedges,
-        network=network,
-        soil=pd.DataFrame([GRASS], index=["grass"]),
-        surface_temperature=pd.DataFrame({"grass": np.full(n_bins, 18.0)}),
-        film_coefficient=film_coefficient,
-        n_modes=n_modes,
+    return _stack(
+        heat.source_to_endmember(
+            tin=tin,
+            flow={"T1": np.full(n_bins, volume / (transit_hours / 24.0))},
+            tedges=tedges,
+            cout_tedges=tedges,
+            network=network,
+            surface_temperature={"grass": np.full(n_bins, 18.0)},
+            n_modes=n_modes,
+        )
     )[0]
 
 
@@ -1501,7 +1464,7 @@ def test_converged_model_satisfies_the_steady_buried_pipe_law(heat_pipe, transit
     # n_modes=2 keeps the 400-day run near its old cost; the law under test is mode-free.
     out = _uniform_case(heat_pipe, tedges, tin=8.0, sol_air=20.0, flow=flow, n_modes=2)
 
-    rate = _rate(heat_pipe)["Plant-T1"]
+    rate = heat.segment_heat_rate(network=heat_pipe)["Plant-T1"]
     expected = 20.0 + (8.0 - 20.0) * np.exp(-rate * transit_hours / 24.0)
     delivered = float(np.nanmean(out[0, -24:]))
     # The remaining gap is the undecayed deficit tail, which still lets a little more heat
@@ -1535,16 +1498,16 @@ def test_the_quasi_steady_limit_is_the_steady_buried_pipe_law_across_the_geometr
         {"from": ["Plant"], "to": ["T1"], "length": [1000.0], "diameter": [2.0 * r_inner], "cover": ["grass"]},
         index=["Plant-T1"],
     )
-    network = PipeNetwork(segments=segments, source="Plant")
+    network = heat.HeatNetwork(segments=_with_soil(segments), source="Plant")
     volume = float(network.segments.loc["Plant-T1", "volume"])
     flow = np.full((1, 1500), volume / transit_bins)  # one bin is one day, so transit_bins days
 
     delivered = float(_uniform_case(network, tedges, tin=8.0, sol_air=20.0, flow=flow)[0, -1])
-    expected = 20.0 + (8.0 - 20.0) * np.exp(-_rate(network)["Plant-T1"] * transit_bins)
+    expected = 20.0 + (8.0 - 20.0) * np.exp(-heat.segment_heat_rate(network=network)["Plant-T1"] * transit_bins)
     np.testing.assert_allclose(delivered, expected, rtol=2e-3)
 
 
-def test_one_way_model_is_the_first_iterate(heat_network, hourly_tedges, diurnal_demand, soil, surface):
+def test_one_way_model_is_the_first_iterate(heat_network, hourly_tedges, diurnal_demand, surface):
     """``max_sweeps=1`` is exactly the operator applied to the undisturbed soil field.
 
     Assembling that by hand is the regression guard on the one-way promise: the returned
@@ -1558,21 +1521,17 @@ def test_one_way_model_is_the_first_iterate(heat_network, hourly_tedges, diurnal
         tedges=hourly_tedges,
         cout_tedges=hourly_tedges,
         network=heat_network,
-        soil=soil,
         surface_temperature=surface(hourly_tedges, amplitude=3.0),
         # The first-iterate identity holds mode by mode -- the undisturbed field has no
         # tilt, so the hand-built bias below is the same at any order -- and two modes
         # keep the coupled run at the end cheap.
         n_modes=2,
     )
-    one_way = heat.source_to_endmember(tin=tin, **shared, max_sweeps=1)
+    one_way = _stack(heat.source_to_endmember(tin=tin, **shared, max_sweeps=1))
 
     system = heat._build_system(
         **shared,
-        surface_tedges=None,
-        nodes=None,
-        kappa_pipe=None,
-        film_coefficient=None,
+        report_nodes=None,
         spinup="constant",
     )
     padded = np.concatenate([np.full(system.n_pad, tin[0]), tin])
@@ -1585,13 +1544,11 @@ def test_one_way_model_is_the_first_iterate(heat_network, hourly_tedges, diurnal
 
     # And the coupling is a correction to it, not a replacement: the two agree once the
     # halo has had no chance to build, and differ where it has.
-    two_way = heat.source_to_endmember(tin=tin, **shared)
+    two_way = _stack(heat.source_to_endmember(tin=tin, **shared))
     assert np.nanmax(np.abs(two_way - one_way)) > 0.1
 
 
-def test_each_segment_relaxes_toward_its_own_cover_and_depth(
-    heat_network, hourly_tedges, diurnal_demand, soil, surface
-):
+def test_each_segment_relaxes_toward_its_own_cover_and_depth(heat_network, hourly_tedges, diurnal_demand, surface):
     """Every pipe must be given the soil field of *its* land cover at *its* burial depth.
 
     ``_build_system`` fans the undisturbed field out over segments by matching on the
@@ -1607,12 +1564,8 @@ def test_each_segment_relaxes_toward_its_own_cover_and_depth(
         tedges=hourly_tedges,
         cout_tedges=hourly_tedges,
         network=heat_network,
-        soil=soil,
         surface_temperature=surface_temperature,
-        surface_tedges=None,
-        nodes=None,
-        kappa_pipe=None,
-        film_coefficient=None,
+        report_nodes=None,
         spinup="constant",
         n_modes=2,
     )
@@ -1624,19 +1577,18 @@ def test_each_segment_relaxes_toward_its_own_cover_and_depth(
     assert len(set(zip(segments["cover"], segments["depth"], strict=True))) > 1, "fixture must mix covers and depths"
     for row, name in enumerate(segments.index):
         cover, depth = segments.loc[name, "cover"], float(segments.loc[name, "depth"])
+        record = np.asarray(surface_temperature[cover], dtype=float)
         expected = heat.soil_temperature(
-            surface_temperature=surface_temperature[cover].to_numpy(dtype=float),
+            surface_temperature=np.concatenate([np.full(system.n_pad, record[0]), record]),
             tedges=padded,
             depth=depth,
-            alpha=float(soil.loc[cover, "alpha"]),
-            kappa=float(soil.loc[cover, "kappa"]),
-            eta=float(soil.loc[cover, "eta"]),
-            surface_tedges=hourly_tedges,
+            alpha=float(segments.loc[name, "alpha"]),
+            radiation_length=float(segments.loc[name, "kappa_soil"]) / float(segments.loc[name, "eta"]),
         )
         np.testing.assert_array_equal(system.t_inf[row], expected, err_msg=f"segment {name} ({cover}, {depth} m)")
 
 
-def test_the_pipe_wall_moves_the_radius_the_halo_is_read_at(heat_pipe, soil):
+def test_the_pipe_wall_moves_the_radius_the_halo_is_read_at(heat_pipe):
     """``kappa_pipe`` reaches the halo, not only the exchange rate.
 
     A walled pipe carries its wall flux across the *outer* surface, so the deficit kernel has
@@ -1647,24 +1599,23 @@ def test_the_pipe_wall_moves_the_radius_the_halo_is_read_at(heat_pipe, soil):
     5e-3 K on this pipe -- above round-off but far below anything a black-box tolerance would
     catch -- and by 0.3 K on a 400 mm main.
     """
-    heat_pipe.segments["wall_thickness"] = 0.0065
+    walled_network = heat.HeatNetwork(
+        segments=heat_pipe.segments.drop(columns="volume").assign(wall_thickness=0.0065, kappa_pipe=0.008),
+        source="Plant",
+    )
     n = 72
     tedges = pd.date_range("2025-06-01", periods=n + 1, freq="h")
     volume = float(heat_pipe.segments.loc["Plant-T1", "volume"])
     shared = dict(
-        flow=np.full((1, n), volume / (2.0 / 24.0)),
+        flow={"T1": np.full(n, volume / (2.0 / 24.0))},
         tedges=tedges,
         cout_tedges=tedges,
-        network=heat_pipe,
-        soil=soil,
-        surface_temperature=pd.DataFrame({"grass": np.full(n, 20.0), "paved": np.full(n, 20.0)}),
+        network=walled_network,
+        surface_temperature={"grass": np.full(n, 20.0), "paved": np.full(n, 20.0)},
     )
     system = heat._build_system(
         **shared,
-        surface_tedges=None,
-        nodes=None,
-        kappa_pipe=0.008,
-        film_coefficient=None,
+        report_nodes=None,
         spinup=None,
         n_modes=2,
     )
@@ -1684,8 +1635,8 @@ def test_the_pipe_wall_moves_the_radius_the_halo_is_read_at(heat_pipe, soil):
 
     # And the series resistance still points the right way end to end.
     tin = np.full(n, 8.0)
-    bare = float(np.nanmean(heat.source_to_endmember(tin=tin, **shared)))
-    walled = float(np.nanmean(heat.source_to_endmember(tin=tin, kappa_pipe=0.008, **shared)))
+    walled = float(np.nanmean(_stack(heat.source_to_endmember(tin=tin, **shared))))
+    bare = float(np.nanmean(_stack(heat.source_to_endmember(tin=tin, **{**shared, "network": heat_pipe}))))
     assert 8.0 < walled < bare, (walled, bare)
 
 
@@ -1704,14 +1655,15 @@ def test_the_halo_stores_heat_and_gives_it_back(heat_pipe):
     volume = float(heat_pipe.segments.loc["Plant-T1", "volume"])
     shared = dict(
         tin=np.where(days < 30.0, 25.0, 10.0),
-        flow=np.full((1, n), volume / (6.0 / 24.0)),
+        flow={"T1": np.full(n, volume / (6.0 / 24.0))},
         tedges=tedges,
         cout_tedges=tedges,
         network=heat_pipe,
-        soil=pd.DataFrame([GRASS], index=["grass"]),
-        surface_temperature=pd.DataFrame({"grass": np.full(n, 10.0)}),
+        surface_temperature={"grass": np.full(n, 10.0)},
     )
-    difference = heat.source_to_endmember(**shared)[0] - heat.source_to_endmember(**shared, max_sweeps=1)[0]
+    difference = (
+        _stack(heat.source_to_endmember(**shared))[0] - _stack(heat.source_to_endmember(**shared, max_sweeps=1))[0]
+    )
 
     warm = slice(20 * 24, 30 * 24)
     after = slice(31 * 24, 45 * 24)
@@ -1745,16 +1697,15 @@ def test_the_delivered_temperature_overshoots_the_forcing_range_by_a_measured_am
         # A step in the produced temperature 20 days in, into soil held flat: the hull is
         # [21, 45] and every excursion past it is the halo answering the step.
         tin=np.where(np.arange(n) < 20 * 24, 21.0, 45.0),
-        flow=np.full((1, n), volume / (12.0 / 24.0)),
+        flow={"T1": np.full(n, volume / (12.0 / 24.0))},
         tedges=tedges,
         cout_tedges=tedges,
         network=heat_pipe,
-        soil=pd.DataFrame([GRASS], index=["grass"]),
-        surface_temperature=pd.DataFrame({"grass": np.full(n, 21.0)}),
+        surface_temperature={"grass": np.full(n, 21.0)},
     )
     contrast = 45.0 - 21.0
 
-    two_way = heat.source_to_endmember(**shared)[0]
+    two_way = _stack(heat.source_to_endmember(**shared))[0]
     finite = two_way[np.isfinite(two_way)]
     # The hot water pours heat into a halo that does not exist yet, so the target is driven
     # *below* the soil and the delivered water follows it down: the excursion is on the cold
@@ -1764,7 +1715,7 @@ def test_the_delivered_temperature_overshoots_the_forcing_range_by_a_measured_am
     assert 0.015 < excursion < 0.035, excursion
 
     # The one-way model has a fixed target and is exactly inside the hull.
-    one_way = heat.source_to_endmember(**shared, max_sweeps=1)[0]
+    one_way = _stack(heat.source_to_endmember(**shared, max_sweeps=1))[0]
     assert np.nanmin(one_way) >= 21.0 - 1e-9
 
 
@@ -1816,26 +1767,25 @@ def test_intermittent_demand_stays_near_the_range_of_its_inputs(label, diameter,
     )
     shared = dict(
         tin=np.full(n, hull_lo),
-        flow=demand[None, :],
+        flow={"T1": demand},
         tedges=tedges,
         cout_tedges=tedges,
-        network=PipeNetwork(segments=segments, source="Plant"),
-        soil=pd.DataFrame([GRASS], index=["grass"]),
-        surface_temperature=pd.DataFrame({"grass": np.full(n, hull_hi)}),
+        network=heat.HeatNetwork(segments=_with_soil(segments), source="Plant"),
+        surface_temperature={"grass": np.full(n, hull_hi)},
         # The flush shape passes six pipe volumes in a single bin, which supports no
         # axial modes past the leading few: the delivered range is identical at two,
         # three and four modes, and the sweep's divergence refusal past that is pinned by
         # test_a_pipe_flushed_within_a_bin_refuses_the_modes_it_cannot_drive.
         n_modes=4 if flow == "flush" else 6,
     )
-    delivered = heat.source_to_endmember(**shared)
+    delivered = _stack(heat.source_to_endmember(**shared))
 
     assert np.isfinite(delivered).any(), f"{label}: nothing was delivered"
     assert np.nanmin(delivered) > hull_lo - ceiling, (label, float(np.nanmin(delivered)))
     assert np.nanmax(delivered) < hull_hi + ceiling, (label, float(np.nanmax(delivered)))
     # ... and the one-way model, which is inside the hull by construction, is not simply being
     # reproduced: the coupling is doing something here.
-    one_way = heat.source_to_endmember(**shared, max_sweeps=1)
+    one_way = _stack(heat.source_to_endmember(**shared, max_sweeps=1))
     assert np.nanmax(np.abs(delivered - one_way)) > 0.1, label
 
 
@@ -1858,20 +1808,21 @@ def test_a_pipe_flushed_within_a_bin_refuses_the_modes_it_cannot_drive():
         index=["P"],
     )
     with pytest.raises(RuntimeError, match="pipe volumes in a single bin") as raised:
-        heat.source_to_endmember(
-            tin=np.full(n, 8.0),
-            flow=demand[None, :],
-            tedges=tedges,
-            cout_tedges=tedges,
-            network=PipeNetwork(segments=segments, source="Plant"),
-            soil=pd.DataFrame([GRASS], index=["grass"]),
-            surface_temperature=pd.DataFrame({"grass": np.full(n, 22.0)}),
+        _stack(
+            heat.source_to_endmember(
+                tin=np.full(n, 8.0),
+                flow={"T1": demand},
+                tedges=tedges,
+                cout_tedges=tedges,
+                network=heat.HeatNetwork(segments=_with_soil(segments), source="Plant"),
+                surface_temperature={"grass": np.full(n, 22.0)},
+            )
         )
     message = str(raised.value)
     assert "refine tedges" in message.lower() or "lower n_modes" in message.lower(), message
 
 
-def test_stagnation_overshoot_stays_small_and_raising_the_modes_settles_it(soil):
+def test_stagnation_overshoot_stays_small_and_raising_the_modes_settles_it():
     """The excursion under a duty cycle: small at the default, and the modes are why.
 
     Standing water is the case the wall flux has to get right. It exchanges heat with the
@@ -1909,22 +1860,21 @@ def test_stagnation_overshoot_stays_small_and_raising_the_modes_settles_it(soil)
             },
             index=[f"s{i}" for i in range(pieces)],
         )
-        network = PipeNetwork(segments=segments, source="Plant")
+        network = heat.HeatNetwork(segments=_with_soil(segments), source="Plant")
         volume = float(network.segments["volume"].sum())
         duty = np.concatenate([np.zeros(idle), np.full(24 - idle, volume / (2.0 / 24.0))])
         shared = dict(
             tin=np.full(n, 8.0),
-            flow=np.tile(duty, days)[None, :],
+            flow={"T1": np.tile(duty, days)},
             tedges=tedges,
             cout_tedges=tedges,
             network=network,
-            soil=soil,
-            surface_temperature=pd.DataFrame({"grass": np.full(n, 20.0), "paved": np.full(n, 20.0)}),
+            surface_temperature={"grass": np.full(n, 20.0), "paved": np.full(n, 20.0)},
             n_modes=n_modes,
         )
-        one_way = heat.source_to_endmember(**shared, max_sweeps=1)
+        one_way = _stack(heat.source_to_endmember(**shared, max_sweeps=1))
         assert np.nanmax(one_way) <= 20.0 + 1e-9, "the one-way model must stay inside its hull"
-        return (np.nanmax(heat.source_to_endmember(**shared)) - 20.0) / contrast
+        return (np.nanmax(_stack(heat.source_to_endmember(**shared))) - 20.0) / contrast
 
     one_history, two_modes, default = excursion(1, 1), excursion(1, 2), excursion(1, 6)
     assert 0.20 < one_history < 0.35, one_history
@@ -1934,7 +1884,7 @@ def test_stagnation_overshoot_stays_small_and_raising_the_modes_settles_it(soil)
     assert abs(refined) < 0.01, f"splitting must leave the settled answer alone: {refined}"
 
 
-def test_the_model_is_linear_in_every_temperature_input(heat_network, short_tedges, diurnal_demand, soil, surface):
+def test_the_model_is_linear_in_every_temperature_input(heat_network, short_tedges, diurnal_demand, surface):
     """Scaling every temperature input scales the output, to the accuracy of the fixed point.
 
     Exactly, in the model. In the answer, to whatever the iteration was asked to reach: the
@@ -1949,14 +1899,19 @@ def test_the_model_is_linear_in_every_temperature_input(heat_network, short_tedg
         tedges=short_tedges,
         cout_tedges=short_tedges,
         network=heat_network,
-        soil=soil,
         n_modes=2,  # linearity is mode-free; two modes keep the four runs near their old cost
     )
-    base = heat.source_to_endmember(
-        tin=np.full(n, 9.0), surface_temperature=surface(short_tedges, amplitude=4.0), **shared
+    base = _stack(
+        heat.source_to_endmember(
+            tin=np.full(n, 9.0), surface_temperature=surface(short_tedges, amplitude=4.0), **shared
+        )
     )
-    scaled = heat.source_to_endmember(
-        tin=np.full(n, 18.0), surface_temperature=2.0 * surface(short_tedges, amplitude=4.0), **shared
+    scaled = _stack(
+        heat.source_to_endmember(
+            tin=np.full(n, 18.0),
+            surface_temperature={c: 2.0 * v for c, v in surface(short_tedges, amplitude=4.0).items()},
+            **shared,
+        )
     )
     np.testing.assert_allclose(scaled, 2.0 * base, rtol=1e-12, atol=1e-7, equal_nan=True)
 
@@ -1964,18 +1919,20 @@ def test_the_model_is_linear_in_every_temperature_input(heat_network, short_tedg
     # round-off floor to about 1e-10 on the wide trunk; 1e-10 is the tightest tolerance the
     # iteration can still cross.
     tight = dict(shared, atol=1e-10)
-    base = heat.source_to_endmember(
-        tin=np.full(n, 9.0), surface_temperature=surface(short_tedges, amplitude=4.0), **tight
+    base = _stack(
+        heat.source_to_endmember(tin=np.full(n, 9.0), surface_temperature=surface(short_tedges, amplitude=4.0), **tight)
     )
-    scaled = heat.source_to_endmember(
-        tin=np.full(n, 18.0), surface_temperature=2.0 * surface(short_tedges, amplitude=4.0), **tight
+    scaled = _stack(
+        heat.source_to_endmember(
+            tin=np.full(n, 18.0),
+            surface_temperature={c: 2.0 * v for c, v in surface(short_tedges, amplitude=4.0).items()},
+            **tight,
+        )
     )
     np.testing.assert_allclose(scaled, 2.0 * base, rtol=1e-12, atol=1e-8, equal_nan=True)
 
 
-def test_the_answer_does_not_depend_on_the_temperature_origin(
-    heat_network, hourly_tedges, diurnal_demand, soil, surface
-):
+def test_the_answer_does_not_depend_on_the_temperature_origin(heat_network, hourly_tedges, diurnal_demand, surface):
     """Celsius or kelvin gives the same answer, shifted --- the converged fixed point included.
 
     Every coefficient of the model is geometry, so adding a constant to every temperature
@@ -1991,12 +1948,17 @@ def test_the_answer_does_not_depend_on_the_temperature_origin(
         tedges=hourly_tedges,
         cout_tedges=hourly_tedges,
         network=heat_network,
-        soil=soil,
         n_modes=2,  # origin invariance is mode-free; two modes keep the runs near their old cost
     )
-    base = heat.source_to_endmember(tin=tin, surface_temperature=surface(hourly_tedges, amplitude=4.0), **shared)
-    shifted = heat.source_to_endmember(
-        tin=tin + 273.15, surface_temperature=surface(hourly_tedges, amplitude=4.0) + 273.15, **shared
+    base = _stack(
+        heat.source_to_endmember(tin=tin, surface_temperature=surface(hourly_tedges, amplitude=4.0), **shared)
+    )
+    shifted = _stack(
+        heat.source_to_endmember(
+            tin=tin + 273.15,
+            surface_temperature={c: v + 273.15 for c, v in surface(hourly_tedges, amplitude=4.0).items()},
+            **shared,
+        )
     )
     # rtol=0 deliberately: the default 1e-7 would be measured against temperatures of order
     # 10, making the effective tolerance 1.5e-6 and leaving the absolute-tolerance rule this
@@ -2015,19 +1977,19 @@ def test_the_inflow_rows_read_the_water_the_parent_delivered(heat_network, short
     segment fed by the plant. If the inflow rows were wired to the wrong path, or the weight
     applied at the wrong end, neither would hold.
     """
-    heat_network.segments["cover"] = "grass"
-    inert = pd.DataFrame([{"alpha": GRASS["alpha"], "kappa": 1e-9, "eta": GRASS["eta"]}], index=["grass"])
+    # A vanishing soil conductivity is a vanishing exchange rate: the pipes carry heat but
+    # never give any away.
+    inert = heat.HeatNetwork(
+        segments=heat_network.segments.drop(columns="volume").assign(cover="grass", kappa_soil=1e-9),
+        source="Plant",
+    )
     system = heat._build_system(
         flow=diurnal_demand(heat_network, short_tedges),
         tedges=short_tedges,
         cout_tedges=short_tedges,
-        network=heat_network,
-        soil=inert,
+        network=inert,
         surface_temperature=surface(short_tedges, amplitude=3.0),
-        surface_tedges=None,
-        nodes=None,
-        kappa_pipe=None,
-        film_coefficient=None,
+        report_nodes=None,
         spinup=None,
         n_modes=2,
     )
@@ -2055,7 +2017,7 @@ def test_the_inflow_rows_read_the_water_the_parent_delivered(heat_network, short
     np.testing.assert_allclose(inflow[both], upstream[both], atol=1e-6)
 
 
-def test_leaf_delivery_rows_agree_with_the_transport_module(heat_network, short_tedges, diurnal_demand, soil, surface):
+def test_leaf_delivery_rows_agree_with_the_transport_module(heat_network, short_tedges, diurnal_demand, surface):
     """A segment feeding an endmember delivers what the public transport model delivers.
 
     For those segments the segment throughflow *is* the node throughflow, so the internal
@@ -2069,12 +2031,8 @@ def test_leaf_delivery_rows_agree_with_the_transport_module(heat_network, short_
         tedges=short_tedges,
         cout_tedges=short_tedges,
         network=heat_network,
-        soil=soil,
         surface_temperature=surface(short_tedges, amplitude=3.0),
-        surface_tedges=None,
-        nodes=None,
-        kappa_pipe=None,
-        film_coefficient=None,
+        report_nodes=None,
         spinup=None,
         n_modes=2,
     )
@@ -2082,7 +2040,7 @@ def test_leaf_delivery_rows_agree_with_the_transport_module(heat_network, short_
     n_seg = len(heat_network.segments)
     # The rates the operator was built with, per cover class; what they should be is pinned
     # separately, and reusing them here keeps this test about the operator rows alone.
-    rates = pd.Series(system.internal.target_terms.segment_rate[:n_seg], index=heat_network.segments.index)
+    rates = dict(zip(heat_network.segments.index, system.internal.target_terms.segment_rate[:n_seg], strict=True))
     bare = apply_banded(system.internal, tin) + apply_segment_targets(system.internal, np.zeros((n_seg, n)))
     bare = np.where(system.internal.valid_out, bare, np.nan)
 
@@ -2091,15 +2049,17 @@ def test_leaf_delivery_rows_agree_with_the_transport_module(heat_network, short_
         node = str(segment["to"])
         if node not in heat_network.endmembers:
             continue
-        expected = transport.source_to_endmember(
-            cin=tin,
-            flow=diurnal_demand(heat_network, short_tedges),
-            tedges=short_tedges,
-            cout_tedges=short_tedges,
-            network=heat_network,
-            nodes=[node],
-            decay_rate=rates,
-            spinup=None,
+        expected = _stack(
+            transport.source_to_endmember(
+                cin=tin,
+                flow=diurnal_demand(heat_network, short_tedges),
+                tedges=short_tedges,
+                cout_tedges=short_tedges,
+                network=heat_network,
+                report_nodes=[node],
+                decay_rate=rates,
+                spinup=None,
+            )
         )[0]
         actual = bare[row]
         both = np.isfinite(actual) & np.isfinite(expected)
@@ -2109,7 +2069,7 @@ def test_leaf_delivery_rows_agree_with_the_transport_module(heat_network, short_
     assert checked == len(heat_network.endmembers)
 
 
-def test_wall_flux_vanishes_without_a_temperature_difference(heat_network, hourly_tedges, diurnal_demand, soil):
+def test_wall_flux_vanishes_without_a_temperature_difference(heat_network, hourly_tedges, diurnal_demand):
     """Water already at the soil temperature exchanges nothing, so the halo never forms."""
     heat_network.segments["cover"] = "grass"
     n = len(hourly_tedges) - 1
@@ -2118,12 +2078,8 @@ def test_wall_flux_vanishes_without_a_temperature_difference(heat_network, hourl
         tedges=hourly_tedges,
         cout_tedges=hourly_tedges,
         network=heat_network,
-        soil=soil,
-        surface_temperature=pd.DataFrame({"grass": np.full(n, 14.0), "paved": np.full(n, 14.0)}),
-        surface_tedges=None,
-        nodes=None,
-        kappa_pipe=None,
-        film_coefficient=None,
+        surface_temperature={"grass": np.full(n, 14.0), "paved": np.full(n, 14.0)},
+        report_nodes=None,
         spinup="constant",
         n_modes=2,
     )
@@ -2162,15 +2118,16 @@ def test_pre_history_transient_decays_with_a_longer_lead_in(heat_pipe):
             pd.Timestamp("2025-03-01") - pd.Timedelta(days=lead_days), periods=total * 24 + 1, freq="h"
         )
         n = len(tedges) - 1
-        out = heat.source_to_endmember(
-            tin=np.full(n, 8.0),
-            flow=np.full((1, n), volume / (2.0 / 24.0)),
-            tedges=tedges,
-            cout_tedges=tedges,
-            network=heat_pipe,
-            soil=pd.DataFrame([GRASS], index=["grass"]),
-            surface_temperature=pd.DataFrame({"grass": np.full(n, 20.0)}),
-            n_modes=2,  # the halo lead-in is a mode-0 story; two modes keep five runs cheap
+        out = _stack(
+            heat.source_to_endmember(
+                tin=np.full(n, 8.0),
+                flow={"T1": np.full(n, volume / (2.0 / 24.0))},
+                tedges=tedges,
+                cout_tedges=tedges,
+                network=heat_pipe,
+                surface_temperature={"grass": np.full(n, 20.0)},
+                n_modes=2,  # the halo lead-in is a mode-0 story; two modes keep five runs cheap
+            )
         )
         return out[0, lead_days * 24 :]
 
@@ -2186,7 +2143,7 @@ def test_pre_history_transient_decays_with_a_longer_lead_in(heat_pipe):
 
 
 def test_declaring_a_pipe_as_series_segments_leaves_the_transport_operator_alone(
-    heat_network, short_tedges, diurnal_demand, soil, surface
+    heat_network, short_tedges, diurnal_demand, surface
 ):
     """Refining the soil memory must not perturb the transport: ``W``, its coverage, its travel times.
 
@@ -2215,7 +2172,7 @@ def test_declaring_a_pipe_as_series_segments_leaves_the_transport_operator_alone
                 rows["depth"].append(row["depth"])
                 index.append(f"{name}~p{i}")
                 previous = nxt
-        return PipeNetwork(segments=pd.DataFrame(rows, index=index), source="Plant")
+        return heat.HeatNetwork(segments=_with_soil(pd.DataFrame(rows, index=index)), source="Plant")
 
     def system(network):
         return heat._build_system(
@@ -2223,12 +2180,8 @@ def test_declaring_a_pipe_as_series_segments_leaves_the_transport_operator_alone
             tedges=short_tedges,
             cout_tedges=short_tedges,
             network=network,
-            soil=soil,
             surface_temperature=surface(short_tedges, amplitude=3.0),
-            surface_tedges=None,
-            nodes=None,
-            kappa_pipe=None,
-            film_coefficient=None,
+            report_nodes=None,
             spinup="constant",
             n_modes=2,
         )
@@ -2265,14 +2218,15 @@ def test_the_fixed_point_does_not_depend_on_how_long_the_record_runs(heat_pipe):
     def run(n_days):
         tedges = pd.date_range("2025-06-01", periods=n_days * 24 + 1, freq="h")
         n = len(tedges) - 1
-        return heat.source_to_endmember(
-            tin=9.0 + 3.0 * np.sin(2.0 * np.pi * np.arange(n) / 24.0),
-            flow=np.full((1, n), volume / (2.0 / 24.0)),
-            tedges=tedges,
-            cout_tedges=tedges,
-            network=heat_pipe,
-            soil=pd.DataFrame([GRASS], index=["grass"]),
-            surface_temperature=pd.DataFrame({"grass": np.full(n, 21.0)}),
+        return _stack(
+            heat.source_to_endmember(
+                tin=9.0 + 3.0 * np.sin(2.0 * np.pi * np.arange(n) / 24.0),
+                flow={"T1": np.full(n, volume / (2.0 / 24.0))},
+                tedges=tedges,
+                cout_tedges=tedges,
+                network=heat_pipe,
+                surface_temperature={"grass": np.full(n, 21.0)},
+            )
         )[0]
 
     short, medium, longest = run(10), run(30), run(90)
@@ -2286,7 +2240,7 @@ def test_the_fixed_point_does_not_depend_on_how_long_the_record_runs(heat_pipe):
     assert abs(float(np.nanmean(longest[-24:]) - np.nanmean(short[-24:]))) > 0.1
 
 
-def test_an_over_cap_branch_does_not_void_the_warm_start_of_the_whole_network(soil, surface):
+def test_an_over_cap_branch_does_not_void_the_warm_start_of_the_whole_network(surface):
     """One branch too long to warm-start must cost only itself its padding.
 
     ``_build_system`` takes its warm start over every endmember path, so a single branch
@@ -2305,21 +2259,20 @@ def test_an_over_cap_branch_does_not_void_the_warm_start_of_the_whole_network(so
         },
         index=["Plant-A", "A-T1", "A-T2"],
     )
-    network = PipeNetwork(segments=segments, source="Plant")
+    network = heat.HeatNetwork(segments=_with_soil(segments), source="Plant")
     tedges = pd.date_range("2025-06-01", periods=4 * 24 + 1, freq="h")
     n = len(tedges) - 1
     shared = dict(
         tin=np.full(n, 9.0),
-        flow=pd.DataFrame({"T1": np.full(n, 400.0), "T2": np.full(n, 300.0)}),
+        flow={"T1": np.full(n, 400.0), "T2": np.full(n, 300.0)},
         tedges=tedges,
         cout_tedges=tedges,
         network=network,
-        soil=soil,
         surface_temperature=surface(tedges),
         n_modes=2,  # the warm-start bookkeeping is mode-free; two modes keep the old cost
     )
 
-    out = heat.source_to_endmember(nodes=["T1", "T2"], **shared)
+    out = _stack(heat.source_to_endmember(report_nodes=["T1", "T2"], **shared))
 
     assert not np.isnan(out[0]).any(), "T1 sits behind 74 m3 and is warm-startable"
     assert np.all(np.isnan(out[1])), "T2 sits behind 1.6e5 m3, well over a year of transit"
@@ -2357,23 +2310,24 @@ def test_halo_memory_converges_under_bin_refinement():
 # ============================================================================
 
 
-def _reverse_case(network, tedges, demand, soil, surface_frame, *, nodes, tin, **kwargs):
+def _reverse_case(network, tedges, demand, surface_frame, *, nodes, tin, **kwargs):
     """Forward then reverse through the same configuration."""
     shared = dict(
         flow=demand,
         tedges=tedges,
         cout_tedges=tedges,
         network=network,
-        soil=soil,
         surface_temperature=surface_frame,
-        nodes=nodes,
+        report_nodes=nodes,
         # What these test is the deconvolution and its refusals, which the axial mode
         # count does not touch; two modes keep the outer-times-inner iteration at the
         # cost these cases were calibrated on.
         n_modes=2,
     )
-    measured = heat.source_to_endmember(tin=tin, **shared)
-    recovered = heat.endmember_to_source(tout=measured, **shared, **kwargs)
+    measured = _stack(heat.source_to_endmember(tin=tin, **shared))
+    observed = network.endmembers if nodes is None else nodes
+    reverse = {k: v for k, v in shared.items() if k != "report_nodes"}
+    recovered = heat.endmember_to_source(tout=dict(zip(observed, measured, strict=True)), **reverse, **kwargs)
     return measured, recovered
 
 
@@ -2396,28 +2350,27 @@ def test_the_reconstruction_reproduces_the_measurements_it_was_built_from(heat_p
     n = len(tedges) - 1
     volume = float(heat_pipe.segments.loc["Plant-T1", "volume"])
     shared = dict(
-        flow=np.full((1, n), volume / (2.0 / 24.0)),
+        flow={"T1": np.full(n, volume / (2.0 / 24.0))},
         tedges=tedges,
         cout_tedges=tedges,
         network=heat_pipe,
-        soil=pd.DataFrame([GRASS], index=["grass"]),
-        surface_temperature=pd.DataFrame({"grass": np.full(n, 20.0)}),
+        surface_temperature={"grass": np.full(n, 20.0)},
         # What can converge to the wrong point is the outer loop's bookkeeping, the same
         # at any order; the six-mode reverse is pinned by the sub-bin-transit test.
         n_modes=2,
     )
     tin = 10.0 + 2.5 * np.sin(2.0 * np.pi * np.arange(n) / 30.0)
-    measured = heat.source_to_endmember(tin=tin, **shared)
-    recovered = heat.endmember_to_source(tout=measured, **shared)
+    measured = _stack(heat.source_to_endmember(tin=tin, **shared))
+    recovered = heat.endmember_to_source(tout=_by_node(shared, measured), **shared)
 
     assert np.isfinite(recovered).sum() > 0.8 * n
-    forward = heat.source_to_endmember(tin=np.where(np.isfinite(recovered), recovered, tin), **shared)
+    forward = _stack(heat.source_to_endmember(tin=np.where(np.isfinite(recovered), recovered, tin), **shared))
     inner = slice(24, -24)
     residual = np.abs(forward[0, inner] - measured[0, inner])
     assert np.nanmax(residual) < 1e-6, np.nanmax(residual)
 
 
-def test_reverse_recovers_the_production_temperature(heat_network, hourly_tedges, diurnal_demand, soil, surface):
+def test_reverse_recovers_the_production_temperature(heat_network, hourly_tedges, diurnal_demand, surface):
     """Round trip through every endmember: the deconvolution inverts the affine model.
 
     In the interior the tolerance is the banded solver's own, not a concession to the
@@ -2436,15 +2389,20 @@ def test_reverse_recovers_the_production_temperature(heat_network, hourly_tedges
     """
     n = len(hourly_tedges) - 1
     tin = 10.0 + 2.0 * np.sin(2.0 * np.pi * np.arange(n) / 72.0)
+    # Halved conductivity keeps every segment well inside the h*tau boundary the reverse is
+    # well-posed within. The fixture's soil leaves C-T4 near it, where the round trip still
+    # converges but only after hundreds of Anderson sweeps -- boundary endurance, which is
+    # not what this test pins.
+    lighter = heat.HeatNetwork(
+        segments=heat_network.segments.drop(columns="volume").assign(
+            kappa_soil=heat_network.segments["kappa_soil"] * 0.5
+        ),
+        source="Plant",
+    )
     _, recovered = _reverse_case(
-        heat_network,
+        lighter,
         hourly_tedges,
         diurnal_demand(heat_network, hourly_tedges),
-        # Halved conductivity keeps every segment well inside the h*tau boundary the
-        # reverse is well-posed within. The fixture's soil leaves C-T4 near it, where
-        # the round trip still converges but only after hundreds of Anderson sweeps --
-        # boundary endurance, which is not what this test pins.
-        soil.assign(kappa=soil["kappa"] * 0.5),
         surface(hourly_tedges, amplitude=4.0),
         nodes=None,
         tin=tin,
@@ -2465,7 +2423,7 @@ def test_reverse_recovers_the_production_temperature(heat_network, hourly_tedges
     assert declined.sum() > 24, "the lead-out reaches further in than transport coverage alone"
 
 
-def test_reverse_tolerates_a_measurement_outage(heat_network, diurnal_demand, soil, surface):
+def test_reverse_tolerates_a_measurement_outage(heat_network, diurnal_demand, surface):
     """One sensor dropping out leaves the reconstruction to the endmembers still reporting.
 
     The record is a longer one for the same reason as the round trip above: the reverse
@@ -2478,26 +2436,30 @@ def test_reverse_tolerates_a_measurement_outage(heat_network, diurnal_demand, so
         flow=diurnal_demand(heat_network, tedges),
         tedges=tedges,
         cout_tedges=tedges,
-        network=heat_network,
         # Halved conductivity keeps every segment -- the T4 service line above all --
         # inside the h*tau coupling boundary the reverse is well-posed within; the
         # fixture's soil puts C-T4 at 1.27, past it, where no gap handling can converge.
-        soil=soil.assign(kappa=soil["kappa"] * 0.5),
+        network=heat.HeatNetwork(
+            segments=heat_network.segments.drop(columns="volume").assign(
+                kappa_soil=heat_network.segments["kappa_soil"] * 0.5
+            ),
+            source="Plant",
+        ),
         surface_temperature=surface(tedges, amplitude=4.0),
         # What this tests is the deconvolution around a gap, which the mode count does
         # not touch; two modes keep the outer-times-inner cost at the old scale.
         n_modes=2,
     )
-    measured = heat.source_to_endmember(tin=tin, **shared)
+    measured = _stack(heat.source_to_endmember(tin=tin, **shared))
     gapped = measured.copy()
     gapped[1, 60:80] = np.nan
-    recovered = heat.endmember_to_source(tout=gapped, **shared)
+    recovered = heat.endmember_to_source(tout=_by_node(shared, gapped), **shared)
 
     inner = slice(36, -96)
     np.testing.assert_allclose(recovered[inner], tin[inner], atol=1e-7)
 
 
-def test_reverse_refuses_an_answer_it_cannot_stand_behind(heat_network, short_tedges, diurnal_demand, soil, surface):
+def test_reverse_refuses_an_answer_it_cannot_stand_behind(heat_network, short_tedges, diurnal_demand, surface):
     """Losing every sensor at once makes the coupled inverse ill-posed, and it says so.
 
     With no endmember reporting over a window, the production during it is unconstrained
@@ -2512,14 +2474,13 @@ def test_reverse_refuses_an_answer_it_cannot_stand_behind(heat_network, short_te
         tedges=short_tedges,
         cout_tedges=short_tedges,
         network=heat_network,
-        soil=soil,
         surface_temperature=surface(short_tedges, amplitude=4.0),
         n_modes=2,  # a blinded window is ill-posed at any order; two modes keep it cheap
     )
-    blinded = heat.source_to_endmember(tin=tin, **shared)
+    blinded = _stack(heat.source_to_endmember(tin=tin, **shared))
     blinded[:, 40:70] = np.nan
     with pytest.raises(RuntimeError, match="did not converge"):
-        heat.endmember_to_source(tout=blinded, **shared, max_sweeps=40)
+        heat.endmember_to_source(tout=_by_node(shared, blinded), **shared, max_sweeps=40)
 
 
 def test_a_measurement_outage_does_not_corrupt_the_record_around_it():
@@ -2542,28 +2503,27 @@ def test_a_measurement_outage_does_not_corrupt_the_record_around_it():
         {"from": ["Plant"], "to": ["T1"], "length": [1000.0], "diameter": [0.1], "cover": ["grass"]},
         index=["main"],
     )
-    network = PipeNetwork(segments=segments, source="Plant")
+    network = heat.HeatNetwork(segments=_with_soil(segments), source="Plant")
     volume = float(network.segments["volume"].iloc[0])
     tin = 9.0 + 2.0 * np.sin(2.0 * np.pi * np.arange(n) / 24.0)
     shared = dict(
-        flow=np.full((1, n), volume / (2.0 / 24.0)),
+        flow={"T1": np.full(n, volume / (2.0 / 24.0))},
         tedges=tedges,
         cout_tedges=tedges,
         network=network,
-        soil=pd.DataFrame([GRASS], index=["grass"]),
-        surface_temperature=pd.DataFrame({"grass": np.full(n, 20.0)}),
+        surface_temperature={"grass": np.full(n, 20.0)},
         # The gap contract is a deconvolution property; two modes and a tight tolerance
         # keep the no-gap premise at the 1e-8 sharpness it was calibrated on.
         n_modes=2,
         atol=1e-9,
     )
-    measured = heat.source_to_endmember(tin=tin, **shared)
+    measured = _stack(heat.source_to_endmember(tin=tin, **shared))
     gap = slice(96, 168)
     gapped = measured.copy()
     gapped[0, gap] = np.nan
 
-    clean = heat.endmember_to_source(tout=measured, **shared)
-    holed = heat.endmember_to_source(tout=gapped, **shared)
+    clean = heat.endmember_to_source(tout=_by_node(shared, measured), **shared)
+    holed = heat.endmember_to_source(tout=_by_node(shared, gapped), **shared)
     settled = slice(36, n - 96)
     assert np.nanmax(np.abs(clean[settled] - tin[settled])) < 1e-8, "the no-gap round trip must stay exact"
 
@@ -2576,8 +2536,8 @@ def test_a_measurement_outage_does_not_corrupt_the_record_around_it():
 
     # The one-way reverse is the local variant, and stays bit-for-bit unaffected outside the
     # gap -- which is what makes the flagging above a statement about the coupling.
-    one_clean = heat.endmember_to_source(tout=measured, **shared, max_sweeps=1)
-    one_holed = heat.endmember_to_source(tout=gapped, **shared, max_sweeps=1)
+    one_clean = heat.endmember_to_source(tout=_by_node(shared, measured), **shared, max_sweeps=1)
+    one_holed = heat.endmember_to_source(tout=_by_node(shared, gapped), **shared, max_sweeps=1)
     # The outage does cost coverage -- bins only that sensor's water reached come back NaN --
     # but wherever the one-way direction still answers, it answers exactly what it did
     # without the gap, to the last bit.
@@ -2586,50 +2546,7 @@ def test_a_measurement_outage_does_not_corrupt_the_record_around_it():
     np.testing.assert_array_equal(one_holed[both], one_clean[both])
 
 
-def test_the_reverse_accepts_measurements_named_by_node(heat_network, diurnal_demand, soil, surface):
-    """A DataFrame or dict of measurements is matched by node name, not by row order.
-
-    Every other way in takes an array whose rows the caller has to keep in the order the
-    function chose, which is the kind of contract that fails silently when a node is added.
-    The named forms exist so it cannot, and they carry their own failure -- a missing node has
-    to be an error rather than a shifted row.
-    """
-    nodes = ["T4", "T1"]  # deliberately not the order the network lists them in
-    # A short record and the one-way reverse on purpose: what is under test is which row goes
-    # with which name, which is settled before any solving starts and which the coupling
-    # cannot affect. The two-way path costs four outer solves here and pins nothing extra.
-    tedges = pd.date_range("2025-06-01", periods=4 * 24 + 1, freq="h")
-    n = len(tedges) - 1
-    tin = 9.0 + 2.0 * np.sin(2.0 * np.pi * np.arange(n) / 72.0)
-    shared = dict(
-        flow=diurnal_demand(heat_network, tedges),
-        tedges=tedges,
-        cout_tedges=tedges,
-        network=heat_network,
-        soil=soil,
-        surface_temperature=surface(tedges, amplitude=3.0),
-        nodes=nodes,
-        # Row naming is settled before any solving starts; two modes keep the six calls cheap.
-        n_modes=2,
-    )
-    measured = heat.source_to_endmember(tin=tin, **shared)
-    shared["max_sweeps"] = 1
-    by_array = heat.endmember_to_source(tout=measured, **shared)
-    assert np.isfinite(by_array).any(), "an all-NaN reconstruction would compare equal to anything"
-    frame = pd.DataFrame({node: measured[i] for i, node in enumerate(nodes)})
-
-    np.testing.assert_array_equal(heat.endmember_to_source(tout=frame, **shared), by_array)
-    np.testing.assert_array_equal(
-        heat.endmember_to_source(tout={node: measured[i] for i, node in enumerate(nodes)}, **shared), by_array
-    )
-    # Shuffling the columns must not shuffle the answer: the name is what identifies the row.
-    shuffled = frame[list(reversed(frame.columns))]
-    np.testing.assert_array_equal(heat.endmember_to_source(tout=shuffled, **shared), by_array)
-    with pytest.raises(ValueError, match="missing node"):
-        heat.endmember_to_source(tout=frame.drop(columns=["T1"]), **shared)
-
-
-def test_the_warm_start_prefix_drives_no_wall_flux(heat_pipe, soil, surface):
+def test_the_warm_start_prefix_drives_no_wall_flux(heat_pipe, surface):
     """The fabricated lead-in feeds the halo nothing, and the record notices if it does.
 
     The bins before the record are a hydraulic warm start, not observed history: their water
@@ -2645,19 +2562,15 @@ def test_the_warm_start_prefix_drives_no_wall_flux(heat_pipe, soil, surface):
     tin = np.full(n_bins, 8.0)
     shared = dict(
         tin=tin,
-        flow=np.full((1, n_bins), float(heat_pipe.segments["volume"].iloc[0]) / (2.0 / 24.0)),
+        flow={"T1": np.full(n_bins, float(heat_pipe.segments["volume"].iloc[0]) / (2.0 / 24.0))},
         tedges=tedges,
         cout_tedges=tedges,
         network=heat_pipe,
-        soil=soil,
         surface_temperature=surface(tedges, amplitude=0.0),
     )
     system = heat._build_system(
         **{k: v for k, v in shared.items() if k != "tin"},
-        surface_tedges=None,
-        nodes=None,
-        kappa_pipe=None,
-        film_coefficient=None,
+        report_nodes=None,
         spinup="constant",
         n_modes=2,
     )
@@ -2681,19 +2594,18 @@ def _equilibrating_pipe(h_tau, *, days=12, diameter=0.1):
         {"from": ["Plant"], "to": ["T1"], "length": [1000.0], "diameter": [diameter], "cover": ["grass"]},
         index=["main"],
     )
-    network = PipeNetwork(segments=segments, source="Plant")
-    rate = float(_rate(network, depth=1.0).iloc[0])
+    network = heat.HeatNetwork(segments=_with_soil(segments), source="Plant")
+    rate = next(iter(heat.segment_heat_rate(network=network).values()))
     volume = float(network.segments["volume"].iloc[0])
     n = 24 * days
     tedges = pd.date_range("2025-06-01", periods=n + 1, freq="h")
     tin = 8.0 + 2.0 * np.sin(2.0 * np.pi * np.arange(n) / 72.0)
     shared = dict(
-        flow=np.full((1, n), volume * rate / h_tau),
+        flow={"T1": np.full(n, volume * rate / h_tau)},
         tedges=tedges,
         cout_tedges=tedges,
         network=network,
-        soil=pd.DataFrame([GRASS], index=["grass"]),
-        surface_temperature=pd.DataFrame({"grass": np.full(n, 22.0)}),
+        surface_temperature={"grass": np.full(n, 22.0)},
     )
     return shared, tin
 
@@ -2717,17 +2629,17 @@ def test_the_reverse_names_the_regime_it_cannot_invert(h_tau):
     """
     shared, tin = _equilibrating_pipe(h_tau, days=8)
     shared["n_modes"] = 2
-    measured = heat.source_to_endmember(tin=tin, **shared)
+    measured = _stack(heat.source_to_endmember(tin=tin, **shared))
 
     with pytest.raises(RuntimeError, match=r"h\*tau = ") as raised:
-        heat.endmember_to_source(tout=measured, **shared, max_sweeps=60)
+        heat.endmember_to_source(tout=_by_node(shared, measured), **shared, max_sweeps=60)
     message = str(raised.value)
     assert "'main'" in message, message
     assert "max_sweeps=1" in message, message
     assert "raise max_sweeps or atol" not in message, "the knobs that cannot help must not be advertised"
 
     # The one-way reverse it points at really does return a usable answer here.
-    one_way = heat.endmember_to_source(tout=measured, **shared, max_sweeps=1)
+    one_way = heat.endmember_to_source(tout=_by_node(shared, measured), **shared, max_sweeps=1)
     assert np.isfinite(one_way).any()
 
 
@@ -2745,8 +2657,8 @@ def test_the_reverse_reconstructs_the_sub_bin_transit_it_once_refused():
     """
     # h*tau = rate * (0.5 h): the transit spans half a bin at the median flow.
     shared, tin = _equilibrating_pipe(0.1112, days=8)
-    measured = heat.source_to_endmember(tin=tin, **shared)
-    recovered = heat.endmember_to_source(tout=measured, **shared)
+    measured = _stack(heat.source_to_endmember(tin=tin, **shared))
+    recovered = heat.endmember_to_source(tout=_by_node(shared, measured), **shared)
     inner = slice(48, -96)
     assert float(np.nanmax(np.abs(recovered[inner] - tin[inner]))) < 1e-6
 
@@ -2756,15 +2668,14 @@ def test_the_reverse_reconstructs_the_sub_bin_transit_it_once_refused():
     n = len(tedges) - 1
     tin_fine = 8.0 + 2.0 * np.sin(2.0 * np.pi * np.arange(n) / 288.0)
     fine = dict(
-        flow=np.full((1, n), shared["flow"][0, 0]),
+        flow={"T1": np.full(n, shared["flow"]["T1"][0])},
         tedges=tedges,
         cout_tedges=tedges,
         network=network,
-        soil=shared["soil"],
-        surface_temperature=pd.DataFrame({"grass": np.full(n, 22.0)}),
+        surface_temperature={"grass": np.full(n, 22.0)},
     )
-    measured_fine = heat.source_to_endmember(tin=tin_fine, **fine)
-    recovered = heat.endmember_to_source(tout=measured_fine, **fine)
+    measured_fine = _stack(heat.source_to_endmember(tin=tin_fine, **fine))
+    recovered = heat.endmember_to_source(tout=_by_node(fine, measured_fine), **fine)
     inner = slice(96, -192)
     # The resonant modes are weakly determined, so this sits above the no-gap Tikhonov floor:
     # measured 1.7e-4 K. The bound pins the remedy; the baseline behavior was a RuntimeError.
@@ -2785,13 +2696,13 @@ def test_a_service_line_at_a_one_bin_transit_is_the_coupling_regime():
     # h*tau = rate * (1 h) for a 40 mm grass line at depth 1: a one-bin transit.
     shared, tin = _equilibrating_pipe(1.1166, days=8, diameter=0.04)
     shared["n_modes"] = 2  # the coupling diagnosis is mode-free; two modes keep the old cost
-    measured = heat.source_to_endmember(tin=tin, **shared)
+    measured = _stack(heat.source_to_endmember(tin=tin, **shared))
 
     with pytest.raises(RuntimeError, match=r"h\*tau = 1\.12") as raised:
-        heat.endmember_to_source(tout=measured, **shared, max_sweeps=60)
+        heat.endmember_to_source(tout=_by_node(shared, measured), **shared, max_sweeps=60)
     assert "'main'" in str(raised.value), str(raised.value)
 
-    one_way = heat.endmember_to_source(tout=measured, **shared, max_sweeps=1)
+    one_way = heat.endmember_to_source(tout=_by_node(shared, measured), **shared, max_sweeps=1)
     assert np.isfinite(one_way).any()
 
 
@@ -2805,15 +2716,15 @@ def test_the_reverse_gives_up_on_divergence_instead_of_exhausting_its_cap():
     """
     shared, tin = _equilibrating_pipe(2.0, days=8)
     shared["n_modes"] = 2  # the detector watches the outer residual, which is mode-free
-    measured = heat.source_to_endmember(tin=tin, **shared)
+    measured = _stack(heat.source_to_endmember(tin=tin, **shared))
 
     with pytest.raises(RuntimeError, match="did not converge") as raised:
-        heat.endmember_to_source(tout=measured, **shared, max_sweeps=5000)
+        heat.endmember_to_source(tout=_by_node(shared, measured), **shared, max_sweeps=5000)
     # The cap is 5000; the detector must stop long before it, which the wording records.
     assert "within max_sweeps" not in str(raised.value), str(raised.value)
 
 
-def test_one_way_reverse_is_a_single_banded_solve(heat_network, short_tedges, diurnal_demand, soil, surface):
+def test_one_way_reverse_is_a_single_banded_solve(heat_network, short_tedges, diurnal_demand, surface):
     """Without the coupling the reverse is the existing deconvolution, and it is exact."""
     n = len(short_tedges) - 1
     tin = 11.0 + 1.5 * np.sin(2.0 * np.pi * np.arange(n) / 60.0)
@@ -2822,11 +2733,10 @@ def test_one_way_reverse_is_a_single_banded_solve(heat_network, short_tedges, di
         tedges=short_tedges,
         cout_tedges=short_tedges,
         network=heat_network,
-        soil=soil,
         surface_temperature=surface(short_tedges, amplitude=3.0),
     )
-    measured = heat.source_to_endmember(tin=tin, **shared, max_sweeps=1)
-    recovered = heat.endmember_to_source(tout=measured, **shared, max_sweeps=1)
+    measured = _stack(heat.source_to_endmember(tin=tin, **shared, max_sweeps=1))
+    recovered = heat.endmember_to_source(tout=_by_node(shared, measured), **shared, max_sweeps=1)
     inner = slice(36, -36)
     np.testing.assert_allclose(recovered[inner], tin[inner], atol=1e-9)
 
@@ -2837,20 +2747,21 @@ def test_one_way_reverse_is_a_single_banded_solve(heat_network, short_tedges, di
 
 
 def test_non_convergence_raises_rather_than_returning_a_partial_answer(
-    heat_network, hourly_tedges, diurnal_demand, soil, surface
+    heat_network, hourly_tedges, diurnal_demand, surface
 ):
     """A truncated iteration is not an answer, so the cap raises."""
     n = len(hourly_tedges) - 1
     with pytest.raises(RuntimeError, match="did not converge"):
-        heat.source_to_endmember(
-            tin=np.full(n, 8.0),
-            flow=diurnal_demand(heat_network, hourly_tedges),
-            tedges=hourly_tedges,
-            cout_tedges=hourly_tedges,
-            network=heat_network,
-            soil=soil,
-            surface_temperature=surface(hourly_tedges),
-            max_sweeps=3,
+        _stack(
+            heat.source_to_endmember(
+                tin=np.full(n, 8.0),
+                flow=diurnal_demand(heat_network, hourly_tedges),
+                tedges=hourly_tedges,
+                cout_tedges=hourly_tedges,
+                network=heat_network,
+                surface_temperature=surface(hourly_tedges),
+                max_sweeps=3,
+            )
         )
 
 
@@ -2867,15 +2778,16 @@ def test_a_year_of_hourly_data_converges_and_stays_physical(heat_pipe):
     n = len(tedges) - 1
     seasonal = np.sin(2.0 * np.pi * np.arange(n) / n)
     volume = float(heat_pipe.segments.loc["Plant-T1", "volume"])
-    out = heat.source_to_endmember(
-        tin=8.0 + 4.0 * seasonal,
-        flow=np.full((1, n), volume / (2.0 / 24.0)) * (1.0 + 0.5 * np.sin(2.0 * np.pi * np.arange(n) / 24.0)),
-        tedges=tedges,
-        cout_tedges=tedges,
-        network=heat_pipe,
-        soil=pd.DataFrame([GRASS], index=["grass"]),
-        surface_temperature=pd.DataFrame({"grass": 12.0 + 10.0 * seasonal}),
-        n_modes=2,  # boundedness over a long record is mode-free; two modes keep the old cost
+    out = _stack(
+        heat.source_to_endmember(
+            tin=8.0 + 4.0 * seasonal,
+            flow={"T1": np.full(n, volume / (2.0 / 24.0)) * (1.0 + 0.5 * np.sin(2.0 * np.pi * np.arange(n) / 24.0))},
+            tedges=tedges,
+            cout_tedges=tedges,
+            network=heat_pipe,
+            surface_temperature={"grass": 12.0 + 10.0 * seasonal},
+            n_modes=2,  # boundedness over a long record is mode-free; two modes keep the old cost
+        )
     )
     finite = out[np.isfinite(out)]
     assert finite.size > 0.9 * out.size
@@ -2883,7 +2795,7 @@ def test_a_year_of_hourly_data_converges_and_stays_physical(heat_pipe):
     assert finite.max() <= 22.0 + 1e-9
 
 
-def test_strict_validity_marks_the_same_bins_as_transport(heat_network, hourly_tedges, diurnal_demand, soil, surface):
+def test_strict_validity_marks_the_same_bins_as_transport(heat_network, hourly_tedges, diurnal_demand, surface):
     """``spinup=None`` invalidates exactly the bins the conservative model invalidates.
 
     Not run at ``max_sweeps=1``, tempting as that is for a test that compares only NaN
@@ -2892,24 +2804,27 @@ def test_strict_validity_marks_the_same_bins_as_transport(heat_network, hourly_t
     sweeps would leave that line unguarded.
     """
     n = len(hourly_tedges) - 1
-    strict = heat.source_to_endmember(
-        tin=np.full(n, 8.0),
-        flow=diurnal_demand(heat_network, hourly_tedges),
-        tedges=hourly_tedges,
-        cout_tedges=hourly_tedges,
-        network=heat_network,
-        soil=soil,
-        surface_temperature=surface(hourly_tedges),
-        spinup=None,
-        n_modes=2,  # the NaN mask under test is transport coverage, which the modes cannot move
+    strict = _stack(
+        heat.source_to_endmember(
+            tin=np.full(n, 8.0),
+            flow=diurnal_demand(heat_network, hourly_tedges),
+            tedges=hourly_tedges,
+            cout_tedges=hourly_tedges,
+            network=heat_network,
+            surface_temperature=surface(hourly_tedges),
+            spinup=None,
+            n_modes=2,  # the NaN mask under test is transport coverage, which the modes cannot move
+        )
     )
-    conservative = transport.source_to_endmember(
-        cin=np.full(n, 8.0),
-        flow=diurnal_demand(heat_network, hourly_tedges),
-        tedges=hourly_tedges,
-        cout_tedges=hourly_tedges,
-        network=heat_network,
-        spinup=None,
+    conservative = _stack(
+        transport.source_to_endmember(
+            cin=np.full(n, 8.0),
+            flow=diurnal_demand(heat_network, hourly_tedges),
+            tedges=hourly_tedges,
+            cout_tedges=hourly_tedges,
+            network=heat_network,
+            spinup=None,
+        )
     )
     np.testing.assert_array_equal(np.isnan(strict), np.isnan(conservative))
 
@@ -2945,7 +2860,7 @@ def test_a_multi_year_sub_daily_grid_counts_as_uniform(heat_pipe, freq, periods)
     )
 
 
-def test_output_grid_may_differ_from_the_input_grid(heat_network, hourly_tedges, diurnal_demand, soil, surface):
+def test_output_grid_may_differ_from_the_input_grid(heat_network, hourly_tedges, diurnal_demand, surface):
     """``cout_tedges`` is free in alignment and resolution.
 
     Run at ``max_sweeps=1``: the targets are iterated on the *internal* operator, which is
@@ -2954,16 +2869,17 @@ def test_output_grid_may_differ_from_the_input_grid(heat_network, hourly_tedges,
     """
     n = len(hourly_tedges) - 1
     cout_tedges = pd.date_range(hourly_tedges[0], hourly_tedges[-1], freq="6h")
-    out = heat.source_to_endmember(
-        tin=np.full(n, 8.0),
-        flow=diurnal_demand(heat_network, hourly_tedges),
-        tedges=hourly_tedges,
-        cout_tedges=cout_tedges,
-        network=heat_network,
-        soil=soil,
-        surface_temperature=surface(hourly_tedges),
-        max_sweeps=1,
-        n_modes=2,  # the shape contract is the reporting operator's, the same at any order
+    out = _stack(
+        heat.source_to_endmember(
+            tin=np.full(n, 8.0),
+            flow=diurnal_demand(heat_network, hourly_tedges),
+            tedges=hourly_tedges,
+            cout_tedges=cout_tedges,
+            network=heat_network,
+            surface_temperature=surface(hourly_tedges),
+            max_sweeps=1,
+            n_modes=2,  # the shape contract is the reporting operator's, the same at any order
+        )
     )
     assert out.shape == (len(heat_network.endmembers), len(cout_tedges) - 1)
 
@@ -2977,25 +2893,24 @@ def test_output_grid_may_differ_from_the_input_grid(heat_network, hourly_tedges,
             ),
             "uniformly spaced",
         ),
-        (lambda kwargs: kwargs.update(soil=kwargs["soil"].drop(index="grass")), "cover class"),
-        (lambda kwargs: kwargs.update(soil=kwargs["soil"].drop(columns="eta")), "column 'eta'"),
         (
-            lambda kwargs: kwargs.update(surface_temperature=kwargs["surface_temperature"].drop(columns="grass")),
+            lambda kwargs: kwargs.update(surface_temperature={"paved": kwargs["surface_temperature"]["paved"]}),
             "cover class",
         ),
-        (lambda kwargs: kwargs.update(nodes=["nowhere"]), "unknown node"),
+        (lambda kwargs: kwargs.update(report_nodes=["nowhere"]), "unknown node"),
         (lambda kwargs: kwargs.update(max_sweeps=0), "max_sweeps must be at least 1"),
         (
             lambda kwargs: kwargs.update(
-                surface_temperature=kwargs["surface_temperature"].assign(
-                    grass=lambda frame: np.concatenate([[np.nan], frame["grass"].to_numpy()[1:]])
-                )
+                surface_temperature={
+                    **kwargs["surface_temperature"],
+                    "grass": np.concatenate([[np.nan], kwargs["surface_temperature"]["grass"][1:]]),
+                }
             ),
             "NaN",
         ),
     ],
 )
-def test_invalid_input_is_rejected(heat_network, hourly_tedges, diurnal_demand, soil, surface, mutate, message):
+def test_invalid_input_is_rejected(heat_network, hourly_tedges, diurnal_demand, surface, mutate, message):
     """Each malformed input names what is wrong with it."""
     n = len(hourly_tedges) - 1
     kwargs = dict(
@@ -3004,15 +2919,14 @@ def test_invalid_input_is_rejected(heat_network, hourly_tedges, diurnal_demand, 
         tedges=hourly_tedges,
         cout_tedges=hourly_tedges,
         network=heat_network,
-        soil=soil,
         surface_temperature=surface(hourly_tedges),
     )
     mutate(kwargs)
     with pytest.raises(ValueError, match=message):
-        heat.source_to_endmember(**kwargs)
+        _stack(heat.source_to_endmember(**kwargs))
 
 
-def test_the_public_surface_holds_at_its_edges(heat_network, soil, surface):
+def test_the_public_surface_holds_at_its_edges(heat_network, surface):
     """Six shapes of call that are legal, rarely written, and easy to break by accident.
 
     None of these is a guard: every one already behaves correctly, and the point is that a
@@ -3030,68 +2944,67 @@ def test_the_public_surface_holds_at_its_edges(heat_network, soil, surface):
         "flow": flow,
         "tedges": tedges,
         "network": heat_network,
-        "soil": soil,
         "surface_temperature": surface(tedges, amplitude=2.0),
         "n_modes": 2,  # none of the six shapes is about mode behavior; two modes keep the old cost
     }
 
     # an internal node, and the source itself: a depth-0 path delivers the source unchanged
-    internal = heat.source_to_endmember(cout_tedges=tedges, nodes=["A"], **common)
+    internal = _stack(heat.source_to_endmember(cout_tedges=tedges, report_nodes=["A"], **common))
     assert np.isfinite(internal).all()
-    at_source = heat.source_to_endmember(cout_tedges=tedges, nodes=["Plant"], **common)
+    at_source = _stack(heat.source_to_endmember(cout_tedges=tedges, report_nodes=["Plant"], **common))
     np.testing.assert_array_equal(at_source, np.full((1, n), 8.0))
 
     # an output grid that the record never reaches: every bin unconstrained, no exception
     elsewhere = pd.date_range("2025-08-01", periods=25, freq="h")
-    assert np.isnan(heat.source_to_endmember(cout_tedges=elsewhere, nodes=["T1"], **common)).all()
+    assert np.isnan(_stack(heat.source_to_endmember(cout_tedges=elsewhere, report_nodes=["T1"], **common))).all()
 
     # a cover class no pipe uses must not change the answer
-    spare = pd.concat([soil, soil.iloc[[0]].rename(index={soil.index[0]: "gravel"})])
-    spare_surface = surface(tedges, amplitude=2.0).assign(gravel=15.0)
+    spare_surface = {**surface(tedges, amplitude=2.0), "gravel": np.full(len(tedges) - 1, 15.0)}
     np.testing.assert_array_equal(
-        heat.source_to_endmember(
-            cout_tedges=tedges, nodes=["T1"], **{**common, "soil": spare, "surface_temperature": spare_surface}
+        _stack(
+            heat.source_to_endmember(
+                cout_tedges=tedges, report_nodes=["T1"], **{**common, "surface_temperature": spare_surface}
+            )
         ),
-        heat.source_to_endmember(cout_tedges=tedges, nodes=["T1"], **common),
+        _stack(heat.source_to_endmember(cout_tedges=tedges, report_nodes=["T1"], **common)),
     )
 
     # a prescribed-temperature surface over one cover and a film over the other
-    mixed = soil.copy()
-    mixed.loc["paved", "eta"] = np.inf
-    assert np.isfinite(heat.source_to_endmember(cout_tedges=tedges, nodes=["T1"], **{**common, "soil": mixed})).all()
+    mixed = heat.HeatNetwork(
+        segments=heat_network.segments.drop(columns="volume").assign(
+            eta=np.where(heat_network.segments["cover"] == "paved", np.inf, GRASS["eta"])
+        ),
+        source="Plant",
+    )
+    assert np.isfinite(
+        _stack(heat.source_to_endmember(cout_tedges=tedges, report_nodes=["T1"], **{**common, "network": mixed}))
+    ).all()
 
-    # the recommended usage: a surface record reaching back before the period of interest
+    # the recommended usage: a record reaching back before the period of interest, reported
+    # on an output grid that covers the period alone -- nothing to discard
     long_tedges = pd.date_range("2025-05-02", periods=32 * 24 + 1, freq="h")
-    early = heat.source_to_endmember(
-        cout_tedges=tedges,
-        nodes=["T1"],
-        surface_tedges=long_tedges,
-        **{**common, "surface_temperature": surface(long_tedges, amplitude=2.0)},
+    n_long = len(long_tedges) - 1
+    early = _stack(
+        heat.source_to_endmember(
+            cout_tedges=tedges,
+            report_nodes=["T1"],
+            **{
+                **common,
+                "tedges": long_tedges,
+                "tin": np.full(n_long, 8.0),
+                "flow": {node: np.full(n_long, 300.0) for node in heat_network.endmembers},
+                "surface_temperature": surface(long_tedges, amplitude=2.0),
+            },
+        )
     )
     assert np.isfinite(early).all()
-    assert not np.allclose(early, heat.source_to_endmember(cout_tedges=tedges, nodes=["T1"], **common)), (
-        "a developed soil history has to change the answer, or the argument does nothing"
-    )
-
-
-def test_missing_geometry_columns_are_reported(heat_network, hourly_tedges, diurnal_demand, soil, surface):
-    """The heat pair needs the pipe geometry the line-source kernel is built on."""
-    n = len(hourly_tedges) - 1
-    heat_network.segments = heat_network.segments.drop(columns="diameter")
-    with pytest.raises(ValueError, match="diameter"):
-        heat.source_to_endmember(
-            tin=np.full(n, 8.0),
-            flow=diurnal_demand(heat_network, hourly_tedges),
-            tedges=hourly_tedges,
-            cout_tedges=hourly_tedges,
-            network=heat_network,
-            soil=soil,
-            surface_temperature=surface(hourly_tedges),
-        )
+    assert not np.allclose(
+        early, _stack(heat.source_to_endmember(cout_tedges=tedges, report_nodes=["T1"], **common))
+    ), "a lead-in warms up both the soil state and the halo, so it has to change the answer"
 
 
 @pytest.mark.parametrize("factor", [0.5, 1.5])
-def test_a_volume_that_contradicts_length_and_diameter_is_rejected(soil, surface, factor):
+def test_a_volume_that_contradicts_length_and_diameter_is_rejected(factor):
     """The heat pair reads a pipe three ways, and they have to describe the same pipe.
 
     ``PipeNetwork`` takes the water volume from a ``volume`` column when there is one and only
@@ -3105,8 +3018,6 @@ def test_a_volume_that_contradicts_length_and_diameter_is_rejected(soil, surface
     data, with nominal DN diameters and lengths attached to it so the heat pair will run, is
     the normal state of an inventory.
     """
-    n_bins = 96
-    tedges = pd.date_range("2025-06-01", periods=n_bins + 1, freq="h")
     geometric = np.pi / 4.0 * 0.1**2 * 1000.0
     segments = pd.DataFrame(
         {
@@ -3119,39 +3030,14 @@ def test_a_volume_that_contradicts_length_and_diameter_is_rejected(soil, surface
         },
         index=["main"],
     )
-    network = PipeNetwork(segments=segments, source="Plant")
-
     with pytest.raises(ValueError, match="reads the pipe three ways") as raised:
-        heat.source_to_endmember(
-            tin=np.full(n_bins, 9.0),
-            flow=np.full((1, n_bins), geometric / (2.0 / 24.0)),
-            tedges=tedges,
-            cout_tedges=tedges,
-            network=network,
-            soil=soil,
-            surface_temperature=surface(tedges, amplitude=3.0),
-        )
+        heat.HeatNetwork(segments=_with_soil(segments), source="Plant")
     assert "'main'" in str(raised.value), str(raised.value)
 
-    # A network whose volume really is the geometric one runs, so the guard is about the
+    # A network whose volume really is the geometric one builds, so the guard is about the
     # contradiction rather than about requiring the column to be absent.
-    consistent = segments.assign(volume=geometric)
-    heat.source_to_endmember(
-        tin=np.full(n_bins, 9.0),
-        flow=np.full((1, n_bins), geometric / (2.0 / 24.0)),
-        tedges=tedges,
-        cout_tedges=tedges,
-        network=PipeNetwork(segments=consistent, source="Plant"),
-        soil=soil,
-        surface_temperature=surface(tedges, amplitude=3.0),
-        max_sweeps=1,
-    )
-
-
-def test_wall_conductivity_requires_the_wall_thickness(heat_pipe):
-    """``kappa_pipe`` without a thickness column is a configuration error, not a default."""
-    with pytest.raises(ValueError, match="wall_thickness"):
-        _rate(heat_pipe, kappa_pipe=0.008)
+    consistent = heat.HeatNetwork(segments=_with_soil(segments).assign(volume=geometric), source="Plant")
+    np.testing.assert_allclose(consistent.segments["volume"], geometric, rtol=1e-15)
 
 
 def test_sol_air_temperature_combines_the_surface_energy_budget():
@@ -3172,3 +3058,246 @@ def test_sol_air_temperature_combines_the_surface_energy_budget():
         300.0 * 86400 / 4.18e6 / 0.41,
         rtol=1e-14,
     )
+
+
+def test_soil_temperature_measures_the_record_against_t_pre():
+    """``t_pre`` is the state the first surface step is measured against, and only that.
+
+    A record that opens settled must return its own constant *exactly* -- every step is zero,
+    so nothing is superposed at all -- and a record that opens onto a jump must respond to
+    the jump alone. The second half pins that the response is linear in the step: the same
+    field is the unit-step answer scaled by the step's size and offset by the pre-history,
+    which a kernel wired to the absolute temperature rather than to the step could not do.
+    """
+    tedges = pd.date_range("2025-01-01", periods=31, freq="D")
+    settled = heat.soil_temperature(surface_temperature=np.full(30, 25.0), tedges=tedges, depth=1.0, **GRASS_FIELD)
+    np.testing.assert_array_equal(settled, 25.0)
+
+    stepped = heat.soil_temperature(
+        surface_temperature=np.full(30, 25.0), tedges=tedges, depth=1.0, t_pre=9.0, **GRASS_FIELD
+    )
+    assert stepped[0] > 9.0
+    assert np.all(np.diff(stepped) > 0.0), "a step at the surface arrives monotonically at depth"
+    assert stepped[-1] < 25.0, "a month is not long enough for a step to fully arrive at 1 m"
+
+    unit = heat.soil_temperature(surface_temperature=np.ones(30), tedges=tedges, depth=1.0, t_pre=0.0, **GRASS_FIELD)
+    np.testing.assert_allclose(stepped, 9.0 + 16.0 * unit, rtol=1e-14)
+
+
+def test_soil_temperature_rejects_a_non_uniform_grid():
+    """The superposition is a convolution only on a uniform grid.
+
+    The lag of an (output edge, surface step) pair is then a function of their index
+    difference alone, which is what turns a quadratic matrix product into a transform. A
+    record on its own spacing has to be resampled by the caller, who knows whether
+    interpolating or bin-averaging it is the right thing to do.
+    """
+    tedges = pd.DatetimeIndex([*pd.date_range("2025-01-01", periods=25, freq="h"), "2025-01-02T02:00:00"])
+    with pytest.raises(ValueError, match="uniformly spaced"):
+        heat.soil_temperature(
+            surface_temperature=np.full(len(tedges) - 1, 20.0),
+            tedges=tedges,
+            depth=1.0,
+            **GRASS_FIELD,
+        )
+
+
+# ============================================================================
+# Kernels: the halo
+# ============================================================================
+
+
+def test_the_neutral_elements_are_exactly_the_absent_columns():
+    """``inf`` conductances and a zero wall are the defaults, bit for bit.
+
+    The rate is written as one series sum with no branch for the bare pipe or the
+    not-limiting film, which is only legitimate if each neutral element contributes exactly
+    zero resistance -- not merely a negligible one. A near-miss here would be invisible in
+    any end-to-end tolerance, so it is pinned bit-exactly.
+    """
+    default = heat.segment_heat_rate(network=_grass_pipe())
+    spelled_out = heat.segment_heat_rate(
+        network=_grass_pipe(wall_thickness=0.0, kappa_pipe=np.inf, film_coefficient=np.inf)
+    )
+    np.testing.assert_array_equal(spelled_out, default)
+    # A finite wall conductivity across a zero-thickness wall is still the bare pipe, and an
+    # infinite film across a real wall adds nothing to it.
+    np.testing.assert_array_equal(heat.segment_heat_rate(network=_grass_pipe(kappa_pipe=0.008)), default)
+    walled = heat.segment_heat_rate(network=_grass_pipe(wall_thickness=0.0065, kappa_pipe=0.008))
+    np.testing.assert_array_equal(
+        heat.segment_heat_rate(network=_grass_pipe(wall_thickness=0.0065, kappa_pipe=0.008, film_coefficient=np.inf)),
+        walled,
+    )
+
+
+def test_segment_heat_rate_reads_each_segments_own_soil(heat_network):
+    """Two pipes may share a cover and still sit in different ground."""
+    segments = heat_network.segments.copy()
+    segments.loc[segments.index[0], "kappa_soil"] = 0.04
+    varied = heat.segment_heat_rate(network=heat.HeatNetwork(segments=segments, source="Plant"))
+    uniform = heat.segment_heat_rate(network=heat_network)
+    first, *rest = heat_network.segments.index
+    assert varied[first] != uniform[first]
+    np.testing.assert_allclose([varied[name] for name in rest], [uniform[name] for name in rest], rtol=1e-14)
+
+
+def test_segment_heat_rate_rejects_a_plain_pipe_network(network):
+    """A transport network carries none of the columns the rate is built from."""
+    with pytest.raises(TypeError, match="HeatNetwork"):
+        heat.segment_heat_rate(network=network)
+
+
+def test_a_pipe_that_is_not_fully_buried_is_rejected_at_construction():
+    """The guard is the geometric minimum ``d_eff > r_o``, not half of it.
+
+    ``ln(2 d_eff/r_o)`` stays positive all the way down to ``d_eff = r_o/2``, so a guard
+    written on its domain admits pipes standing half out of the ground, where the exact
+    ``acosh(d_eff/r_o)`` it approximates does not exist at all. The resistance then collapses
+    toward zero and the rate diverges: a 1 m main whose axis sits at 0.2505 m is twenty times
+    faster than a 100 mm service line. That rate drives the whole coupled solve, which is why
+    the second half of this test matters -- with the loose guard the two-way model converged,
+    quietly and without exceeding ``max_sweeps``, on a delivered temperature far below every
+    input.
+    """
+    segments = pd.DataFrame(
+        {
+            "from": ["P"],
+            "to": ["A"],
+            "length": [1000.0],
+            "diameter": [1.0],
+            "cover": ["grass"],
+            "alpha": [GRASS["alpha"]],
+            "kappa_soil": [GRASS["kappa"]],
+        },
+        index=["main"],
+    )
+    for depth in (0.2505, 0.4, 0.5):
+        with pytest.raises(ValueError, match="burial depth must exceed the outer pipe radius"):
+            heat.HeatNetwork(segments=segments.assign(depth=depth), source="P")
+    just_buried = heat.segment_heat_rate(network=heat.HeatNetwork(segments=segments.assign(depth=0.5001), source="P"))
+    assert all(np.isfinite(rate) and rate > 0.0 for rate in just_buried.values())
+
+    # The wall pushes the outer radius out, so a burial that clears the bare pipe need not
+    # clear the walled one -- which is why the guard is written on r_o rather than r_i.
+    with pytest.raises(ValueError, match="burial depth must exceed the outer pipe radius"):
+        heat.HeatNetwork(segments=segments.assign(depth=0.5001, wall_thickness=0.02), source="P")
+
+
+# ============================================================================
+# The affine bias operator
+# ============================================================================
+
+
+@pytest.mark.parametrize("column", ["length", "diameter", "cover", "alpha", "kappa_soil"])
+def test_a_missing_heat_column_is_reported_at_construction(heat_network, column):
+    """Every column the kernels are built on is required, and named when it is absent."""
+    segments = heat_network.segments.drop(columns=[column, *(["volume"] if column != "length" else [])])
+    with pytest.raises(ValueError, match=column):
+        heat.HeatNetwork(segments=segments, source="Plant")
+
+
+def test_the_optional_heat_columns_default_to_their_neutral_elements(heat_network):
+    """A table that names none of them describes a bare pipe under a prescribed surface."""
+    bare = heat.HeatNetwork(segments=heat_network.segments.drop(columns=["volume", "depth", "eta"]), source="Plant")
+    np.testing.assert_array_equal(bare.segments["depth"], 1.0)
+    np.testing.assert_array_equal(bare.segments["eta"], np.inf)
+    np.testing.assert_array_equal(bare.segments["wall_thickness"], 0.0)
+    np.testing.assert_array_equal(bare.segments["kappa_pipe"], np.inf)
+    np.testing.assert_array_equal(bare.segments["film_coefficient"], np.inf)
+
+
+def test_a_plain_pipe_network_is_rejected_by_the_heat_pair(network, hourly_tedges, diurnal_demand, surface):
+    """A transport network carries none of the buried-pipe columns the heat pair reads."""
+    n = len(hourly_tedges) - 1
+    with pytest.raises(TypeError, match="HeatNetwork"):
+        _stack(
+            heat.source_to_endmember(
+                tin=np.full(n, 8.0),
+                flow=diurnal_demand(network, hourly_tedges),
+                tedges=hourly_tedges,
+                cout_tedges=hourly_tedges,
+                network=network,
+                surface_temperature=surface(hourly_tedges),
+            )
+        )
+
+
+def test_the_reverse_reads_its_observation_set_off_the_keys(heat_network, diurnal_demand, surface):
+    """The keys of ``tout`` name the sensors, and nothing about their order can matter.
+
+    The reverse takes no node list: which nodes were observed *is* which keys are present.
+    Two things have to follow. The answer must not depend on the order the caller happened to
+    build the mapping in -- the solve orders rows by the network, not by insertion -- and a
+    key that is not a node has to be an error rather than a silently ignored series.
+    """
+    nodes = ["T4", "T1"]  # deliberately not the order the network lists them in
+    # A short record and the one-way reverse on purpose: what is under test is which row goes
+    # with which name, which is settled before any solving starts and which the coupling
+    # cannot affect. The two-way path costs four outer solves here and pins nothing extra.
+    tedges = pd.date_range("2025-06-01", periods=4 * 24 + 1, freq="h")
+    n = len(tedges) - 1
+    tin = 9.0 + 2.0 * np.sin(2.0 * np.pi * np.arange(n) / 72.0)
+    shared = dict(
+        flow=diurnal_demand(heat_network, tedges),
+        tedges=tedges,
+        cout_tedges=tedges,
+        network=heat_network,
+        surface_temperature=surface(tedges, amplitude=3.0),
+    )
+    measured = _stack(heat.source_to_endmember(tin=tin, report_nodes=nodes, **shared))
+    shared["max_sweeps"] = 1
+    named = dict(zip(nodes, measured, strict=True))
+    recovered = heat.endmember_to_source(tout=named, **shared)
+    assert np.isfinite(recovered).any(), "an all-NaN reconstruction would compare equal to anything"
+
+    # Reversing the insertion order must not move a single bit of the answer.
+    reversed_keys = {node: named[node] for node in reversed(list(named))}
+    np.testing.assert_array_equal(heat.endmember_to_source(tout=reversed_keys, **shared), recovered)
+
+    with pytest.raises(ValueError, match="unknown node"):
+        heat.endmember_to_source(tout={**named, "nowhere": measured[0]}, **shared)
+    with pytest.raises(ValueError, match="at least one observed node"):
+        heat.endmember_to_source(tout={}, **shared)
+
+
+def test_an_optional_column_may_be_given_for_one_segment_only():
+    """A property one pipe carries and its neighbour omits is a gap, not an error.
+
+    The mapping form lets every segment carry its own keys, so a wall thickness known for one
+    pipe and unknown for the next arrives as NaN in the gap. That gap is the neutral element,
+    which is what makes a partially surveyed inventory usable at all -- while a *required*
+    property missing from one segment has to be named, because there is no neutral element
+    for the soil a pipe sits in.
+    """
+    grass = {"cover": "grass", "alpha": GRASS["alpha"], "kappa_soil": GRASS["kappa"], "eta": GRASS["eta"]}
+    network = heat.HeatNetwork(
+        segments={
+            "surveyed": {"from": "P", "to": "A", "length": 1000.0, "diameter": 0.1, **grass, "wall_thickness": 0.0065},
+            "not-surveyed": {"from": "A", "to": "B", "length": 1000.0, "diameter": 0.1, **grass},
+        },
+        source="P",
+    )
+    np.testing.assert_array_equal(network.segments["wall_thickness"], [0.0065, 0.0])
+    np.testing.assert_array_equal(network.segments["kappa_pipe"], np.inf)
+    # An infinite wall conductivity carries no resistance however thick the wall, so all the
+    # thickness does is move the radius the soil is read at outward -- which *lowers*
+    # ln(2 d_eff / r_o) and so raises the rate. The wall only ever slows a pipe down through
+    # its own conductivity, never through its geometry.
+    rate = heat.segment_heat_rate(network=network)
+    assert rate["surveyed"] > rate["not-surveyed"]
+
+    with pytest.raises(ValueError, match=r"segment 'not-surveyed' is missing \['kappa_soil'\]"):
+        heat.HeatNetwork(
+            segments={
+                "surveyed": {"from": "P", "to": "A", "length": 1000.0, "diameter": 0.1, **grass},
+                "not-surveyed": {
+                    "from": "A",
+                    "to": "B",
+                    "length": 1000.0,
+                    "diameter": 0.1,
+                    "cover": "grass",
+                    "alpha": GRASS["alpha"],
+                },
+            },
+            source="P",
+        )

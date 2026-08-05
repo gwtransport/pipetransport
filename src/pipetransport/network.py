@@ -30,6 +30,7 @@ See the ./LICENSE file or go to https://github.com/gwtransport/pipetransport/blo
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Mapping
 
 import numpy as np
 import numpy.typing as npt
@@ -43,12 +44,18 @@ class PipeNetwork:
 
     Parameters
     ----------
-    segments : pandas.DataFrame
-        One row per pipe segment, indexed by a unique segment name. Required columns
-        ``"from"`` and ``"to"`` name the upstream and downstream node of the segment. The
-        water volume comes either from a ``"volume"`` column [m³] or from ``"length"`` [m]
-        and ``"diameter"`` [m] (inner diameter), as ``pi/4 * diameter**2 * length``. Any
-        further columns are carried through unchanged.
+    segments : mapping or pandas.DataFrame
+        The pipe segments, keyed by a unique segment name, each carrying its own properties:
+        ``"from"`` and ``"to"`` name the upstream and downstream node, and the water volume
+        comes either from a ``"volume"`` entry [m³] or from ``"length"`` [m] and
+        ``"diameter"`` [m] (inner diameter), as ``pi/4 * diameter**2 * length``. Any further
+        entries are carried through unchanged, and a property one segment omits is filled
+        from its default where the reading code has one.
+
+        A ``DataFrame`` in the form :attr:`segments` exposes -- one row per segment, indexed
+        by name -- is accepted too, so a table read from file and a network being upgraded
+        both pass straight in. Nothing else is: the raw ``pd.DataFrame(...)`` constructor
+        reads a mapping column-wise and would transpose the segments silently.
     source : str
         Name of the production node. Must be a node of the graph and must have no
         incoming segment.
@@ -56,7 +63,9 @@ class PipeNetwork:
     Attributes
     ----------
     segments : pandas.DataFrame
-        Copy of the input table with a guaranteed ``"volume"`` column, in input row order.
+        The validated table the input became: one row per segment in input order, with a
+        guaranteed ``"volume"`` column and any defaults filled in. It is a derived artifact
+        rather than the input form, and the constructors take it back as is.
     source : str
         Name of the production node.
     nodes : tuple of str
@@ -70,6 +79,8 @@ class PipeNetwork:
 
     Raises
     ------
+    TypeError
+        If ``segments`` is neither a mapping nor a DataFrame.
     ValueError
         If the segment table is empty or malformed, if the geometry is not positive, if
         ``source`` is not a node or has an incoming segment, or if the graph is not a tree
@@ -83,17 +94,12 @@ class PipeNetwork:
 
     Examples
     --------
-    >>> import pandas as pd
     >>> from pipetransport.network import PipeNetwork
-    >>> segments = pd.DataFrame(
-    ...     {
-    ...         "from": ["Plant", "A", "A"],
-    ...         "to": ["A", "T1", "T2"],
-    ...         "length": [2000.0, 800.0, 400.0],
-    ...         "diameter": [0.40, 0.15, 0.20],
-    ...     },
-    ...     index=["Plant-A", "A-T1", "A-T2"],
-    ... )
+    >>> segments = {
+    ...     "Plant-A": {"from": "Plant", "to": "A", "length": 2000.0, "diameter": 0.40},
+    ...     "A-T1": {"from": "A", "to": "T1", "length": 800.0, "diameter": 0.15},
+    ...     "A-T2": {"from": "A", "to": "T2", "length": 400.0, "diameter": 0.20},
+    ... }
     >>> network = PipeNetwork(segments=segments, source="Plant")
     >>> network.endmembers
     ('T1', 'T2')
@@ -103,8 +109,19 @@ class PipeNetwork:
     251.3
     """
 
-    def __init__(self, *, segments: pd.DataFrame, source: str) -> None:
-        segments = pd.DataFrame(segments).copy()
+    def __init__(self, *, segments: Mapping[str, Mapping] | pd.DataFrame, source: str) -> None:
+        # Two forms, dispatched explicitly. Never ``pd.DataFrame(segments)``: its dict handling
+        # is column-oriented, so a mapping of row-dicts would come back transposed in silence.
+        if isinstance(segments, Mapping):
+            segments = pd.DataFrame.from_dict(dict(segments), orient="index")
+        elif isinstance(segments, pd.DataFrame):
+            segments = segments.copy()
+        else:
+            msg = (
+                "segments must be a mapping of segment name to its properties, or the DataFrame "
+                "form network.segments exposes (one row per segment, indexed by name)"
+            )
+            raise TypeError(msg)
         if segments.empty:
             msg = "segments must hold at least one pipe segment"
             raise ValueError(msg)
@@ -207,16 +224,18 @@ class PipeNetwork:
             f"endmembers={len(self.endmembers)}, volume={self.segments['volume'].sum():.1f} m3)"
         )
 
-    def flow_array(self, flow: npt.ArrayLike | pd.DataFrame | dict) -> npt.NDArray[np.floating]:
+    def flow_array(self, flow: Mapping[str, npt.ArrayLike] | npt.NDArray[np.floating]) -> npt.NDArray[np.floating]:
         """Coerce endmember demand into a ``(n_endmembers, n_bins)`` array in :attr:`endmembers` order.
 
         Parameters
         ----------
-        flow : DataFrame, mapping, or array-like
-            Demand at every endmember [m³/day], constant over each time bin. A DataFrame or
-            mapping is keyed by endmember name (row axis is time for a DataFrame); an
-            array-like must already have shape ``(n_endmembers, n_bins)`` ordered as
-            :attr:`endmembers`.
+        flow : mapping
+            Demand at every endmember [m³/day], keyed by endmember name: one bin-constant
+            array of length ``n_bins`` per endmember. The keys must be exactly
+            :attr:`endmembers` -- a missing one leaves the network underdetermined and an
+            unknown one is a typo, so both raise. (An already-coerced
+            ``(n_endmembers, n_bins)`` array passes through unchanged, which is the
+            idempotence internal callers rely on; the mapping is the input form.)
 
         Returns
         -------
@@ -226,47 +245,48 @@ class PipeNetwork:
         Raises
         ------
         ValueError
-            If named input misses an endmember, or if array input has the wrong shape or
-            holds NaN or negative values.
+            If the mapping misses an endmember or holds a key that is not one, if an
+            already-coerced array has the wrong shape, or if any demand is NaN or negative.
 
         Examples
         --------
-        >>> import pandas as pd
         >>> from pipetransport.examples import example_network
         >>> network = example_network()
-        >>> demand = pd.DataFrame({
+        >>> demand = {
         ...     "T1": [240.0, 250.0],
         ...     "T2": [360.0, 350.0],
         ...     "T3": [120.0, 130.0],
         ...     "T4": [80.0, 70.0],
-        ... })
+        ... }
         >>> network.flow_array(demand).shape
         (4, 2)
         """
-        named: dict | None = None
-        if isinstance(flow, pd.DataFrame):
-            named = {str(column): flow[column].to_numpy(dtype=float) for column in flow.columns}
-        elif isinstance(flow, dict):
+        if isinstance(flow, Mapping):
             named = {str(key): value for key, value in flow.items()}
-        if named is not None:
             missing = [e for e in self.endmembers if e not in named]
             if missing:
                 msg = f"flow is missing endmember(s): {missing}"
                 raise ValueError(msg)
+            unknown = sorted(set(named) - set(self.endmembers))
+            if unknown:
+                msg = f"flow holds key(s) that are not endmembers: {unknown}; endmembers are {list(self.endmembers)}"
+                raise ValueError(msg)
             array = np.stack([np.asarray(named[e], dtype=float) for e in self.endmembers])
         else:
+            # The pass-through for an array this method already coerced; not a public input form.
             array = np.asarray(flow, dtype=float)
             if array.ndim != 2 or array.shape[0] != len(self.endmembers):  # noqa: PLR2004
                 msg = (
-                    f"flow must have shape (n_endmembers, n_bins) = ({len(self.endmembers)}, n_bins) "
-                    f"ordered as network.endmembers, got shape {array.shape}"
+                    f"flow must be a mapping keyed by endmember, or the "
+                    f"({len(self.endmembers)}, n_bins) array a previous flow_array call produced; "
+                    f"got shape {array.shape}"
                 )
                 raise ValueError(msg)
         _validate_no_nan(array, name="flow")
         _validate_non_negative(array, name="flow", message="flow must be non-negative (reverse flow not supported)")
         return array
 
-    def segment_flow(self, *, flow: npt.ArrayLike | pd.DataFrame | dict) -> npt.NDArray[np.floating]:
+    def segment_flow(self, *, flow: Mapping[str, npt.ArrayLike] | npt.NDArray[np.floating]) -> npt.NDArray[np.floating]:
         """Throughflow of every segment, from mass conservation on the endmember demand.
 
         The pipes store no water beyond their fixed volume, so a segment carries the summed
@@ -275,8 +295,9 @@ class PipeNetwork:
 
         Parameters
         ----------
-        flow : DataFrame, mapping, or array-like
-            Demand at every endmember [m³/day]; see :meth:`flow_array`.
+        flow : mapping
+            Demand at every endmember [m³/day], keyed by endmember name; see
+            :meth:`flow_array`.
 
         Returns
         -------
@@ -290,17 +311,19 @@ class PipeNetwork:
 
         Examples
         --------
-        >>> import numpy as np
         >>> from pipetransport.examples import example_network
         >>> network = example_network()
-        >>> demand = np.array([[240.0], [360.0], [120.0], [80.0]])  # T1, T2, T3, T4
+        >>> demand = {"T1": [240.0], "T2": [360.0], "T3": [120.0], "T4": [80.0]}
         >>> network.segment_flow(flow=demand).ravel()
         array([800., 600., 200., 240., 360., 120.,  80.])
         """
         return self._below_segment @ self.flow_array(flow)
 
     def node_flow(
-        self, *, flow: npt.ArrayLike | pd.DataFrame | dict, nodes: list[str] | tuple[str, ...] | None = None
+        self,
+        *,
+        flow: Mapping[str, npt.ArrayLike] | npt.NDArray[np.floating],
+        nodes: list[str] | tuple[str, ...] | None = None,
     ) -> npt.NDArray[np.floating]:
         """Throughflow past one or more nodes, from mass conservation on the endmember demand.
 
@@ -311,8 +334,9 @@ class PipeNetwork:
 
         Parameters
         ----------
-        flow : DataFrame, mapping, or array-like
-            Demand at every endmember [m³/day]; see :meth:`flow_array`.
+        flow : mapping
+            Demand at every endmember [m³/day], keyed by endmember name; see
+            :meth:`flow_array`.
         nodes : list of str or None, optional
             Nodes to report, in the requested order. Defaults to :attr:`nodes`.
 
@@ -332,10 +356,9 @@ class PipeNetwork:
 
         Examples
         --------
-        >>> import numpy as np
         >>> from pipetransport.examples import example_network
         >>> network = example_network()
-        >>> demand = np.array([[240.0], [360.0], [120.0], [80.0]])  # T1, T2, T3, T4
+        >>> demand = {"T1": [240.0], "T2": [360.0], "T3": [120.0], "T4": [80.0]}
         >>> network.node_flow(flow=demand, nodes=["Plant", "B", "T4"]).ravel()
         array([800., 600.,  80.])
         """

@@ -320,6 +320,8 @@ limit of the decaying one, not a separate code path.
 **How it is checked.** Partly. Negative rates are rejected, and a ``Series`` of rates must cover
 every segment. The kinetic form itself is your modelling choice.
 
+.. _assumption-soil-columns:
+
 Heat exchange with the soil
 ---------------------------
 
@@ -329,7 +331,7 @@ an affine map, so tree topology, plug flow and known demand are all still requir
 
 **Assumption.** The soil around a segment behaves as a set of independent radial columns around a
 *constant-flux cylinder* at the pipe wall, with a mirror-image line sink above the ground surface;
-the soil is homogeneous and time-constant per land-cover class; the pipe wall is a memoryless series
+the soil is homogeneous and time-constant per segment; the pipe wall is a memoryless series
 resistance; and the water is well mixed across the pipe section.
 
 **Why it matters.** Independence of the columns is what makes the wall temperature a local quantity
@@ -379,16 +381,23 @@ pipe that has in reality been running for years is modelled as one switched on a
 meeting soil that accepts heat almost without resistance. On a 100 mm service line with a sustained
 12 K difference the delivered temperature is several kelvin too close to the soil at the start of the
 record; a week of lead-in brings that under 1 K, a month under 0.4 K and a season under 0.1 K.
-Supply lead-in you intend to discard, and discard it.
+Supply lead-in and leave ``cout_tedges`` on the period you care about; the output grid is free, so
+nothing needs discarding.
 
-**What you can do.** Start the record well before the period you care about, and give
-``surface_tedges`` a year or more of history so the soil field at depth is not leaning on ``t_pre``.
-Use bin widths that resolve the forcing you care about --- the halo memory reads the flux history
-only through bin averages. Keep parallel mains out, or merge them into one equivalent segment.
+**What you can do.** Start ``tedges`` about three weeks --- :math:`d_\text{eff}^2/\alpha` --- before
+the period you care about, with realistic history: the measured surface record, a typical demand
+pattern, and a production temperature near the record's opening value. That one lead-in serves both
+slow memories: it lets the network build the halo the model otherwise starts without (the measured
+decay above), and it delivers about half of any recent surface swing to a metre's depth --- the
+seasonal baseline older than the lead-in enters as the first value of each surface series, so open
+the lead-in where the record is representative rather than at an extreme. Use bin widths that resolve
+the forcing you care about --- the halo memory reads the flux history only through bin averages. Keep
+parallel mains out, or merge them into one equivalent segment.
 
-**How it is checked.** Partly. Geometry and soil parameters must be positive and the burial depth
-must exceed the pipe radius; every segment's cover class must appear in the ``soil`` table and in the
-surface record; ``tedges`` must be uniformly spaced, since the halo memory is a convolution. The
+**How it is checked.** Partly, and mostly when the :class:`~pipetransport.heat.HeatNetwork` is
+built rather than when it is solved: geometry and soil parameters must be positive, the burial depth
+must clear the outer pipe radius, and any ``volume`` column must agree with the length and diameter.
+At solve time every segment's cover class must appear in the surface record; ``tedges`` must be uniformly spaced, since the halo memory is a convolution. The
 adequacy of the lead-in, the bin width and the trench spacing is your modelling choice.
 
 .. _assumption-uniform-wall-flux:

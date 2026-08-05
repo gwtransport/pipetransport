@@ -107,6 +107,7 @@ See the ./LICENSE file or go to https://github.com/gwtransport/pipetransport/blo
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
@@ -115,7 +116,12 @@ import pandas as pd
 from scipy.signal import lfilter
 from scipy.special import gammainc, gammaln
 
-from pipetransport._validation import _validate_non_negative, _validate_retardation_factor, _validate_tedges
+from pipetransport._validation import (
+    _per_segment,
+    _validate_non_negative,
+    _validate_retardation_factor,
+    _validate_tedges,
+)
 from pipetransport.utils import cumulative_flow_volume, tedges_to_days
 
 if TYPE_CHECKING:
@@ -1992,12 +1998,12 @@ def apply_segment_targets(
 def network_transfer(
     *,
     network: PipeNetwork,
-    flow: npt.ArrayLike | pd.DataFrame | dict,
+    flow: Mapping[str, npt.ArrayLike] | npt.NDArray[np.floating],
     tedges: pd.DatetimeIndex,
     cout_tedges: pd.DatetimeIndex,
-    nodes: list[str] | tuple[str, ...] | None,
-    decay_rate: float | pd.Series,
-    retardation_factor: float,
+    report_nodes: list[str] | tuple[str, ...] | None,
+    decay_rate: float | Mapping[str, float],
+    retardation_factor: float | Mapping[str, float],
     spinup: str | None,
 ) -> tuple[tuple[str, ...], NetworkTransfer, int]:
     """Resolve the shared inputs of every public entry point and build the node operators.
@@ -2016,13 +2022,13 @@ def network_transfer(
         Input bin edges, length ``n_cin + 1``.
     cout_tedges : DatetimeIndex
         Output bin edges, length ``n_cout + 1``. May differ in alignment and resolution.
-    nodes : list of str or None
+    report_nodes : list of str or None
         Nodes to report at. ``None`` selects :attr:`~pipetransport.network.PipeNetwork.endmembers`.
-    decay_rate : float or Series
-        First-order decay rate [1/day], one value for every segment or a Series indexed by
-        segment name.
-    retardation_factor : float
-        Multiplier on every segment volume; ``1.0`` is a conservative tracer.
+    decay_rate : float or mapping
+        First-order decay rate [1/day], shared by every segment or keyed by segment name.
+    retardation_factor : float or mapping
+        Multiplier on the segment volumes, shared or per segment; ``1.0`` is a conservative
+        tracer.
     spinup : {"constant"} or None
         Warm-start policy, see :func:`resolve_spinup`.
 
@@ -2047,28 +2053,17 @@ def network_transfer(
     demand = network.flow_array(flow)
     _validate_tedges(tedges, demand, tedges_name="tedges", values_name="flow")
     _validate_tedges(cout_tedges, np.empty(len(cout_tedges) - 1), tedges_name="cout_tedges", values_name="cout")
-    _validate_retardation_factor(retardation_factor)
-
-    if isinstance(decay_rate, pd.Series):
-        missing = [name for name in network.segments.index if name not in decay_rate.index]
-        if missing:
-            msg = f"decay_rate is missing segment(s): {missing}"
-            raise ValueError(msg)
-        decay = decay_rate.reindex(network.segments.index).to_numpy(dtype=float)
-    else:
-        decay = np.asarray(decay_rate, dtype=float)
-        if decay.ndim > 1 or (decay.ndim == 1 and decay.size != len(network.segments)):
-            msg = f"decay_rate must be a scalar or hold one value per segment ({len(network.segments)})"
-            raise ValueError(msg)
-        decay = np.broadcast_to(decay, (len(network.segments),))
+    retardation = _per_segment(retardation_factor, network.segments.index, name="retardation_factor")
+    _validate_retardation_factor(retardation)
+    decay = _per_segment(decay_rate, network.segments.index, name="decay_rate")
     _validate_non_negative(decay, name="decay_rate")
 
-    requested = tuple(network.endmembers) if nodes is None else tuple(nodes)
+    requested = tuple(network.endmembers) if report_nodes is None else tuple(report_nodes)
     unknown = [node for node in requested if node not in network.paths]
     if unknown:
         msg = f"unknown node(s): {unknown}; network nodes are {list(network.nodes)}"
         raise ValueError(msg)
-    volume = retardation_factor * network.segments["volume"].to_numpy(dtype=float)
+    volume = retardation * network.segments["volume"].to_numpy(dtype=float)
     # Padded per-node path matrix: row n holds the segment rows of node n's path, source
     # outward; `active` marks the real slots.
     paths_idx, active = pad_paths([network.segments.index.get_indexer(list(network.paths[node])) for node in requested])

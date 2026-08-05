@@ -31,31 +31,23 @@ sys.path.insert(0, str(Path(__file__).parent))
 @pytest.fixture
 def single_pipe():
     """One 100 m³ pipe from Plant to T1: travel time is exactly volume / demand."""
-    segments = pd.DataFrame(
-        {"from": ["Plant"], "to": ["T1"], "volume": [100.0]},
-        index=["Plant-T1"],
-    )
-    return PipeNetwork(segments=segments, source="Plant")
+    return PipeNetwork(segments={"Plant-T1": {"from": "Plant", "to": "T1", "volume": 100.0}}, source="Plant")
 
 
 @pytest.fixture
 def single_pipe_35():
     """Return a 35.34 m³ service line: at 600 m³/day the transit is well under two bins."""
-    segments = pd.DataFrame({"from": ["Plant"], "to": ["T1"], "volume": [35.34]}, index=["Plant-T1"])
-    return PipeNetwork(segments=segments, source="Plant")
+    return PipeNetwork(segments={"Plant-T1": {"from": "Plant", "to": "T1", "volume": 35.34}}, source="Plant")
 
 
 @pytest.fixture
 def two_branch():
     """Plant -> A, then A -> T1 and A -> T2: the smallest network with a flow split."""
-    segments = pd.DataFrame(
-        {
-            "from": ["Plant", "A", "A"],
-            "to": ["A", "T1", "T2"],
-            "volume": [300.0, 40.0, 60.0],
-        },
-        index=["Plant-A", "A-T1", "A-T2"],
-    )
+    segments = {
+        "Plant-A": {"from": "Plant", "to": "A", "volume": 300.0},
+        "A-T1": {"from": "A", "to": "T1", "volume": 40.0},
+        "A-T2": {"from": "A", "to": "T2", "volume": 60.0},
+    }
     return PipeNetwork(segments=segments, source="Plant")
 
 
@@ -89,21 +81,24 @@ def short_tedges():
 
 @pytest.fixture
 def constant_demand():
-    """Build a factory for a constant per-endmember demand array of shape (n_endmembers, n_bins).
+    """Build a factory for a constant demand mapping keyed by endmember.
 
     Returns
     -------
     callable
-        ``make(network, tedges, means=None)`` -> ndarray. ``means`` defaults to
-        ``100 * (1 + i)`` m³/day for endmember ``i``, so the endmembers carry visibly
-        different shares of the production.
+        ``make(network, tedges, means=None)`` -> dict of endmember to ndarray. ``means``
+        defaults to ``100 * (1 + i)`` m³/day for endmember ``i``, so the endmembers carry
+        visibly different shares of the production.
     """
 
     def _make(network, tedges, means=None):
         n_bins = len(tedges) - 1
         if means is None:
             means = [100.0 * (1 + i) for i in range(len(network.endmembers))]
-        return np.asarray(means, dtype=float)[:, None] * np.ones(n_bins)
+        return {
+            name: np.full(n_bins, float(mean))
+            for name, mean in zip(network.endmembers, np.asarray(means, dtype=float), strict=True)
+        }
 
     return _make
 
@@ -115,7 +110,7 @@ def diurnal_demand():
     Returns
     -------
     callable
-        ``make(network, tedges)`` -> DataFrame with one column per endmember.
+        ``make(network, tedges)`` -> dict with one array per endmember.
     """
 
     def _make(network, tedges):
@@ -137,12 +132,12 @@ def analytic_travel_time():
     -------
     callable
         ``make(network, demand, node)`` -> float travel time in days, where ``demand`` is a
-        constant ``(n_endmembers, n_bins)`` array.
+        constant demand mapping keyed by endmember.
     """
 
     def _make(network, demand, node):
         segment_flow = network.segment_flow(flow=demand)[:, 0]
-        production = float(np.sum(demand[:, 0]))
+        production = float(sum(np.asarray(series, dtype=float)[0] for series in demand.values()))
         row_of = {name: i for i, name in enumerate(network.segments.index)}
         rows = [row_of[name] for name in network.paths[node]]
         volume = network.segments["volume"].to_numpy(dtype=float)
