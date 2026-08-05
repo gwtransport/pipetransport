@@ -914,9 +914,12 @@ _HALO_MESH_HALVED = (48, 128)
 # Lag schedules ``(dt, n_bins, sub-steps per bin)``. ``hourly`` resolves the first hours,
 # where the cylinder carries the response and the surface is not yet felt; ``daily`` spans the
 # image arrival time ``(2 d_eff)**2/(4 alpha)`` -- 22.5 d at a metre, 5 d for the shallow case
-# -- where the conceptual gap peaks; ``twenty_day`` runs to saturation. The first bin of each
+# -- where the conceptual gap peaks; ``twenty_day`` runs to saturation. The opening bin of every
 # schedule averages over the ``sqrt(t)`` corner of the wall response, so it is read separately
-# from the rest (and, on the coarsest schedule, one bin later).
+# from the rest. ``daily`` drops a second bin: at one-day bins the thin pipe is still settling
+# out of that corner, and halving the step moves bin 1 by 0.5 ``g`` against 0.16 ``g`` for bin 2.
+# Neither bin is load-bearing for the assertions -- they pass from bin 1 -- but the numbers the
+# docstring quotes should come from lags the reference has actually converged on.
 _HALO_SCHEDULES = {"hourly": (1.0 / 24.0, 48, 24), "daily": (1.0, 60, 12), "twenty_day": (20.0, 60, 12)}
 _HALO_SETTLED = {"hourly": 1, "daily": 2, "twenty_day": 1}
 
@@ -954,15 +957,20 @@ def test_halo_kernel_matches_the_two_dimensional_reference(geometry, schedule, c
       Laplace inversion that already checks it. The shallow geometry is the exception and
       belongs to the next regime already: its image arrives in 5 days, so the gap is open to
       0.65 ``g`` before the second day is out.
-    - **While the image arrives** the gap goes *negative* and overshoots: the line image
-      switches on faster than the true surface does, so the model credits the wall with more
-      arrived resistance than it has, by 2.7 ``g`` on the service line, 1.7 ``g`` on the main
-      and 1.2 ``g`` shallow. The issue expected the transient difference to sit below the
-      steady bound. It does not -- though it keeps the same ``(r_o/2 d_eff)**2`` order, which
-      is what leaves the conclusion (the image is affordable) standing.
-    - **Approaching saturation** the gap returns to ``+g`` from below, and slowly, as
-      ``ln(t)/t``: after 1200 days the service line and the main have reached 0.73 and 0.77
-      ``g``, the shallow geometry -- whose image time is 16 times shorter -- 0.95 ``g``.
+    - **While the image arrives** the gap goes *negative* and overshoots: the true surface
+      starts cooling the wall *before* the line image does -- the image is read from the axis
+      at ``2 d_eff``, while the near side of the wall sees its own at ``2(d_eff - r_o)``, and
+      averaging the convex ``E1`` around the wall is dominated by that near side -- so the
+      model credits the wall with more arrived resistance than it has, by 2.7 ``g`` on the
+      service line, 1.7 ``g`` on the main and 1.2 ``g`` shallow. (Those are the geometries
+      measured, ``d_eff/r_o`` of 21 down to 2.5; the ratio keeps growing with ``d_eff/r_o``,
+      roughly as ``ln(2 d_eff/r_o)``, even as the absolute error shrinks.) The issue expected
+      the transient difference to sit below the steady bound. It does not -- though it keeps
+      the same ``(r_o/2 d_eff)**2`` order, which is what leaves the conclusion (the image is
+      affordable) standing.
+    - **Approaching saturation** the gap returns to ``+g`` from below, and slowly, as ``1/t``:
+      after 1200 days the service line and the main have reached 0.73 and 0.77 ``g``, the
+      shallow geometry -- whose image time is 16 times shorter -- 0.95 ``g``.
 
     The reference resolves all of it: halving the mesh in both directions moves these curves by
     at most 0.07 ``g``, so the mesh actually used sits a further four times nearer -- two orders

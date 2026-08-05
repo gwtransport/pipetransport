@@ -362,10 +362,13 @@ coefficient being 1.00, 0.995 and 0.98 at :math:`d_\text{eff}/r_o` of 21, 5.3 an
 sign is worth reading: to leading order :math:`\ln(2 d_\text{eff}/r_o)` sits midway between the two
 wall conditions, exceeding the isothermal :math:`\operatorname{acosh}(d_\text{eff}/r_o)` by what it
 falls short of the uniform-flux answer by --- only to leading order, since the quartic terms differ.
-Transiently the gap is *larger* rather than smaller: while the image
-is arriving the model credits the wall with more resistance than has reached it, by up to 2.7 times the
-steady gap, returning to that gap only as :math:`\ln t / t`. All of it grows as the burial approaches
-:math:`r_o`.
+Transiently the gap is *larger* rather than smaller. The true surface starts cooling the wall before
+the line image does --- the image is read from the axis at :math:`2 d_\text{eff}`, while the near side
+of the wall sees its own at :math:`2(d_\text{eff} - r_o)` --- so while it arrives the model credits the
+wall with more resistance than has reached it, by 2.7 times the steady gap over the geometries measured
+(:math:`d_\text{eff}/r_o` of 2.5 to 21; the ratio itself keeps growing roughly as
+:math:`\ln(2 d_\text{eff}/r_o)`, though the absolute error shrinks). It returns to the steady gap only
+as :math:`1/t`. All of it grows as the burial approaches :math:`r_o`.
 
 The surface film is folded into the same picture by displacing the surface downward by the radiation
 length :math:`\kappa/\eta` and treating it as perfect --- the effective depth
@@ -374,8 +377,9 @@ them, and summing that distribution in closed form gives
 :math:`2\pi\kappa R = \ln(2 d/r_o) + 2 e^{x} E_1(x)` with :math:`x = 2 d \eta/\kappa`. Measured against
 it --- and independently against the two-dimensional solve, which agrees with the closed form to its
 own discretisation floor --- the displacement captures 99.95 % of what the film does, and always
-errs low: :math:`2.0\times10^{-4}` of :math:`R_\text{soil}` at :math:`h_s = 20` W/(m² K), an order
-below the cylinder-image gap it is combined with. It grows as the film weakens.
+errs low: :math:`2.0\times10^{-4}` day/m² at :math:`h_s = 20` W/(m² K), which is
+:math:`8.5\times10^{-6}` of :math:`R_\text{soil}` and so more than an order below the cylinder-image
+gap it is combined with. It grows as the film weakens.
 
 **What breaks if it is violated.** Two mains sharing a trench warm each other's soil, which this
 model does not represent --- each segment sees only its own halo, so the delivered temperature of
