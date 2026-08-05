@@ -22,7 +22,9 @@ from _oracle import OraclePath
 from scipy.fft import rfft
 from scipy.integrate import quad
 from scipy.linalg import solve_banded
-from scipy.special import erfc, erfcx, exp1, j1, kve, y1
+from scipy.sparse import csc_matrix, diags, identity
+from scipy.sparse.linalg import splu, spsolve
+from scipy.special import erfc, erfcx, exp1, hyperu, j1, kve, y1
 
 from pipetransport import heat, transport
 from pipetransport._transfer import apply_banded, apply_segment_targets, paths_transfer
@@ -546,6 +548,552 @@ def test_deficit_kernel_is_finite_at_zero_lag(recwarn):
 
 
 # ============================================================================
+# The halo kernel against the true two-dimensional boundary-value problem
+# ============================================================================
+#
+# Everything above shares the kernel's *conceptual* model -- a constant-flux cylinder at the
+# wall minus a line image at ``2 d_eff`` -- so agreement there validates the implementation,
+# not the model. The references below share none of it (issue #43). The soil is solved as
+# what it physically is: a two-dimensional half plane outside a circle, with the surface as a
+# boundary condition rather than an image, and the steady resistance an *output* rather than
+# the ``ln(2 d_eff/r_o)`` the kernel saturates at by construction.
+#
+# The mesh is bipolar. For a circle of radius ``r_o`` centred at depth ``d``, with
+# ``v0 = arccosh(d/r_o)`` and ``a = sqrt(d**2 - r_o**2)``, the rectangle
+# ``u in (-pi, pi], v in (0, v0)`` covers the entire soil domain exactly once: ``v = 0`` is
+# the surface plane, ``v = v0`` the pipe wall, and ``(u, v) -> (0, 0)`` is the point at
+# infinity -- so there is no far-field truncation anywhere, and both boundaries are
+# coordinate lines rather than staircases. The map is conformal, with scale factor
+# ``h = a/(cosh v - cos u)``, so ``laplacian = h**-2 (T_uu + T_vv)``: the steady problem is
+# plain Laplace in the rectangle and the transient one carries ``h**-2`` as a coefficient.
+# The geometry is the only thing ``arccosh`` is used for here; nothing about it is asserted.
+
+
+def _bipolar_halo_system(nu, nv, *, r_o, d, alpha, kappa, eta=np.inf):
+    """Assemble the bipolar-rectangle heat system for a unit wall flux, boundaries folded in.
+
+    The unknowns are the ``nu x nv`` nodes at ``u_i = (i + 1/2) du`` (cell-centred, which
+    keeps the point at infinity ``u = 0`` off the grid) and ``v_j = j dv``, ``j = 1..nv``,
+    flattened as ``i * nv + (j - 1)``. Only ``u in [0, pi]`` is solved: every field here is
+    even in ``u``, so the far half is a reflection.
+
+    The pipe injects ``q' = 1`` per unit length spread uniformly over the wall, which is the
+    conceptual model's own wall condition -- what is *not* assumed is how the soil carries it
+    away. Both boundary conditions are second-order and eliminated into the matrix:
+
+    - wall (``v = v0``): ``kappa h**-1 T_v = q''`` via the ghost node ``T[nv+1] = T[nv-1] +
+      2 dv phi``, contributing ``2 phi/dv`` to the affine term;
+    - surface (``v = 0``): Dirichlet ``T = 0``, or Robin ``kappa h**-1 T_v = eta T``, folded
+      in as ``T0 = (4 T1 - T2)/(3 + gamma)`` from the one-sided derivative.
+
+    The stencil is assembled node by node. Duplicate ``(row, col)`` entries are summed by
+    :class:`~scipy.sparse.csc_matrix`, which is what makes the ``u``-reflection fall out of
+    clipping the neighbour index: at ``i = 0`` the left neighbour *is* the node itself, so its
+    weight lands on the diagonal.
+
+    Returns
+    -------
+    tuple
+        ``(laplacian, coefficient, affine, wall_weight, area)``: the rectangle Laplacian, the
+        transient coefficient ``alpha h**-2``, the affine term (so ``T_t = c (L T + b)`` and
+        the steady problem is ``L T = -b``), the wall arc-length weights, and the cell areas
+        ``h**2 du dv`` doubled for the reflected half.
+    """
+    v0, a = np.arccosh(d / r_o), np.sqrt(d * d - r_o * r_o)
+    du, dv = np.pi / nu, v0 / nv
+    u = (np.arange(nu) + 0.5) * du
+    grid_u, grid_v = np.meshgrid(u, np.arange(1, nv + 1) * dv, indexing="ij")
+    scale = a / (np.cosh(grid_v) - np.cos(grid_u))
+    node = np.arange(nu * nv).reshape(nu, nv)
+    column = np.broadcast_to(np.arange(1, nv + 1), (nu, nv))
+
+    # The five-point stencil, then the two boundaries on top of it. The ``u`` neighbours are
+    # clipped rather than wrapped, which is the mirror: at ``i = 0`` the left neighbour is the
+    # node itself, and ``csc_matrix`` summing duplicate entries lands its weight on the diagonal.
+    rows = [node, node, node]
+    cols = [node, node[np.clip(np.arange(nu) - 1, 0, nu - 1)], node[np.clip(np.arange(nu) + 1, 0, nu - 1)]]
+    vals = [
+        np.full(node.shape, -2.0 / du**2 - 2.0 / dv**2),
+        np.full(node.shape, 1.0 / du**2),
+        np.full(node.shape, 1.0 / du**2),
+    ]
+    affine = np.zeros((nu, nv))
+
+    outward = column < nv
+    rows.append(node[outward]), cols.append(node[outward] + 1), vals.append(np.full(outward.sum(), 1.0 / dv**2))
+    inward = outward & (column > 1)
+    rows.append(node[inward]), cols.append(node[inward] - 1), vals.append(np.full(inward.sum(), 1.0 / dv**2))
+    # Wall ghost ``T[nv+1] = T[nv-1] + 2 dv phi``: the outward neighbour folds back onto the
+    # inward one and the flux becomes an affine term.
+    rows.append(node[:, -1]), cols.append(node[:, -1] - 1), vals.append(np.full(nu, 2.0 / dv**2))
+    affine[:, -1] = a / (np.pi * r_o * kappa * dv * (np.cosh(v0) - np.cos(u)))
+    if np.isfinite(eta):
+        # ``T0 = (4 T1 - T2)/(3 + gamma)`` from the one-sided surface derivative; a Dirichlet
+        # surface is ``T0 = 0`` and contributes nothing at all, so it needs no branch of its own.
+        weight = 1.0 / ((3.0 + 2.0 * dv * (eta / kappa) * a / (1.0 - np.cos(u))) * dv**2)
+        rows.append(node[:, 0]), cols.append(node[:, 0]), vals.append(4.0 * weight)
+        rows.append(node[:, 0]), cols.append(node[:, 0] + 1), vals.append(-weight)
+
+    flat = [np.concatenate([part.reshape(-1) for part in stack]) for stack in (vals, rows, cols)]
+    laplacian = csc_matrix((flat[0], (flat[1], flat[2])), shape=(nu * nv, nu * nv))
+    wall_weight = a / (np.cosh(v0) - np.cos(u))
+    # Cell areas ``h**2 du dv``, doubled for the reflected half. Midpoint in ``u`` (the grid is
+    # cell-centred) but trapezoidal in ``v``, where the nodes sit *on* the boundaries: the wall
+    # row is a half cell, and the surface row would be too if it were carried. Right-endpoint
+    # weights instead leave a first-order bias that does not settle under refinement.
+    area = np.square(scale) * du * dv * 2.0
+    area[:, -1] *= 0.5
+    return laplacian, (alpha / np.square(scale)).reshape(-1), affine.reshape(-1), wall_weight, area.reshape(-1)
+
+
+def _bipolar_wall_mean(temperature, wall_weight, nv):
+    """Arc-length mean of the wall temperature, the observable the halo kernel predicts."""
+    return float(temperature[np.arange(wall_weight.size) * nv + (nv - 1)] @ wall_weight / wall_weight.sum())
+
+
+def _bipolar_halo_steady(nu, nv, *, r_o, d, kappa, eta=np.inf):
+    """Steady mean wall resistance [day/m²] per unit ``q'``, by a direct sparse solve.
+
+    Conformality removes the coefficient entirely -- the steady problem is Laplace's equation
+    in the rectangle -- so this shares not even the diffusivity with the transient solve.
+    """
+    laplacian, _, affine, wall_weight, _ = _bipolar_halo_system(nu, nv, r_o=r_o, d=d, alpha=1.0, kappa=kappa, eta=eta)
+    return _bipolar_wall_mean(np.asarray(spsolve(laplacian, -affine)), wall_weight, nv)
+
+
+def _bipolar_halo_isothermal(nu, nv, *, r_o, d, kappa):
+    """Steady resistance of an *isothermal* wall, where the exact answer is ``acosh(d/r_o)``.
+
+    With Dirichlet data at both ends of the rectangle the exact solution is linear in ``v``,
+    which the five-point stencil reproduces to round-off. That makes this the sharpest
+    available pin on the mesh, the wall bookkeeping and the flux integration -- all the
+    machinery the uniform-flux solves rely on -- before any question of accuracy arises.
+    """
+    v0 = np.arccosh(d / r_o)
+    dv = v0 / nv
+    laplacian, _, _, wall_weight, _ = _bipolar_halo_system(nu, nv, r_o=r_o, d=d, alpha=1.0, kappa=kappa)
+    # Wall held at 1, surface at 0: the wall rows drop their ghost elimination of the flux
+    # condition for the prescribed value, which is a diagonal mask on the assembled system.
+    held = np.zeros(wall_weight.size * nv)
+    held[np.arange(wall_weight.size) * nv + (nv - 1)] = 1.0
+    interior = (diags(1.0 - held) @ laplacian + diags(held)).tocsc()
+    temperature = np.asarray(spsolve(interior, held)).reshape(wall_weight.size, nv)
+    # Flux out of the wall by the second-order one-sided derivative; the metric cancels in
+    # ``kappa h**-1 T_v * h du``, so the total is a plain sum over the u grid, doubled.
+    gradient = (3.0 * temperature[:, -1] - 4.0 * temperature[:, -2] + temperature[:, -3]) / (2.0 * dv)
+    return 1.0 / (2.0 * kappa * gradient.sum() * (np.pi / wall_weight.size))
+
+
+def _bipolar_halo_transient(nu, nv, *, r_o, d, alpha, kappa, dt_bin, n_bins, sub, eta=np.inf):
+    """Bin-averaged mean wall temperature per unit ``q'``, and the soil's heat budget.
+
+    Crank-Nicolson on ``T_t = c (L T + b)``, started with four backward-Euler quarter-steps
+    (Rannacher): the wall response opens as ``sqrt(t)``, and undamped trapezoidal stepping
+    rings on that corner. The bin averages are trapezoidal over ``sub`` sub-steps per lag
+    bin, which is the same bin-average convention ``Dbar`` carries.
+
+    Returns
+    -------
+    tuple
+        ``(gbar, stored, injected)``: the bin-averaged wall resistance [day/m²] per lag bin,
+        and the heat in the soil against the heat put in. ``stored`` carries the
+        ``kappa/alpha`` ratio, which is the soil's volumetric heat capacity in the package's
+        water-referenced units.
+    """
+    laplacian, coefficient, affine, wall_weight, area = _bipolar_halo_system(
+        nu, nv, r_o=r_o, d=d, alpha=alpha, kappa=kappa, eta=eta
+    )
+    dt = dt_bin / sub
+    operator = (diags(coefficient) @ laplacian).tocsc()
+    eye = identity(operator.shape[0], format="csc")
+    crank = splu((eye - 0.5 * dt * operator).tocsc())
+    explicit = (eye + 0.5 * dt * operator).tocsc()
+    euler = splu((eye - 0.25 * dt * operator).tocsc())
+    source = coefficient * affine
+
+    temperature = np.zeros(operator.shape[0])
+    trace = [0.0]
+    for _ in range(4):
+        temperature = euler.solve(temperature + 0.25 * dt * source)
+    trace.append(_bipolar_wall_mean(temperature, wall_weight, nv))
+    for _ in range(1, n_bins * sub):
+        temperature = crank.solve(explicit @ temperature + dt * source)
+        trace.append(_bipolar_wall_mean(temperature, wall_weight, nv))
+
+    # Trapezoid within each lag bin, taken as differences of one cumulative trapezoid so the
+    # sub-step endpoints each bin shares with the next are summed once.
+    wall = np.asarray(trace)
+    cumulative = np.concatenate(([0.0], np.cumsum(0.5 * (wall[:-1] + wall[1:]))))
+    return np.diff(cumulative[::sub]) / sub, (kappa / alpha) * float(temperature @ area), n_bins * dt_bin
+
+
+def _steady_shape_factor_series(z, n=400):
+    """``2 pi kappa R`` of a uniform-flux buried cylinder, by separation of variables.
+
+    Separating in the bipolar rectangle with ``T(u, 0) = 0`` and ``T_v(u, v0) = phi(u)``, and
+    expanding ``1/(cosh w - cos u) = (1/sinh w)(1 + 2 sum e**(-n w) cos n u)``, the
+    arc-length mean wall temperature per unit ``q'`` closes in the series
+
+    ``2 pi kappa R = v0 + sum_{n>=1} (2/n) tanh(n v0) exp(-2 n v0)``,  ``v0 = arccosh(z)``.
+
+    Its large-``z`` expansion is ``ln(2z) + (1/(2z))**2 + O(z**-4)``: the package's law plus a
+    quadratic term with *unit* coefficient. For contrast an isothermal wall gives exactly
+    ``acosh(z) = ln(2z) - (1/(2z))**2 + ...``, so ``ln(2z)`` sits midway between the two wall
+    conditions at this order -- which is why the wall condition has to be stated before the
+    residual can be called small.
+    """
+    v0 = np.arccosh(z)
+    orders = np.arange(1, n + 1)
+    return v0 + np.sum(2.0 / orders * np.tanh(orders * v0) * np.exp(-2.0 * orders * v0))
+
+
+def _steady_shape_factor_by_collocation(z, m=12, n_wall=2000):
+    """``2 pi kappa R`` again, by multipole collocation in the *physical* plane.
+
+    No conformal map and no mesh: the field is expanded in harmonic functions built to vanish
+    on ``y = 0`` by mirror antisymmetry -- a source/image log pair plus interior multipoles
+    ``cos(k th)/rho**k`` and ``sin(k th)/rho**k`` with their images -- and the uniform wall
+    flux is imposed by least squares at ``n_wall`` collocation points. Working dimensionless
+    (``r_o = kappa = 1``, axis at depth ``z``) the total flux is ``2 pi``, so the mean wall
+    temperature *is* ``2 pi kappa R``.
+
+    This keeps image pairs, which is how a Dirichlet plane is represented exactly; what it
+    does not keep is the truncation under test, since the multipole ladder carries the
+    cylinder's near field to order ``m`` rather than collapsing it to a line.
+
+    Returns
+    -------
+    tuple
+        ``(shape_factor, wall_residual, surface_residual)``.
+    """
+
+    def basis(x, y):
+        r1, t1 = np.hypot(x, y + z), np.arctan2(y + z, x)
+        r2, t2 = np.hypot(x, y - z), np.arctan2(y - z, x)
+        columns = [np.log(r2) - np.log(r1)]
+        for k in range(1, m + 1):
+            columns.extend((
+                np.cos(k * t1) / r1**k - np.cos(k * t2) / r2**k,
+                np.sin(k * t1) / r1**k + np.sin(k * t2) / r2**k,
+            ))
+        return np.stack(columns, axis=-1)
+
+    angle = (np.arange(n_wall) + 0.5) * 2.0 * np.pi / n_wall
+    wall_x, wall_y = np.cos(angle), -z + np.sin(angle)
+    step = 1e-6
+    design = (
+        basis(wall_x * (1.0 + step), -z + (wall_y + z) * (1.0 + step))
+        - basis(wall_x * (1.0 - step), -z + (wall_y + z) * (1.0 - step))
+    ) / (2.0 * step)
+    # Heat leaves the pipe, so the wall gradient points inward: dT/drho = -1 in these units.
+    coefficients, *_ = np.linalg.lstsq(design, -np.ones(n_wall), rcond=None)
+    probe = np.linspace(-30.0 * z, 30.0 * z, 501)
+    return (
+        float((basis(wall_x, wall_y) @ coefficients).mean()),
+        float(np.abs(design @ coefficients + 1.0).max()),
+        float(np.abs(basis(probe, np.zeros_like(probe)) @ coefficients).max()),
+    )
+
+
+# Soil the geometries below sit in: the module's grass class, whose diffusivity and
+# conductivity the halo kernel reads separately.
+_HALO_ALPHA, _HALO_KAPPA = GRASS["alpha"], GRASS["kappa"]
+# (r_o, d_eff) of a 100 mm service line and a 400 mm main at a metre, and a shallow 400 mm
+# main where the bound predicts percent-level error. The shallow one goes through the kernel
+# directly: ``HeatNetwork``'s burial guard is about the public API, not about what the kernel
+# is allowed to be measured at.
+_HALO_GEOMETRIES = {"service_100mm": (0.05, 1.0605), "main_400mm": (0.2, 1.0605), "shallow_400mm": (0.2, 0.5)}
+
+
+def _halo_kernel_response(n_bins, dt_bin, r_o, d_eff):
+    """The package's cumulative wall response ``R_inf - Dbar`` [day/m²], per lag bin."""
+    dbar = heat._deficit_kernel(
+        n_bins,
+        dt_bin,
+        r_o=np.array([r_o]),
+        d_eff=np.array([d_eff]),
+        alpha=np.array([_HALO_ALPHA]),
+        kappa=np.array([_HALO_KAPPA]),
+    )[0]
+    return np.log(2.0 * d_eff / r_o) / (2.0 * np.pi * _HALO_KAPPA) - dbar
+
+
+def test_bipolar_reference_reproduces_the_textbook_isothermal_resistance():
+    """The 2-D reference recovers ``acosh(d/r_o)/(2 pi kappa)`` to round-off.
+
+    An isothermal wall over a Dirichlet plane has the exact steady solution linear in the
+    bipolar ``v``, so a five-point stencil is exact on it: any error here is the mesh, the
+    wall indexing or the flux integration rather than discretisation. Pinning that first is
+    what lets the uniform-flux numbers below be read as physics.
+    """
+    for name in ("service_100mm", "shallow_400mm"):
+        r_o, d = _HALO_GEOMETRIES[name]
+        resistance = _bipolar_halo_isothermal(96, 128, r_o=r_o, d=d, kappa=_HALO_KAPPA)
+        exact = np.arccosh(d / r_o) / (2.0 * np.pi * _HALO_KAPPA)
+        np.testing.assert_allclose(resistance, exact, rtol=1e-10, err_msg=name)
+
+
+@pytest.mark.parametrize("name", list(_HALO_GEOMETRIES))
+def test_steady_uniform_flux_resistance_agrees_across_three_frames(name):
+    """Three evaluations sharing no arithmetic agree on the true steady wall resistance.
+
+    A separated series in the bipolar rectangle, a finite-difference solve on that same
+    rectangle, and multipole collocation in the physical plane -- different unknowns,
+    different basis, different failure modes. The finite-difference solve converges onto an
+    answer it was never given: it is told the wall flux and the surface condition, and the
+    resistance is what comes out.
+
+    This is the arbiter the next test measures the package against, so it is established
+    first and on its own.
+    """
+    r_o, d_eff = _HALO_GEOMETRIES[name]
+    z = d_eff / r_o
+    series = _steady_shape_factor_series(z)
+    collocated, wall_residual, surface_residual = _steady_shape_factor_by_collocation(z)
+    assert wall_residual < 1e-7, "the collocation does not hold the uniform wall flux it claims"
+    # Exact by construction rather than by fitting -- every basis function is antisymmetric
+    # about ``y = 0`` -- so this guards the basis against a later edit, not the accuracy.
+    assert surface_residual < 1e-8, "the collocation basis is not antisymmetric about the surface"
+    np.testing.assert_allclose(collocated, series, rtol=1e-8)
+
+    exact = series / (2.0 * np.pi * _HALO_KAPPA)
+    coarse = _bipolar_halo_steady(96, 128, r_o=r_o, d=d_eff, kappa=_HALO_KAPPA)
+    fine = _bipolar_halo_steady(192, 256, r_o=r_o, d=d_eff, kappa=_HALO_KAPPA)
+    assert abs(fine - exact) < 0.35 * abs(coarse - exact), "the solve is not converging at its stated order"
+    assert abs(fine - exact) < 1e-5
+
+
+@pytest.mark.parametrize(
+    ("name", "tolerance"), [("service_100mm", 0.01), ("main_400mm", 0.02), ("shallow_400mm", 0.05)]
+)
+def test_steady_conceptual_gap_has_the_predicted_order_and_unit_coefficient(name, tolerance):
+    """The measurement issue #43 asks for: what the cylinder-plus-line model costs at steady state.
+
+    The package saturates at ``ln(2 d_eff/r_o)/(2 pi kappa)``. The true uniform-flux problem
+    lands *above* it by ``(r_o/(2 d_eff))**2/(2 pi kappa)`` -- the quadratic term of the
+    series' own expansion -- and the measured coefficient is 1.000, 0.995 and 0.979 for
+    ``d_eff/r_o`` of 21.2, 5.3 and 2.5, the residue being the ``O((r_o/2 d_eff)**4)`` next
+    order that grows as the burial closes on the radius.
+
+    So the bound the module quotes is not merely an order of magnitude, it is sharp: 1.5e-4 of
+    ``R_soil`` for a 100 mm service line at a metre, 3.7e-3 for a 400 mm main, and 2.4e-2
+    where the burial is two and a half radii. Asserting the *coefficient* rather than a loose
+    ceiling is what makes this a measurement -- a kernel that drifted to the isothermal wall
+    condition would land at -1, not 1, and still pass any bound stated as ``< 0.05``.
+
+    The symmetry between the two wall conditions is a leading-order statement only: the
+    quartic terms are ``-1/32`` here against ``-3/32`` for ``acosh``, which is part of why the
+    shallow coefficient has drifted to 0.979.
+    """
+    r_o, d_eff = _HALO_GEOMETRIES[name]
+    z = d_eff / r_o
+    gap = _steady_shape_factor_series(z) - np.log(2.0 * z)
+    np.testing.assert_allclose(gap * (2.0 * z) ** 2, 1.0, atol=tolerance)
+
+
+# Mesh for the transient solves, and its half in each direction for the refinement check. The
+# rectangle is deliberately tall rather than square: the discretisation error lives almost
+# entirely in ``v``, across the halo, while the field is smooth around the pipe in ``u``.
+# Measured on the geometry that binds -- the 100 mm line, whose ``v`` extent ``arccosh(d/r_o)``
+# is the largest at 3.75 -- halving ``nu`` from 128 to 96 costs 0.0007 ``g`` where halving
+# ``nv`` from 192 to 128 costs 0.03 ``g``, so the resolution is spent where it buys something.
+_HALO_MESH = (96, 256)
+_HALO_MESH_HALVED = (48, 128)
+
+# Lag schedules ``(dt, n_bins, sub-steps per bin)``. ``hourly`` resolves the first hours,
+# where the cylinder carries the response and the surface is not yet felt; ``daily`` spans the
+# image arrival time ``(2 d_eff)**2/(4 alpha)`` -- 22.5 d at a metre, 5 d for the shallow case
+# -- where the conceptual gap peaks; ``twenty_day`` runs to saturation. The opening bin of every
+# schedule averages over the ``sqrt(t)`` corner of the wall response, so it is read separately
+# from the rest. ``daily`` drops a second bin: at one-day bins the thin pipe is still settling
+# out of that corner, and halving the step moves bin 1 by 0.5 ``g`` against 0.16 ``g`` for bin 2.
+# Neither bin is load-bearing for the assertions -- they pass from bin 1 -- but the numbers the
+# docstring quotes should come from lags the reference has actually converged on.
+_HALO_SCHEDULES = {"hourly": (1.0 / 24.0, 48, 24), "daily": (1.0, 60, 12), "twenty_day": (20.0, 60, 12)}
+_HALO_SETTLED = {"hourly": 1, "daily": 2, "twenty_day": 1}
+
+
+@pytest.mark.parametrize(
+    ("geometry", "schedule", "ceiling", "dip", "approach"),
+    [
+        ("service_100mm", "hourly", 0.05, None, None),
+        ("main_400mm", "hourly", 0.01, None, None),
+        ("shallow_400mm", "hourly", 1.00, None, None),
+        ("service_100mm", "daily", 3.20, (-3.2, -1.2), None),
+        ("main_400mm", "daily", 2.10, (-2.1, -1.2), None),
+        ("shallow_400mm", "daily", 1.60, (-1.6, -1.0), None),
+        ("service_100mm", "twenty_day", 3.40, None, (0.55, 0.95)),
+        ("main_400mm", "twenty_day", 2.10, None, (0.60, 0.95)),
+        ("shallow_400mm", "twenty_day", 1.20, None, (0.80, 1.05)),
+    ],
+)
+def test_halo_kernel_matches_the_two_dimensional_reference(geometry, schedule, ceiling, dip, approach):
+    """The kernel's transient response against the true problem, over every lag that matters.
+
+    The reference is the steady test's 2-D solve stepped in time from a cold half space with
+    the wall flux switched on at ``t = 0``. It carries no image, no cylinder quadrature and no
+    ``E1``: the surface is a boundary condition, and the resistance the halo saturates at is
+    an outcome rather than an input. Everything is quoted in units of the steady gap
+    ``g = (r_o/(2 d_eff))**2/(2 pi kappa)`` that the previous test pins, because that is the
+    scale the whole conceptual error lives on.
+
+    Three regimes, and the middle one revises what issue #43 assumed when it asked:
+
+    - **Before the surface is felt** (hourly bins, first two days) the kernel is exact for
+      practical purposes: 6e-5 day/m², some 3e-6 of ``R_soil``, or 0.02 ``g`` on the service
+      line and 0.001 ``g`` on the main. That is an independent confirmation of the cylinder
+      quadrature by a method sharing nothing with either the branch-cut integral or the
+      Laplace inversion that already checks it. The shallow geometry is the exception and
+      belongs to the next regime already: its image arrives in 5 days, so the gap is open to
+      0.65 ``g`` before the second day is out.
+    - **While the image arrives** the gap goes *negative* and overshoots: the true surface
+      starts cooling the wall *before* the line image does -- the image is read from the axis
+      at ``2 d_eff``, while the near side of the wall sees its own at ``2(d_eff - r_o)``, and
+      averaging the convex ``E1`` around the wall is dominated by that near side -- so the
+      model credits the wall with more arrived resistance than it has, by 2.7 ``g`` on the
+      service line, 1.7 ``g`` on the main and 1.2 ``g`` shallow. (Those are the geometries
+      measured, ``d_eff/r_o`` of 21 down to 2.5; the ratio keeps growing with ``d_eff/r_o``,
+      roughly as ``ln(2 d_eff/r_o)``, even as the absolute error shrinks.) The issue expected
+      the transient difference to sit below the steady bound. It does not -- though it keeps
+      the same ``(r_o/2 d_eff)**2`` order, which is what leaves the conclusion (the image is
+      affordable) standing.
+    - **Approaching saturation** the gap returns to ``+g`` from below, and slowly, as ``1/t``:
+      after 1200 days the service line and the main have reached 0.73 and 0.77 ``g``, the
+      shallow geometry -- whose image time is 16 times shorter -- 0.95 ``g``.
+
+    The reference resolves all of it: halving the mesh in both directions moves these curves by
+    at most 0.07 ``g``, so the mesh actually used sits a further four times nearer -- two orders
+    below the dip it reports.
+    """
+    r_o, d_eff = _HALO_GEOMETRIES[geometry]
+    dt_bin, n_bins, sub = _HALO_SCHEDULES[schedule]
+    settings = dict(r_o=r_o, d=d_eff, alpha=_HALO_ALPHA, kappa=_HALO_KAPPA, dt_bin=dt_bin, n_bins=n_bins, sub=sub)
+    package = _halo_kernel_response(n_bins, dt_bin, r_o, d_eff)
+    fine, stored, injected = _bipolar_halo_transient(*_HALO_MESH, **settings)
+    coarse, _, _ = _bipolar_halo_transient(*_HALO_MESH_HALVED, **settings)
+
+    steady_gap = (_steady_shape_factor_series(d_eff / r_o) - np.log(2.0 * d_eff / r_o)) / (2.0 * np.pi * _HALO_KAPPA)
+    settled = slice(_HALO_SETTLED[schedule], None)
+    gap = (fine - package)[settled] / steady_gap
+
+    # Grid doubling, at a fixed time step so this is the mesh alone: the coarse mesh already
+    # sits this close, and second-order convergence puts the fine one a further four times
+    # nearer -- far below the gaps asserted next, which is what makes them the model's.
+    assert np.abs(fine - coarse)[settled].max() < 0.10 * steady_gap, "the mesh does not resolve the gap being measured"
+    assert np.abs(gap).max() < ceiling
+
+    if schedule == "hourly":
+        # The opening bin is the cylinder's own, the one a line source gets badly wrong; the
+        # tolerance is the trapezoidal rule's error on the ``sqrt(t)`` corner, not the model's.
+        np.testing.assert_allclose(fine[0], package[0], rtol=8e-3)
+        # Two days in, the heat has diffused 0.63 m of the 0.86-1.01 m to the surface, so a
+        # fraction of a percent has begun to leave and none of it can come back. The shallow
+        # pipe is well past that, which is why its gap is already open.
+        held = stored / injected
+        assert held < 1.0, "the soil cannot hold more heat than the pipe injected"
+        if geometry != "shallow_400mm":
+            assert held > 0.99
+    if dip is not None:
+        assert dip[0] < gap.min() < dip[1]
+    if approach is not None:
+        assert approach[0] < gap[-10:].mean() < approach[1]
+
+
+def test_the_two_dimensional_reference_conserves_heat_and_settles_in_time():
+    """The reference's own two error sources, bounded before it is used to judge anything.
+
+    *Conservation.* Bipolar coordinates carry the whole half space, so until heat reaches the
+    surface there is nowhere for it to go and the soil must hold exactly what the wall
+    injected. At six hours the diffusion length is 0.22 m against a metre of cover and the
+    budget closes to five decimals -- which pins the wall-flux normalisation, the metric in the
+    cell areas and the time stepping against each other in one number. (By two days a few
+    tenths of a percent have left, and by eight days a tenth of the total: the check has to be
+    read before the surface opens, not after.)
+
+    *Time step.* The transient comparison doubles the mesh but holds the step, so the step is
+    demonstrated separately, on the case where it is worst: the thin pipe on 20-day bins, whose
+    first bins average over a ``sqrt(t)`` corner far finer than they can resolve. Past the
+    opening bin, halving the step moves the answer by a small fraction of the steady gap the
+    comparison reports.
+    """
+    for name in ("service_100mm", "main_400mm"):
+        r_o, d_eff = _HALO_GEOMETRIES[name]
+        _, stored, injected = _bipolar_halo_transient(
+            *_HALO_MESH_HALVED,
+            r_o=r_o,
+            d=d_eff,
+            alpha=_HALO_ALPHA,
+            kappa=_HALO_KAPPA,
+            dt_bin=0.25 / 6,
+            n_bins=6,
+            sub=24,
+        )
+        np.testing.assert_allclose(stored / injected, 1.0, rtol=2e-5, err_msg=name)
+
+    r_o, d_eff = _HALO_GEOMETRIES["service_100mm"]
+    steady_gap = (_steady_shape_factor_series(d_eff / r_o) - np.log(2.0 * d_eff / r_o)) / (2.0 * np.pi * _HALO_KAPPA)
+    settings = dict(r_o=r_o, d=d_eff, alpha=_HALO_ALPHA, kappa=_HALO_KAPPA, dt_bin=20.0, n_bins=60)
+    # On the halved mesh: this isolates the step, and the mesh is the other test's business.
+    coarse_step, _, _ = _bipolar_halo_transient(*_HALO_MESH_HALVED, **settings, sub=12)
+    fine_step, _, _ = _bipolar_halo_transient(*_HALO_MESH_HALVED, **settings, sub=24)
+    assert np.abs(fine_step - coarse_step)[1:].max() < 0.10 * steady_gap
+
+
+def test_effective_depth_reduction_measured_against_a_robin_surface():
+    """``d_eff = depth + kappa/eta`` against a genuine Robin surface, at steady state.
+
+    The package never solves a Robin problem: it displaces the surface downward by the
+    radiation length and solves a Dirichlet one. What that displacement costs is measured here
+    twice over, by routes that share no arithmetic.
+
+    The exact Robin half space is not one image but a *distribution* of them: a positive mirror
+    at the true ``2 depth`` followed by a tail at ``2 depth + s`` weighted
+    ``2 beta exp(-beta s)``, ``beta = eta/kappa``. Integrating that tail against the line
+    source closes in
+
+    ``2 pi kappa R = ln(2 depth/r_o) + 2 exp(x) E1(x)``,  ``x = 2 depth eta / kappa``
+
+    -- the ``hyperu(1, 1, x)`` below, which is exactly 0 at ``eta = inf``, recovering the
+    Dirichlet law without a branch. Adding the uniform-flux cylinder's own
+    ``(r_o/(2 d_eff))**2`` term to that gives an analytic prediction for the *whole* geometry
+    this file's 2-D solve computes numerically, and the two agree to 9e-7 day/m², the solve's
+    own discretisation floor. That is the mutual check: a closed form and a mesh, neither
+    holding the other's assumptions.
+
+    Against either of them the displacement's residual is the same number to four figures --
+    2.026e-4 day/m² from the mesh, 2.025e-4 from the closed form, against a film effect of
+    0.377 -- so ``d_eff`` captures 99.95 % of what the surface film does, and always from
+    below. That is an order below the cylinder-image gap it is combined with, which is why the
+    model can carry one ``d_eff`` through both. Issue #49 proposes replacing the displacement
+    with the exact image distribution above; 2.03e-4 day/m² is the number it has to beat, and
+    the closed form here is the anchor to beat it against.
+    """
+    r_o, depth, eta = 0.05, 1.0, GRASS["eta"]
+    scale = 2.0 * np.pi * _HALO_KAPPA
+    d_eff = depth + _HALO_KAPPA / eta
+
+    coarse = _bipolar_halo_steady(96, 128, r_o=r_o, d=depth, kappa=_HALO_KAPPA, eta=eta)
+    robin = _bipolar_halo_steady(192, 256, r_o=r_o, d=depth, kappa=_HALO_KAPPA, eta=eta)
+    assert abs(robin - coarse) < 1e-5
+
+    # The analytic anchor: exact Robin image distribution for the line, plus the cylinder's own
+    # steady term read at the effective depth -- the image distance that actually sets it.
+    exact_line = (np.log(2.0 * depth / r_o) + 2.0 * hyperu(1, 1, 2.0 * depth * eta / _HALO_KAPPA)) / scale
+    anchor = exact_line + (r_o / (2.0 * d_eff)) ** 2 / scale
+    assert abs(robin - anchor) < 3e-6, "the Robin solve and the closed-form image distribution disagree"
+
+    bare = _steady_shape_factor_series(depth / r_o) / scale
+    displaced = _steady_shape_factor_series(d_eff / r_o) / scale
+    film = robin - bare
+    assert film > 0.0, "a finite surface film can only add resistance"
+    # Signed: displacing the surface downward always understates the true Robin resistance.
+    residual = robin - displaced
+    assert 0.0 < residual < 8e-4 * film
+    # And the same residual falls out of the closed form alone, with no mesh anywhere in it.
+    np.testing.assert_allclose(residual, exact_line - np.log(2.0 * d_eff / r_o) / scale, rtol=2e-3)
+
+
+# ============================================================================
 # The exchange rate
 # ============================================================================
 
@@ -589,8 +1137,12 @@ def test_segment_heat_rate_reproduces_the_documented_values():
 def test_segment_heat_rate_approaches_the_exact_buried_cylinder_resistance():
     """The line-source-plus-image soil resistance is the exact cylinder one to ``O((r/d)**2)``.
 
-    A cylinder of radius ``r`` whose axis lies at depth ``d`` below an isothermal plane has the
-    exact steady shape-factor resistance ``acosh(d/r) / (2 pi kappa)``. The package uses
+    An *isothermal* cylinder of radius ``r`` whose axis lies at depth ``d`` below an isothermal
+    plane has the exact steady shape-factor resistance ``acosh(d/r) / (2 pi kappa)``. That wall
+    condition is the other one from the model's own uniform flux, whose exact factor lies the
+    same distance on the far side of ``ln(2 d/r)`` -- see
+    :func:`test_steady_conceptual_gap_has_the_predicted_order_and_unit_coefficient`, which
+    measures that side. Either way the magnitude below is what the log gives up. The package uses
     ``ln(2 d / r) / (2 pi kappa)``, which is its large-``d/r`` limit, so the dimensionless gap
     is ``1 / (4 (d/r)**2)``. Pinning the gap against that expression -- rather than merely
     observing that it is small at one geometry -- is what distinguishes the intended

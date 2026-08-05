@@ -110,10 +110,29 @@ Validity
   quantity in the module that is not closed-form. It is evaluated by quadrature along the
   branch cut of its Laplace transform, once per distinct ``alpha dt / r_o**2`` at build
   time, and holds about 1e-13 relative over every Fourier number reachable here. The image
-  keeps its line source, at a cost of the same order as the steady resistance's own
-  ``ln(2 d_eff/r_o)`` shape factor already carries: 2e-4 of ``R_soil`` for a 100 mm service
-  line buried a metre and 3.5e-3 for a 400 mm main, both growing as the burial approaches
-  ``r_o``. What the cylinder buys is the first lag bin, where a line source read at ``r = r_o``
+  keeps its line source, and the whole conceptual model -- cylinder, line image, saturation at
+  ``ln(2 d_eff/r_o)`` -- has been measured against an independent 2-D solve of the true
+  boundary-value problem, which carries no image and is never told a resistance (issue #43).
+  Steadily it costs ``(r_o/2 d_eff)**2/(2 pi kappa)`` with a coefficient measured at 1.00,
+  0.995 and 0.98 for ``d_eff/r_o`` of 21, 5.3 and 2.5: 1.5e-4 of ``R_soil`` for a 100 mm
+  service line buried a metre, 3.7e-3 for a 400 mm main, 2.4e-2 at two and a half radii. The
+  sign says ``ln(2 d_eff/r_o)`` sits midway between the two wall conditions, above the
+  isothermal ``acosh(d_eff/r_o)`` by what it falls short of the uniform-flux answer by.
+  Transiently the gap is larger, not smaller: the true surface starts cooling the wall before
+  the line image does -- the image is read from the axis at ``2 d_eff`` while the near side of
+  the wall sees its own at ``2(d_eff - r_o)`` -- so while it arrives the model over-credits the
+  resistance that has reached the wall, by 2.7 times the steady gap over the geometries
+  measured (``d_eff/r_o`` of 2.5 to 21, the ratio itself growing about as ``ln(2 d_eff/r_o)``
+  while the absolute error shrinks), returning to it only as ``1/t``. All of it grows as the
+  burial approaches ``r_o``. Before the surface is felt at all the kernel is exact to 3e-6 of
+  ``R_soil``, which is that same solve confirming the cylinder quadrature by a route sharing
+  nothing with it. The surface film, folded in as a perfect surface displaced down by
+  ``kappa/eta``, is measured the same way: against a genuine Robin surface -- and against the
+  closed form of its exact image distribution, ``ln(2 d/r_o) + 2 exp(x) E1(x)`` at
+  ``x = 2 d eta/kappa`` -- the displacement captures 99.95 % of what the film does and errs
+  low, 2.0e-4 day/m² at ``eta = 0.41``, which is 8.5e-6 of ``R_soil`` and so a good order below
+  the cylinder-image gap it is combined with.
+  What the cylinder buys is the first lag bin, where a line source read at ``r = r_o``
   understates the arrived resistance badly because the heat has not yet diffused past the
   pipe: ``Dbar[0]/R_soil`` is 0.8568 for a 100 mm service line and 0.9323 for a 400 mm main
   on hourly bins, against 0.9418 and 1.0000 for the line source -- the second of which left
@@ -379,10 +398,13 @@ def _deficit_kernel(
     makes the halo saturate at the steady buried-pipe resistance
     ``R_inf = ln(2 d_eff/r_o)/(2 pi kappa)``. The image keeps its closed form
     ``E1(c_i/t)/(4 pi kappa)``: a cylinder read from ``2 d_eff`` away rather than from its own
-    wall is a line to the same order the *steady* resistance above already is, and it costs
-    the same order too -- at most 2e-4 of ``R_inf`` for a 100 mm service line buried a metre
-    and 3.5e-3 for a 400 mm main, against the 1e-4 and 3.8e-3 that ``ln(2 d_eff/r_o)`` itself
-    gives up against ``acosh(d_eff/r_o)``. Both grow as the burial approaches ``r_o``.
+    wall is a line to the same order the *steady* resistance above already is. What the
+    conceptual model as a whole costs against the true boundary-value problem is measured, not
+    assumed, in ``test_heat.py``'s two-dimensional reference: ``(r_o/2 d_eff)**2/(2 pi kappa)``
+    at steady state with a coefficient of 1.00 to 0.98 over ``d_eff/r_o`` from 21 down to 2.5,
+    and 2.7 times that transiently while the image arrives -- over that same range of
+    ``d_eff/r_o``, the ratio growing about as ``ln(2 d_eff/r_o)`` beyond it. Both grow as the
+    burial approaches ``r_o``.
 
     The deficit ``D = R_inf - G`` is what has *not yet arrived*; its bin average over lag bin
     ``m`` comes from the time integral of ``G``, closed-form for the image and quadrature for
@@ -651,14 +673,20 @@ class HeatNetwork(PipeNetwork):
             capacity of water [m²/day].
         ``depth``
             Burial depth to the pipe axis [m]. Default 1.0. It must put the pipe below the
-            surface, ``d_eff > r_o``; the exact shape factor ``acosh(d_eff/r_o)`` does not
-            exist below that and the ``ln(2 d_eff/r_o)`` used here runs away to a divergent
-            rate rather than to an error. That log is the large-``d/r`` limit of the exact
-            factor and overstates it by ``1/(4 (d_eff/r_o)**2)``, so accuracy is a matter of
-            how far above the guard the pipe is: 0.01 % for a 100 mm service line and 0.4 %
-            for a 400 mm main at a metre, 5.3 % at ``d_eff = 2 r_o``, 24 % for a DN1600
-            there, and 117 % for a DN2000 -- leaving the default depth on a transmission
-            main is the mis-entry to watch.
+            surface, ``d_eff > r_o``; the exact shape factors do not exist below that and the
+            ``ln(2 d_eff/r_o)`` used here runs away to a divergent rate rather than to an
+            error. That log is the large-``d/r`` limit of both exact factors, and it sits
+            between them: ``1/(4 (d_eff/r_o)**2)`` above the isothermal-wall
+            ``acosh(d_eff/r_o)`` and, *while* ``d_eff >> r_o``, the same amount below the
+            uniform-flux wall this model actually imposes (measured in ``test_heat.py`` at
+            ``d_eff/r_o`` of 21, 5.3 and 2.5). So accuracy is a matter of how far above the
+            guard the pipe is: 0.015 % for a 100 mm service line and 0.4 % for a 400 mm main
+            at a metre, 5.3 % at ``d_eff = 2 r_o``, 24 % for a DN1600 there, and 117 % for a
+            DN2000 -- leaving the default depth on a transmission main is the mis-entry to
+            watch. Those last figures are against ``acosh``; near the guard the two wall
+            conditions part company entirely (as ``d_eff -> r_o`` the isothermal resistance
+            goes to zero while the uniform-flux one stays finite), so against the flux wall
+            the same two rows read 13 % and 25 %. Either way the pipe is in the wrong regime.
         ``eta``
             Surface film coefficient [m/day]. Default ``inf``, a prescribed-temperature
             surface: the radiation length ``kappa_soil / eta`` is then exactly zero and the
