@@ -364,7 +364,7 @@ def endmember_series(
     ...     network=net,
     ... )
     >>> ax = endmember_series(
-    ...     values=dict(zip(net.endmembers, age * 24.0)),
+    ...     values={node: series * 24.0 for node, series in age.items()},
     ...     tedges=tedges,
     ...     ylabel="water age [h]",
     ... )

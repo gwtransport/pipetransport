@@ -20,6 +20,11 @@ from pipetransport.utils import tedges_to_days
 NETWORK_FIXTURES = ["single_pipe", "two_branch", "network"]
 
 
+def _stack(result):
+    """Stack a per-node result mapping back into rows, in the mapping's own (report) order."""
+    return np.stack(list(result.values()))
+
+
 def _path_oracles(network, demand, node, tdays):
     """Brute-force path solvers for the full path to ``node`` and for each of its tails.
 
@@ -71,7 +76,7 @@ def test_constant_demand_reproduces_closed_form(
 ):
     network = request.getfixturevalue(network_name)
     demand = constant_demand(network, hourly_tedges)
-    age = endmember_to_source(flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network)
+    age = _stack(endmember_to_source(flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network))
 
     assert age.shape == (len(network.endmembers), len(hourly_tedges) - 1)
     assert np.all(np.isfinite(age)), "the warm start should make every output bin of a steady record valid"
@@ -85,14 +90,14 @@ def test_constant_demand_reproduces_closed_form(
 def test_single_pipe_travel_time_is_volume_over_demand(single_pipe, hourly_tedges):
     # 100 m3 of pipe emptied by 100 m3/day is exactly one day, with no split to complicate it.
     demand = {"T1": np.full(len(hourly_tedges) - 1, 100.0)}
-    age = endmember_to_source(flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=single_pipe)
+    age = _stack(endmember_to_source(flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=single_pipe))
     np.testing.assert_allclose(age, 1.0, rtol=1e-12)
 
 
 def test_two_branch_effective_volume_counts_the_trunk_in_full(two_branch, hourly_tedges):
     # Plant-A (300 m3) carries all 300 m3/day, A-T1 (40 m3) a third, A-T2 (60 m3) two thirds.
     demand = {"T1": np.full(len(hourly_tedges) - 1, 100.0), "T2": np.full(len(hourly_tedges) - 1, 200.0)}
-    age = endmember_to_source(flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=two_branch)
+    age = _stack(endmember_to_source(flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=two_branch))
     np.testing.assert_allclose(age[0], (300.0 + 40.0 * 3.0) / 300.0, rtol=1e-12)
     np.testing.assert_allclose(age[1], (300.0 + 60.0 * 1.5) / 300.0, rtol=1e-12)
 
@@ -105,8 +110,10 @@ def test_shared_trunk_contributes_its_full_volume_to_every_path(network, hourly_
     segment_flow = pd.Series(network.segment_flow(flow=demand)[:, 0], index=network.segments.index)
     fraction = segment_flow / production
 
-    age = endmember_to_source(
-        flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network, report_nodes=["T1", "T3"]
+    age = _stack(
+        endmember_to_source(
+            flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network, report_nodes=["T1", "T3"]
+        )
     )
     effective = age[:, 0] * production  # effective volume in units of source throughflow
 
@@ -130,8 +137,10 @@ def test_both_directions_give_the_same_constant_under_constant_flow(
 ):
     network = request.getfixturevalue(network_name)
     demand = constant_demand(network, hourly_tedges)
-    backward = endmember_to_source(flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network)
-    forward = source_to_endmember(flow=demand, tedges=hourly_tedges, network=network)
+    backward = _stack(
+        endmember_to_source(flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network)
+    )
+    forward = _stack(source_to_endmember(flow=demand, tedges=hourly_tedges, network=network))
 
     assert forward.shape == backward.shape
     for i, node in enumerate(network.endmembers):
@@ -147,10 +156,12 @@ def test_retardation_factor_scales_the_travel_time_linearly(network, hourly_tedg
     # Every segment volume is multiplied by R and every flow is untouched, so under a constant
     # proportional split sum(R * V_i / f_i) / Q is exactly R times the unretarded travel time.
     demand = constant_demand(network, hourly_tedges)
-    base = endmember_to_source(flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network)
+    base = _stack(endmember_to_source(flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network))
     for factor in (2.5, 7.0):
-        scaled = endmember_to_source(
-            flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network, retardation_factor=factor
+        scaled = _stack(
+            endmember_to_source(
+                flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network, retardation_factor=factor
+            )
         )
         np.testing.assert_allclose(scaled, factor * base, rtol=1e-12)
 
@@ -165,8 +176,10 @@ def test_diurnal_travel_time_matches_the_brute_force_oracle(network, short_tedge
     """Cross-check the bin-averaged age against parcel-by-parcel root solves plus quadrature."""
     demand = diurnal_demand(network, short_tedges)
     tdays = tedges_to_days(short_tedges)
-    age = endmember_to_source(
-        flow=demand, tedges=short_tedges, cout_tedges=short_tedges, network=network, report_nodes=[node]
+    age = _stack(
+        endmember_to_source(
+            flow=demand, tedges=short_tedges, cout_tedges=short_tedges, network=network, report_nodes=[node]
+        )
     )[0]
 
     oracles = _path_oracles(network, demand, node, tdays)
@@ -203,13 +216,15 @@ def test_diurnal_directions_agree_on_the_matched_arrival_grid(network, short_ted
     assert np.all(np.diff(arrivals) > 0)
     arrival_tedges = short_tedges[0] + pd.to_timedelta(arrivals, unit="D")
 
-    forward = source_to_endmember(flow=demand, tedges=short_tedges, network=network, report_nodes=[node])[0]
-    backward = endmember_to_source(
-        flow=demand,
-        tedges=short_tedges,
-        cout_tedges=arrival_tedges,
-        network=network,
-        report_nodes=[node],
+    forward = _stack(source_to_endmember(flow=demand, tedges=short_tedges, network=network, report_nodes=[node]))[0]
+    backward = _stack(
+        endmember_to_source(
+            flow=demand,
+            tedges=short_tedges,
+            cout_tedges=arrival_tedges,
+            network=network,
+            report_nodes=[node],
+        )
     )[0]
 
     matched = forward[: len(arrivals) - 1]
@@ -228,8 +243,10 @@ def test_diurnal_directions_bracket_each_other(network, hourly_tedges, diurnal_d
     """
     demand = diurnal_demand(network, hourly_tedges)
     tdays = tedges_to_days(hourly_tedges)
-    forward = source_to_endmember(flow=demand, tedges=hourly_tedges, network=network)
-    backward = endmember_to_source(flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network)
+    forward = _stack(source_to_endmember(flow=demand, tedges=hourly_tedges, network=network))
+    backward = _stack(
+        endmember_to_source(flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network)
+    )
 
     for i, node in enumerate(network.endmembers):
         oracle = _path_oracles(network, demand, node, tdays)[0]
@@ -252,12 +269,14 @@ def test_diurnal_directions_bracket_each_other(network, hourly_tedges, diurnal_d
 
 def test_age_ordering_under_diurnal_demand(network, hourly_tedges, diurnal_demand):
     demand = diurnal_demand(network, hourly_tedges)
-    age = endmember_to_source(
-        flow=demand,
-        tedges=hourly_tedges,
-        cout_tedges=hourly_tedges,
-        network=network,
-        report_nodes=["T1", "T2", "T3", "T4"],
+    age = _stack(
+        endmember_to_source(
+            flow=demand,
+            tedges=hourly_tedges,
+            cout_tedges=hourly_tedges,
+            network=network,
+            report_nodes=["T1", "T2", "T3", "T4"],
+        )
     )
     assert np.all(np.isfinite(age))
     t1, t2, t3, t4 = age
@@ -273,8 +292,10 @@ def test_age_ordering_under_diurnal_demand(network, hourly_tedges, diurnal_deman
     assert np.all(t2 < t4)
 
     # A junction carries the water its endmembers will later receive, so it is strictly younger.
-    junction = endmember_to_source(
-        flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network, report_nodes=["B"]
+    junction = _stack(
+        endmember_to_source(
+            flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network, report_nodes=["B"]
+        )
     )[0]
     assert np.all(junction < t1)
     assert np.all(junction < t2)
@@ -289,14 +310,16 @@ def test_constant_demand_decay_equals_exp_minus_rate_times_age(network, hourly_t
     """A steady demand gives every parcel in a bin the same age, so the residual is exp(-k tau)."""
     demand = constant_demand(network, hourly_tedges)
     decay_rate = 0.4
-    age = endmember_to_source(flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network)
-    residual = transport_source_to_endmember(
-        cin=np.ones(len(hourly_tedges) - 1),
-        flow=demand,
-        tedges=hourly_tedges,
-        cout_tedges=hourly_tedges,
-        network=network,
-        decay_rate=decay_rate,
+    age = _stack(endmember_to_source(flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network))
+    residual = _stack(
+        transport_source_to_endmember(
+            cin=np.ones(len(hourly_tedges) - 1),
+            flow=demand,
+            tedges=hourly_tedges,
+            cout_tedges=hourly_tedges,
+            network=network,
+            decay_rate=decay_rate,
+        )
     )
     assert np.all(np.isfinite(residual))
     np.testing.assert_allclose(residual, np.exp(-decay_rate * age), rtol=1e-12)
@@ -308,14 +331,16 @@ def test_diurnal_demand_leaves_a_jensen_gap(network, hourly_tedges, diurnal_dema
     decay_rate = 0.6
     # Six-hourly reporting bins so each average spans a real spread of ages.
     cout_tedges = pd.date_range(hourly_tedges[0], hourly_tedges[-1], freq="6h")
-    age = endmember_to_source(flow=demand, tedges=hourly_tedges, cout_tedges=cout_tedges, network=network)
-    residual = transport_source_to_endmember(
-        cin=np.ones(len(hourly_tedges) - 1),
-        flow=demand,
-        tedges=hourly_tedges,
-        cout_tedges=cout_tedges,
-        network=network,
-        decay_rate=decay_rate,
+    age = _stack(endmember_to_source(flow=demand, tedges=hourly_tedges, cout_tedges=cout_tedges, network=network))
+    residual = _stack(
+        transport_source_to_endmember(
+            cin=np.ones(len(hourly_tedges) - 1),
+            flow=demand,
+            tedges=hourly_tedges,
+            cout_tedges=cout_tedges,
+            network=network,
+            decay_rate=decay_rate,
+        )
     )
     gap = residual - np.exp(-decay_rate * age)
     assert np.all(np.isfinite(gap))
@@ -362,8 +387,10 @@ def test_age_before_a_shutdown_is_the_steady_travel_time(single_pipe, hourly_ted
     for rate in _SHUTDOWN_RATES:
         demand = _shutdown_demand(n_bins, rate, start, duration=24)
 
-        age = endmember_to_source(
-            flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=single_pipe, spinup=None
+        age = _stack(
+            endmember_to_source(
+                flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=single_pipe, spinup=None
+            )
         )[0]
 
         before = age[:start]
@@ -383,14 +410,16 @@ def test_residual_before_a_shutdown_is_the_steady_exponential(single_pipe, hourl
     for rate in _SHUTDOWN_RATES:
         demand = _shutdown_demand(n_bins, rate, start, duration=24)
 
-        cout = transport_source_to_endmember(
-            cin=np.ones(n_bins),
-            flow=demand,
-            tedges=hourly_tedges,
-            cout_tedges=hourly_tedges,
-            network=single_pipe,
-            decay_rate=decay_rate,
-            spinup=None,
+        cout = _stack(
+            transport_source_to_endmember(
+                cin=np.ones(n_bins),
+                flow=demand,
+                tedges=hourly_tedges,
+                cout_tedges=hourly_tedges,
+                network=single_pipe,
+                decay_rate=decay_rate,
+                spinup=None,
+            )
         )[0]
 
         before = cout[:start]
@@ -410,11 +439,15 @@ def test_a_stagnant_branch_does_not_suppress_the_warm_start_of_its_siblings(netw
     demand = constant_demand(network, hourly_tedges)
     demand["T4"][0] = 0.0  # T4 starts behind a closed tap
 
-    alone = endmember_to_source(
-        flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network, report_nodes=["T1"]
+    alone = _stack(
+        endmember_to_source(
+            flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network, report_nodes=["T1"]
+        )
     )[0]
-    together = endmember_to_source(
-        flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network, report_nodes=["T1", "T4"]
+    together = _stack(
+        endmember_to_source(
+            flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network, report_nodes=["T1", "T4"]
+        )
     )
 
     assert np.all(np.isfinite(alone))
@@ -438,7 +471,7 @@ def test_source_bins_inside_a_shutdown_have_no_age(single_pipe, hourly_tedges, s
     shut = slice(start, start + duration)
     demand = _shutdown_demand(n_bins, 500.0, start, duration)
 
-    age = source_to_endmember(flow=demand, tedges=hourly_tedges, network=single_pipe)
+    age = _stack(source_to_endmember(flow=demand, tedges=hourly_tedges, network=single_pipe))
 
     assert np.all(np.isnan(age[0, shut])), "a bin that produces nothing has no residence time"
     # Only the shutdown is lost: departures clear of it still deliver inside the record at
@@ -457,10 +490,12 @@ def test_source_bins_inside_a_shutdown_have_no_age(single_pipe, hourly_tedges, s
 def test_source_node_has_zero_travel_time(network, hourly_tedges, constant_demand):
     demand = constant_demand(network, hourly_tedges)
     for age in (
-        endmember_to_source(
-            flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network, report_nodes=["Plant"]
+        _stack(
+            endmember_to_source(
+                flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network, report_nodes=["Plant"]
+            )
         ),
-        source_to_endmember(flow=demand, tedges=hourly_tedges, network=network, report_nodes=["Plant"]),
+        _stack(source_to_endmember(flow=demand, tedges=hourly_tedges, network=network, report_nodes=["Plant"])),
     ):
         assert np.all(np.isfinite(age))
         np.testing.assert_allclose(age, 0.0, atol=0.0)
@@ -469,16 +504,20 @@ def test_source_node_has_zero_travel_time(network, hourly_tedges, constant_deman
 def test_nodes_order_is_honoured(network, hourly_tedges, constant_demand, analytic_travel_time):
     demand = constant_demand(network, hourly_tedges)
     order = ["T3", "B", "T1", "C"]
-    age = endmember_to_source(
-        flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network, report_nodes=order
+    age = _stack(
+        endmember_to_source(
+            flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network, report_nodes=order
+        )
     )
     assert age.shape == (len(order), len(hourly_tedges) - 1)
     for i, node in enumerate(order):
         # Same row whether or not the other nodes are asked for. Not bit-identical: the
         # warm-start length is the longest travel time over the requested set, which shifts
         # the interpolation grid by a few ulps.
-        alone = endmember_to_source(
-            flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network, report_nodes=[node]
+        alone = _stack(
+            endmember_to_source(
+                flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network, report_nodes=[node]
+            )
         )[0]
         answered = np.isfinite(age[i])
         np.testing.assert_array_equal(answered, np.isfinite(alone))
@@ -492,12 +531,14 @@ def test_every_node_answers_the_final_output_bin(network, hourly_tedges, constan
     # The last output bin ends exactly at the record end and is fed only by parcels that left
     # inside the record, so it is constrained at every node.
     demand = constant_demand(network, hourly_tedges)
-    age = endmember_to_source(
-        flow=demand,
-        tedges=hourly_tedges,
-        cout_tedges=hourly_tedges,
-        network=network,
-        report_nodes=list(network.nodes[1:]),
+    age = _stack(
+        endmember_to_source(
+            flow=demand,
+            tedges=hourly_tedges,
+            cout_tedges=hourly_tedges,
+            network=network,
+            report_nodes=list(network.nodes[1:]),
+        )
     )
     assert np.all(np.isfinite(age[:, -1]))
 
@@ -507,11 +548,13 @@ def test_spinup_none_leaves_the_first_travel_time_worth_of_bins_nan(
 ):
     """Without a warm start, an output bin is answered only once no parcel in it predates the record."""
     demand = constant_demand(network, hourly_tedges)
-    strict = endmember_to_source(
-        flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network, spinup=None
+    strict = _stack(
+        endmember_to_source(flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network, spinup=None)
     )
-    warm = endmember_to_source(
-        flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network, spinup="constant"
+    warm = _stack(
+        endmember_to_source(
+            flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network, spinup="constant"
+        )
     )
 
     assert not np.isnan(warm).any()
@@ -540,15 +583,17 @@ def test_warm_start_reproduces_a_genuinely_constant_history(network, hourly_tedg
     demand = {name: np.concatenate([np.full(head, series[head]), series[head:]]) for name, series in diurnal.items()}
     truncated = {name: series[head:] for name, series in demand.items()}
 
-    truth = endmember_to_source(
-        flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network, spinup=None
+    truth = _stack(
+        endmember_to_source(flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network, spinup=None)
     )[:, head:]
-    warm = endmember_to_source(
-        flow=truncated,
-        tedges=hourly_tedges[head:],
-        cout_tedges=hourly_tedges[head:],
-        network=network,
-        spinup="constant",
+    warm = _stack(
+        endmember_to_source(
+            flow=truncated,
+            tedges=hourly_tedges[head:],
+            cout_tedges=hourly_tedges[head:],
+            network=network,
+            spinup="constant",
+        )
     )
 
     assert not np.isnan(warm).any()

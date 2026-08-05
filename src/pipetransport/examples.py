@@ -70,15 +70,15 @@ def example_network() -> PipeNetwork:
     >>> network.paths["T4"]
     ('Plant-A', 'A-C', 'C-T4')
     """
-    segments = pd.DataFrame(
-        {
-            "from": ["Plant", "A", "A", "B", "B", "C", "C"],
-            "to": ["A", "B", "C", "T1", "T2", "T3", "T4"],
-            "length": [2000.0, 1500.0, 1200.0, 800.0, 400.0, 600.0, 2500.0],  # m
-            "diameter": [0.40, 0.30, 0.25, 0.15, 0.20, 0.15, 0.10],  # m
-        },
-        index=["Plant-A", "A-B", "A-C", "B-T1", "B-T2", "C-T3", "C-T4"],
-    )
+    segments = {
+        "Plant-A": {"from": "Plant", "to": "A", "length": 2000.0, "diameter": 0.40},  # m
+        "A-B": {"from": "A", "to": "B", "length": 1500.0, "diameter": 0.30},
+        "A-C": {"from": "A", "to": "C", "length": 1200.0, "diameter": 0.25},
+        "B-T1": {"from": "B", "to": "T1", "length": 800.0, "diameter": 0.15},
+        "B-T2": {"from": "B", "to": "T2", "length": 400.0, "diameter": 0.20},
+        "C-T3": {"from": "C", "to": "T3", "length": 600.0, "diameter": 0.15},
+        "C-T4": {"from": "C", "to": "T4", "length": 2500.0, "diameter": 0.10},
+    }
     return PipeNetwork(segments=segments, source="Plant")
 
 
@@ -169,12 +169,22 @@ def example_heat_network() -> HeatNetwork:
     >>> row["cover"], float(row["depth"]), float(row["kappa_soil"])
     ('grass', 0.8, 0.025)
     """
-    segments = example_network().segments.drop(columns="volume")
-    cover = ["grass", "grass", "paved", "paved", "grass", "paved", "grass"]
-    soil = {"grass": (0.05, 0.025), "paved": (0.075, 0.035)}
-    segments["cover"] = cover
-    segments["depth"] = [1.2, 1.0, 1.0, 0.9, 1.0, 1.0, 0.8]
-    segments["alpha"] = [soil[c][0] for c in cover]
-    segments["kappa_soil"] = [soil[c][1] for c in cover]
-    segments["eta"] = 0.41
+    soil = {
+        "grass": {"cover": "grass", "alpha": 0.05, "kappa_soil": 0.025, "eta": 0.41},
+        "paved": {"cover": "paved", "alpha": 0.075, "kappa_soil": 0.035, "eta": 0.41},
+    }
+    buried = {
+        "Plant-A": ("grass", 1.2),
+        "A-B": ("grass", 1.0),
+        "A-C": ("paved", 1.0),
+        "B-T1": ("paved", 0.9),
+        "B-T2": ("grass", 1.0),
+        "C-T3": ("paved", 1.0),
+        "C-T4": ("grass", 0.8),
+    }
+    pipes = example_network().segments.drop(columns="volume").to_dict(orient="index")
+    segments = {
+        name: {**pipe, **soil[cover], "depth": depth}
+        for (name, pipe), (cover, depth) in zip(pipes.items(), buried.values(), strict=True)
+    }
     return HeatNetwork(segments=segments, source="Plant")

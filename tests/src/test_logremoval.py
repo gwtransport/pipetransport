@@ -9,7 +9,6 @@ the demand is constant.
 from itertools import pairwise
 
 import numpy as np
-import pandas as pd
 import pytest
 
 from pipetransport.logremoval import (
@@ -31,6 +30,11 @@ LOG10_2 = 0.30102999566398120  # log10(2), correctly rounded to double precision
 # ============================================================================
 # residence_time_to_log_removal
 # ============================================================================
+
+
+def _stack(result):
+    """Stack a per-node result mapping back into rows, in the mapping's own (report) order."""
+    return np.stack(list(result.values()))
 
 
 def test_residence_time_to_log_removal_is_the_same_exponential_as_the_rate_constant():
@@ -59,13 +63,15 @@ def test_residence_time_to_log_removal_propagates_unconstrained_bins(network, sh
     demand = diurnal_demand(network, short_tedges)
     log10_decay_rate = 0.4
     # spinup=None leaves the earliest bins unconstrained, so the age array carries NaN.
-    age = residence_time_at_taps(
-        flow=demand,
-        tedges=short_tedges,
-        cout_tedges=short_tedges,
-        network=network,
-        report_nodes=["T1", "T4"],
-        spinup=None,
+    age = _stack(
+        residence_time_at_taps(
+            flow=demand,
+            tedges=short_tedges,
+            cout_tedges=short_tedges,
+            network=network,
+            report_nodes=["T1", "T4"],
+            spinup=None,
+        )
     )
 
     log_removal = residence_time_to_log_removal(residence_times=age, log10_decay_rate=log10_decay_rate)
@@ -249,14 +255,14 @@ def test_parallel_mean_is_bounded_by_the_streams_and_below_the_arithmetic_mean()
 def test_segment_decay_rate_without_a_wall_reaction_is_the_bulk_rate(network, single_pipe):
     rates = segment_decay_rate(network=network, bulk_decay_rate=0.42)
 
-    pd.testing.assert_index_equal(rates.index, network.segments.index)
-    np.testing.assert_allclose(rates.to_numpy(), np.full(len(network.segments), 0.42), rtol=0.0)
-    # No diameter is needed when nothing reacts at the wall, so a volume-only network works.
-    volume_only = segment_decay_rate(network=single_pipe, bulk_decay_rate=0.42)
-    pd.testing.assert_index_equal(volume_only.index, single_pipe.segments.index)
-    np.testing.assert_allclose(volume_only.to_numpy(), [0.42], rtol=0.0)
+    assert list(rates) == list(network.segments.index)
+    np.testing.assert_allclose(list(rates.values()), np.full(len(network.segments), 0.42), rtol=0.0)
     # The default is a conservative tracer.
-    np.testing.assert_allclose(segment_decay_rate(network=network).to_numpy(), 0.0, atol=0.0)
+    np.testing.assert_allclose(list(segment_decay_rate(network=network).values()), 0.0, atol=0.0)
+    # The helper exists for the wall term, so it asks for the diameter whether or not the wall
+    # rate happens to be zero: a bulk-only rate is one number that needs no helper at all.
+    with pytest.raises(ValueError, match="needs the segment diameter"):
+        segment_decay_rate(network=single_pipe, bulk_decay_rate=0.42)
 
 
 def test_segment_decay_rate_wall_term_scales_with_four_over_diameter(network):
@@ -267,11 +273,11 @@ def test_segment_decay_rate_wall_term_scales_with_four_over_diameter(network):
     # k = k_b + 4 k_w / D, hand-evaluated for the example diameters
     # [0.40, 0.30, 0.25, 0.15, 0.20, 0.15, 0.10] m: 4 * 0.02 / D = 0.08 / D.
     expected = np.array([0.5, 0.3 + 4 / 15, 0.62, 0.3 + 8 / 15, 0.7, 0.3 + 8 / 15, 1.1])
-    pd.testing.assert_index_equal(rates.index, network.segments.index)
-    np.testing.assert_allclose(rates.to_numpy(), expected, rtol=1e-14)
+    assert list(rates) == list(network.segments.index)
+    np.testing.assert_allclose(list(rates.values()), expected, rtol=1e-14)
     # The wall contribution is a pure surface-to-volume effect: (k - k_b) * D == 4 k_w.
     np.testing.assert_allclose(
-        (rates.to_numpy() - bulk_decay_rate) * network.segments["diameter"].to_numpy(),
+        (np.array(list(rates.values())) - bulk_decay_rate) * network.segments["diameter"].to_numpy(),
         4.0 * wall_decay_rate,
         rtol=1e-14,
     )
@@ -290,13 +296,13 @@ def test_segment_decay_rate_mass_transfer_limits_the_wall_term(network):
         mass_transfer_coefficient=0.5,
     )
 
-    assert np.all(limited.to_numpy() < no_limit.to_numpy())
-    assert np.all(limited.to_numpy() > bulk_decay_rate)
-    pd.testing.assert_index_equal(limited.index, network.segments.index)
+    assert all(limited[name] < no_limit[name] for name in limited)
+    assert all(rate > bulk_decay_rate for rate in limited.values())
+    assert list(limited) == list(network.segments.index)
     # Reaction and transport resistances add in series: 1 / (k - k_b) = R_h * (1/k_w + 1/k_f).
     hydraulic_radius = network.segments["diameter"].to_numpy() / 4.0
     resistance = hydraulic_radius * (1.0 / wall_decay_rate + 1.0 / 0.5)
-    np.testing.assert_allclose(limited.to_numpy() - bulk_decay_rate, 1.0 / resistance, rtol=1e-14)
+    np.testing.assert_allclose(np.array(list(limited.values())) - bulk_decay_rate, 1.0 / resistance, rtol=1e-14)
     # Hand value for the 400 mm trunk: 0.02 * 0.5 / (0.1 * 0.52) = 5 / 26.
     np.testing.assert_allclose(limited["Plant-A"], bulk_decay_rate + 5 / 26, rtol=1e-14)
 
@@ -307,13 +313,27 @@ def test_segment_decay_rate_mass_transfer_limits_the_wall_term(network):
             bulk_decay_rate=bulk_decay_rate,
             wall_decay_rate=wall_decay_rate,
             mass_transfer_coefficient=coefficient,
-        ).to_numpy()
+        )
         for coefficient in (0.5, 5.0, 50.0, 1e9)
     ]
     for slower, quicker in pairwise(faster):
-        assert np.all(quicker > slower)
-    assert np.all(faster[-1] < no_limit.to_numpy())
-    np.testing.assert_allclose(faster[-1], no_limit.to_numpy(), rtol=1e-9)
+        assert all(quicker[name] > slower[name] for name in quicker)
+    assert all(faster[-1][name] < no_limit[name] for name in no_limit)
+    np.testing.assert_allclose(list(faster[-1].values()), list(no_limit.values()), rtol=1e-9)
+
+    # And the not-limiting default is that limit exactly, not merely close to it: inf is the
+    # neutral element of the series sum rather than a large number standing in for one.
+    np.testing.assert_array_equal(
+        list(
+            segment_decay_rate(
+                network=network,
+                bulk_decay_rate=bulk_decay_rate,
+                wall_decay_rate=wall_decay_rate,
+                mass_transfer_coefficient=np.inf,
+            ).values()
+        ),
+        list(no_limit.values()),
+    )
 
 
 def test_segment_decay_rate_requires_a_diameter_for_a_wall_reaction(single_pipe):
@@ -336,14 +356,16 @@ def test_segment_decay_rate_drives_transport_to_the_closed_form_residual(network
     rates = segment_decay_rate(network=network, bulk_decay_rate=0.3, wall_decay_rate=0.02)
     nodes = ["T3", "T4"]
 
-    cout = source_to_endmember(
-        cin=np.ones(len(hourly_tedges) - 1),
-        flow=demand,
-        tedges=hourly_tedges,
-        cout_tedges=hourly_tedges,
-        network=network,
-        report_nodes=nodes,
-        decay_rate=rates,
+    cout = _stack(
+        source_to_endmember(
+            cin=np.ones(len(hourly_tedges) - 1),
+            flow=demand,
+            tedges=hourly_tedges,
+            cout_tedges=hourly_tedges,
+            network=network,
+            report_nodes=nodes,
+            decay_rate=rates,
+        )
     )
 
     # Constant demand freezes every segment travel time at V_e / Q_e, so the delivered
@@ -354,7 +376,7 @@ def test_segment_decay_rate_drives_transport_to_the_closed_form_residual(network
     expected = np.array([
         np.exp(
             -np.sum(
-                rates.to_numpy()[[row_of[s] for s in network.paths[node]]]
+                np.array([rates[s] for s in network.paths[node]])
                 * volume[[row_of[s] for s in network.paths[node]]]
                 / segment_flow[[row_of[s] for s in network.paths[node]]]
             )
@@ -372,16 +394,18 @@ def test_segment_decay_rate_drives_transport_to_the_closed_form_residual(network
     np.testing.assert_allclose(expected, [0.6614533737911086, 0.5435327458198652], rtol=1e-12)
 
     # The Series is aligned by segment name, not by position: reversing it changes nothing.
-    reversed_rates = rates.iloc[::-1]
+    reversed_rates = dict(reversed(rates.items()))
     np.testing.assert_allclose(
-        source_to_endmember(
-            cin=np.ones(len(hourly_tedges) - 1),
-            flow=demand,
-            tedges=hourly_tedges,
-            cout_tedges=hourly_tedges,
-            network=network,
-            report_nodes=nodes,
-            decay_rate=reversed_rates,
+        _stack(
+            source_to_endmember(
+                cin=np.ones(len(hourly_tedges) - 1),
+                flow=demand,
+                tedges=hourly_tedges,
+                cout_tedges=hourly_tedges,
+                network=network,
+                report_nodes=nodes,
+                decay_rate=reversed_rates,
+            )
         ),
         cout,
         rtol=0.0,

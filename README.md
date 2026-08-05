@@ -54,9 +54,9 @@ cout = source_to_endmember(
     tedges=tedges,
     cout_tedges=tedges,
     network=network,
-)  # (4 taps, 168 hours), same units as cin
+)  # one series per tap, same units as cin
 
-for tap, series in zip(network.endmembers, cout, strict=True):
+for tap, series in cout.items():
     peak = int(np.nanargmax(series))
     print(f"{tap}: peak {series[peak]:.2f} at {tedges[peak]}")
 ```
@@ -124,8 +124,12 @@ residual = source_to_endmember(
 )
 age = water_age(flow=demand, tedges=tedges, cout_tedges=tedges, network=network)  # days
 
-for tap, res, hours in zip(network.endmembers, residual, age * 24, strict=True):
-    print(f"{tap}: residual {np.nanmin(res):.2f}-{np.nanmax(res):.2f} mg/L, age up to {np.nanmax(hours):.1f} h")
+for tap, days in age.items():
+    res = residual[tap]
+    print(
+        f"{tap}: residual {np.nanmin(res):.2f}-{np.nanmax(res):.2f} mg/L, "
+        f"age up to {np.nanmax(days) * 24:.1f} h"
+    )
 ```
 
 ## Scope

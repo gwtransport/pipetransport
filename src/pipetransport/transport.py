@@ -57,10 +57,10 @@ def source_to_endmember(
     cout_tedges: pd.DatetimeIndex,
     network: PipeNetwork,
     report_nodes: list[str] | tuple[str, ...] | None = None,
-    decay_rate: float | pd.Series = 0.0,
-    retardation_factor: float = 1.0,
+    decay_rate: float | Mapping[str, float] = 0.0,
+    retardation_factor: float | Mapping[str, float] = 1.0,
     spinup: str | None = "constant",
-) -> npt.NDArray[np.floating]:
+) -> dict[str, npt.NDArray[np.floating]]:
     """Compute the delivered water quality at each reporting node from the produced quality.
 
     Parameters
@@ -82,15 +82,14 @@ def source_to_endmember(
     report_nodes : list of str or None, optional
         Nodes to report at, in output row order. Any node of the network is allowed -- a
         junction reports the quality passing through it. Defaults to ``network.endmembers``.
-    decay_rate : float or pandas.Series, optional
-        First-order decay rate [1/day]: a scalar shared by every segment, or a Series indexed
-        by segment name for a per-pipe rate (see
-        :func:`pipetransport.logremoval.segment_decay_rate`). Default 0.0, a conservative
-        tracer.
-    retardation_factor : float, optional
-        Multiplier on every segment volume, ``>= 1``. Values above 1 model a compound that
-        exchanges reversibly with the pipe wall and therefore travels slower than the water.
-        Default 1.0.
+    decay_rate : float or mapping, optional
+        First-order decay rate [1/day]: one value shared by every segment, or a mapping from
+        segment name to its own (see :func:`pipetransport.logremoval.segment_decay_rate`,
+        which returns exactly that). Default 0.0, a conservative tracer.
+    retardation_factor : float or mapping, optional
+        Multiplier on the segment volumes, ``>= 1``, shared or per segment. Values above 1
+        model a compound that exchanges reversibly with the pipe wall and therefore travels
+        slower than the water. Default 1.0.
     spinup : {"constant"} or None, optional
         ``"constant"`` (default) warm-starts the record by extending it backwards at the
         first observed demand and quality, so the earliest output bins carry a value instead
@@ -100,11 +99,13 @@ def source_to_endmember(
 
     Returns
     -------
-    numpy.ndarray
-        Delivered quality of shape ``(len(report_nodes), len(cout_tedges) - 1)``, in the units of
-        ``cin``. Each value is the flow-weighted average over its output bin. NaN marks bins
-        the record does not constrain: spin-up under ``spinup=None``, a bin extending past
-        the end of the flow record, or a bin during which the node draws no water.
+    dict of str to ndarray
+        Delivered quality keyed by reporting node, in ``report_nodes`` order, each a series
+        of ``len(cout_tedges) - 1`` values in the units of ``cin``. Each value is the
+        flow-weighted average over its output bin. NaN marks bins the record does not
+        constrain: spin-up under ``spinup=None``, a bin extending past the end of the flow
+        record, or a bin during which the node draws no water. The mapping is what
+        :func:`endmember_to_source` takes as ``cout``, so a round trip composes verbatim.
 
     Raises
     ------
@@ -148,9 +149,9 @@ def source_to_endmember(
     >>> cout = source_to_endmember(
     ...     cin=cin, flow=demand, tedges=tedges, cout_tedges=tedges, network=network
     ... )
-    >>> cout.shape
-    (4, 168)
-    >>> bool(np.nanmax(cout[0]) > 0.9)  # the pulse arrives at T1 nearly undiluted
+    >>> list(cout)
+    ['T1', 'T2', 'T3', 'T4']
+    >>> bool(np.nanmax(cout["T1"]) > 0.9)  # the pulse arrives at T1 nearly undiluted
     True
 
     Adding first-order decay turns the same call into a chlorine-residual model:
@@ -163,7 +164,7 @@ def source_to_endmember(
     ...     network=network,
     ...     decay_rate=0.5,
     ... )
-    >>> bool(np.all(residual[:, -1] < 1.0))
+    >>> bool(all(series[-1] < 1.0 for series in residual.values()))
     True
     """
     tedges = pd.DatetimeIndex(tedges)
@@ -171,7 +172,7 @@ def source_to_endmember(
     _validate_tedges(tedges, cin, tedges_name="tedges", values_name="cin")
     _validate_no_nan(cin, name="cin")
 
-    _, transfer, n_pad = network_transfer(
+    reported, transfer, n_pad = network_transfer(
         network=network,
         flow=flow,
         tedges=tedges,
@@ -186,7 +187,7 @@ def source_to_endmember(
 
     out = apply_banded(transfer, cin)
     out[~transfer.valid_out] = np.nan
-    return out
+    return dict(zip(reported, out, strict=True))
 
 
 def endmember_to_source(
@@ -196,8 +197,8 @@ def endmember_to_source(
     tedges: pd.DatetimeIndex,
     cout_tedges: pd.DatetimeIndex,
     network: PipeNetwork,
-    decay_rate: float | pd.Series = 0.0,
-    retardation_factor: float = 1.0,
+    decay_rate: float | Mapping[str, float] = 0.0,
+    retardation_factor: float | Mapping[str, float] = 1.0,
     regularization_strength: float = 1e-10,
     spinup: str | None = "constant",
 ) -> npt.NDArray[np.floating]:
@@ -227,10 +228,11 @@ def endmember_to_source(
         Time edges of the ``cout`` bins.
     network : PipeNetwork
         The distribution network.
-    decay_rate : float or pandas.Series, optional
-        First-order decay rate [1/day]; see :func:`source_to_endmember`. Default 0.0.
-    retardation_factor : float, optional
-        Multiplier on every segment volume, ``>= 1``. Default 1.0.
+    decay_rate : float or mapping, optional
+        First-order decay rate [1/day], shared or per segment; see
+        :func:`source_to_endmember`. Default 0.0.
+    retardation_factor : float or mapping, optional
+        Multiplier on the segment volumes, ``>= 1``, shared or per segment. Default 1.0.
     regularization_strength : float, optional
         Tikhonov parameter λ, strictly positive. Larger values trust the smooth reference
         more; smaller values trust the data more. A good starting value for noisy data is
@@ -286,7 +288,7 @@ def endmember_to_source(
     ...     report_nodes=["T1", "T4"],
     ... )
     >>> recovered = endmember_to_source(
-    ...     cout={"T1": measured[0], "T4": measured[1]},
+    ...     cout=measured,
     ...     flow=demand,
     ...     tedges=tedges,
     ...     cout_tedges=tedges,

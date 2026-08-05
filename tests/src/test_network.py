@@ -453,3 +453,41 @@ def test_zero_demand_is_allowed_and_propagates(two_branch, short_tedges, constan
     n_bins = len(short_tedges) - 1
     expected = np.stack([np.full(n_bins, 45.0), np.zeros(n_bins), np.full(n_bins, 45.0)])
     np.testing.assert_allclose(two_branch.segment_flow(flow=demand), expected, rtol=0.0, atol=0.0)
+
+
+def test_segments_accept_a_mapping_of_row_dicts_and_the_table_they_become():
+    """Two input forms, one validated artifact -- and the artifact is accepted back.
+
+    The mapping is the input form: each pipe's properties travel together, so there are no
+    parallel column lists to keep aligned. The DataFrame form is the one :attr:`segments`
+    exposes, which is what lets a table read from file, or a network being rebuilt from
+    another, pass straight in.
+    """
+    mapping = {
+        "Plant-A": {"from": "Plant", "to": "A", "volume": 300.0},
+        "A-T1": {"from": "A", "to": "T1", "volume": 40.0},
+    }
+    from_mapping = PipeNetwork(segments=mapping, source="Plant")
+    round_tripped = PipeNetwork(segments=from_mapping.segments, source="Plant")
+
+    assert from_mapping.nodes == round_tripped.nodes == ("Plant", "A", "T1")
+    pd.testing.assert_frame_equal(round_tripped.segments, from_mapping.segments)
+    # Insertion order is row order, which is what the doc promises about the derived table.
+    assert list(from_mapping.segments.index) == ["Plant-A", "A-T1"]
+
+
+def test_a_mapping_is_never_read_column_wise():
+    """The row-dict mapping must not go through ``pd.DataFrame(...)``, which transposes it.
+
+    ``pd.DataFrame`` reads a dict of dicts *column*-wise, so delegating to it would turn each
+    segment into a column and each property into a row -- silently, since the result is still
+    a DataFrame. The guard is that the segment names come back as the index.
+    """
+    built = PipeNetwork(segments={"only": {"from": "Plant", "to": "T1", "volume": 100.0}}, source="Plant")
+    assert list(built.segments.index) == ["only"]
+    assert {"from", "to", "volume"} <= set(built.segments.columns)
+
+
+def test_segments_rejects_anything_but_the_two_forms():
+    with pytest.raises(TypeError, match="mapping of segment name"):
+        PipeNetwork(segments=[{"from": "Plant", "to": "T1", "volume": 100.0}], source="Plant")

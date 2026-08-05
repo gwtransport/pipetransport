@@ -52,9 +52,9 @@ def source_to_endmember(
     tedges: pd.DatetimeIndex,
     network: PipeNetwork,
     report_nodes: list[str] | tuple[str, ...] | None = None,
-    retardation_factor: float = 1.0,
+    retardation_factor: float | Mapping[str, float] = 1.0,
     spinup: str | None = "constant",
-) -> npt.NDArray[np.floating]:
+) -> dict[str, npt.NDArray[np.floating]]:
     """Compute how long the water produced in each bin takes to reach each reporting node.
 
     The average over a ``tedges`` bin is weighted by the volume destined for that node, so
@@ -72,8 +72,8 @@ def source_to_endmember(
     report_nodes : list of str or None, optional
         Nodes to report at, in output row order. Any node is allowed; a junction reports the
         age of the water passing through it. Defaults to ``network.endmembers``.
-    retardation_factor : float, optional
-        Multiplier on every segment volume, ``>= 1``. Default 1.0.
+    retardation_factor : float or mapping, optional
+        Multiplier on the segment volumes, ``>= 1``, shared or per segment. Default 1.0.
     spinup : {"constant"} or None, optional
         ``"constant"`` (default) warm-starts the record by extending it backwards at the
         first observed demand, so the earliest bins carry a value instead of NaN. ``None``
@@ -81,9 +81,9 @@ def source_to_endmember(
 
     Returns
     -------
-    numpy.ndarray
-        Mean travel time [days] of shape ``(len(report_nodes), len(tedges) - 1)``. NaN marks
-        bins the record does not constrain.
+    dict of str to ndarray
+        Mean travel time [days] keyed by reporting node, in ``report_nodes`` order, each a
+        series of ``len(tedges) - 1`` values. NaN marks bins the record does not constrain.
 
     Raises
     ------
@@ -109,16 +109,16 @@ def source_to_endmember(
     >>> tedges = pd.date_range("2025-06-01", "2025-06-08", freq="h")
     >>> demand = example_demand(tedges=tedges, network=network)
     >>> lead = source_to_endmember(flow=demand, tedges=tedges, network=network)
-    >>> lead.shape
-    (4, 168)
+    >>> list(lead)
+    ['T1', 'T2', 'T3', 'T4']
 
     T4 sits at the end of a long, thin, low-demand branch, so its water takes longest:
 
-    >>> bool(np.nanmean(lead[3]) > np.nanmean(lead[0]))
+    >>> bool(np.nanmean(lead["T4"]) > np.nanmean(lead["T1"]))
     True
     """
     tedges = pd.DatetimeIndex(tedges)
-    _, transfer, n_pad = network_transfer(
+    reported, transfer, n_pad = network_transfer(
         network=network,
         flow=flow,
         tedges=tedges,
@@ -128,9 +128,9 @@ def source_to_endmember(
         retardation_factor=retardation_factor,
         spinup=spinup,
     )
-    # The warm-start prefix is an assumed history, not a result; drop it so the rows align
+    # The warm-start prefix is an assumed history, not a result; drop it so the series align
     # with the user-provided tedges.
-    return transfer.residence_time_in[:, n_pad:]
+    return dict(zip(reported, transfer.residence_time_in[:, n_pad:], strict=True))
 
 
 def endmember_to_source(
@@ -140,9 +140,9 @@ def endmember_to_source(
     cout_tedges: pd.DatetimeIndex,
     network: PipeNetwork,
     report_nodes: list[str] | tuple[str, ...] | None = None,
-    retardation_factor: float = 1.0,
+    retardation_factor: float | Mapping[str, float] = 1.0,
     spinup: str | None = "constant",
-) -> npt.NDArray[np.floating]:
+) -> dict[str, npt.NDArray[np.floating]]:
     """Compute how long ago the water delivered in each output bin left the source.
 
     The average over a ``cout_tedges`` bin is weighted by the node's own throughflow, which
@@ -162,8 +162,8 @@ def endmember_to_source(
     report_nodes : list of str or None, optional
         Nodes to report at, in output row order. Any node is allowed; a junction reports the
         age of the water passing through it. Defaults to ``network.endmembers``.
-    retardation_factor : float, optional
-        Multiplier on every segment volume, ``>= 1``. Default 1.0.
+    retardation_factor : float or mapping, optional
+        Multiplier on the segment volumes, ``>= 1``, shared or per segment. Default 1.0.
     spinup : {"constant"} or None, optional
         ``"constant"`` (default) warm-starts the record by extending it backwards at the
         first observed demand, so the earliest bins carry a value instead of NaN. ``None``
@@ -171,9 +171,9 @@ def endmember_to_source(
 
     Returns
     -------
-    numpy.ndarray
-        Mean age [days] of shape ``(len(report_nodes), len(cout_tedges) - 1)``. NaN marks
-        bins the record does not constrain.
+    dict of str to ndarray
+        Mean age [days] keyed by reporting node, in ``report_nodes`` order, each a series of
+        ``len(cout_tedges) - 1`` values. NaN marks bins the record does not constrain.
 
     Raises
     ------
@@ -209,15 +209,15 @@ def endmember_to_source(
     >>> age = endmember_to_source(
     ...     flow=demand, tedges=tedges, cout_tedges=tedges, network=network
     ... )
-    >>> age.shape
-    (4, 168)
+    >>> list(age)
+    ['T1', 'T2', 'T3', 'T4']
 
     T4 sits at the end of a long, thin, low-demand branch, so its water is the oldest:
 
-    >>> bool(np.nanmean(age[3]) > np.nanmean(age[0]))
+    >>> bool(np.nanmean(age["T4"]) > np.nanmean(age["T1"]))
     True
     """
-    _, transfer, _ = network_transfer(
+    reported, transfer, _ = network_transfer(
         network=network,
         flow=flow,
         tedges=pd.DatetimeIndex(tedges),
@@ -227,4 +227,4 @@ def endmember_to_source(
         retardation_factor=retardation_factor,
         spinup=spinup,
     )
-    return transfer.residence_time_out
+    return dict(zip(reported, transfer.residence_time_out, strict=True))

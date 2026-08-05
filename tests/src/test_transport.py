@@ -23,6 +23,11 @@ from pipetransport.utils import tedges_to_days
 _HOURS_PER_DAY = 24.0
 
 
+def _stack(result):
+    """Stack a per-node result mapping back into rows, in the mapping's own (report) order."""
+    return np.stack(list(result.values()))
+
+
 def _step_ramp(n_bins, step_bin, tau_hours):
     """Bin averages of a unit step delayed by ``tau_hours`` on unit-hour bins."""
     return np.clip(np.arange(1, n_bins + 1) - (step_bin + tau_hours), 0.0, 1.0)
@@ -80,8 +85,10 @@ def test_constant_source_is_delivered_unchanged(
     nodes = list(network.nodes[1:])  # every node but the source: junctions report too
     cin = np.full(len(hourly_tedges) - 1, 1.0)
 
-    cout = source_to_endmember(
-        cin=cin, flow=demand, tedges=hourly_tedges, cout_tedges=cout_tedges, network=network, report_nodes=nodes
+    cout = _stack(
+        source_to_endmember(
+            cin=cin, flow=demand, tedges=hourly_tedges, cout_tedges=cout_tedges, network=network, report_nodes=nodes
+        )
     )
 
     assert cout.shape == (len(nodes), len(cout_tedges) - 1)
@@ -106,7 +113,9 @@ def test_step_arrives_as_analytic_ramp_at_every_endmember(
     step_bin = 100
     cin = np.where(np.arange(n_bins) >= step_bin, 1.0, 0.0)
 
-    cout = source_to_endmember(cin=cin, flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network)
+    cout = _stack(
+        source_to_endmember(cin=cin, flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=network)
+    )
 
     assert not np.isnan(cout).any()
     for i, node in enumerate(network.endmembers):
@@ -123,8 +132,8 @@ def test_single_pipe_travel_time_is_volume_over_flow(single_pipe, hourly_tedges,
 
     step_bin = 72
     cin = np.where(np.arange(n_bins) >= step_bin, 1.0, 0.0)
-    cout = source_to_endmember(
-        cin=cin, flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=single_pipe
+    cout = _stack(
+        source_to_endmember(cin=cin, flow=demand, tedges=hourly_tedges, cout_tedges=hourly_tedges, network=single_pipe)
     )
 
     np.testing.assert_allclose(cout[0], _step_ramp(n_bins, step_bin, tau_days * _HOURS_PER_DAY), rtol=0.0, atol=1e-13)
@@ -141,13 +150,15 @@ def test_retardation_factor_scales_the_travel_time(two_branch, hourly_tedges, co
     assert analytic_travel_time(two_branch, demand, "T1") == pytest.approx(1.4, rel=0.0, abs=1e-14)
 
     for retardation in (1.0, 2.0, 2.5):
-        cout = source_to_endmember(
-            cin=cin,
-            flow=demand,
-            tedges=hourly_tedges,
-            cout_tedges=hourly_tedges,
-            network=two_branch,
-            retardation_factor=retardation,
+        cout = _stack(
+            source_to_endmember(
+                cin=cin,
+                flow=demand,
+                tedges=hourly_tedges,
+                cout_tedges=hourly_tedges,
+                network=two_branch,
+                retardation_factor=retardation,
+            )
         )
         for i, node in enumerate(two_branch.endmembers):
             tau_hours = retardation * analytic_travel_time(two_branch, demand, node) * _HOURS_PER_DAY
@@ -171,14 +182,16 @@ def test_decay_acts_over_the_retarded_transit_not_the_water_transit(
     n_bins = len(hourly_tedges) - 1
     decay_rate = 1.25
 
-    cout = source_to_endmember(
-        cin=np.ones(n_bins),
-        flow=demand,
-        tedges=hourly_tedges,
-        cout_tedges=hourly_tedges,
-        network=two_branch,
-        decay_rate=decay_rate,
-        retardation_factor=retardation,
+    cout = _stack(
+        source_to_endmember(
+            cin=np.ones(n_bins),
+            flow=demand,
+            tedges=hourly_tedges,
+            cout_tedges=hourly_tedges,
+            network=two_branch,
+            decay_rate=decay_rate,
+            retardation_factor=retardation,
+        )
     )
 
     for i, node in enumerate(two_branch.endmembers):
@@ -189,14 +202,16 @@ def test_decay_acts_over_the_retarded_transit_not_the_water_transit(
         # what passing decay_rate / R recovers.
         if retardation > 1.0:
             assert abs(expected - np.exp(-decay_rate * tau_water)) > 1e-3
-    scaled = source_to_endmember(
-        cin=np.ones(n_bins),
-        flow=demand,
-        tedges=hourly_tedges,
-        cout_tedges=hourly_tedges,
-        network=two_branch,
-        decay_rate=decay_rate / retardation,
-        retardation_factor=retardation,
+    scaled = _stack(
+        source_to_endmember(
+            cin=np.ones(n_bins),
+            flow=demand,
+            tedges=hourly_tedges,
+            cout_tedges=hourly_tedges,
+            network=two_branch,
+            decay_rate=decay_rate / retardation,
+            retardation_factor=retardation,
+        )
     )
     for i, node in enumerate(two_branch.endmembers):
         aqueous_only = np.exp(-decay_rate * analytic_travel_time(two_branch, demand, node))
@@ -225,9 +240,9 @@ def test_transport_is_linear_in_the_source_signal(network, hourly_tedges, diurna
         "spinup": None,
     }
 
-    out1 = source_to_endmember(cin=c1, **shared)
-    out2 = source_to_endmember(cin=c2, **shared)
-    combined = source_to_endmember(cin=a * c1 + b * c2, **shared)
+    out1 = _stack(source_to_endmember(cin=c1, **shared))
+    out2 = _stack(source_to_endmember(cin=c2, **shared))
+    combined = _stack(source_to_endmember(cin=a * c1 + b * c2, **shared))
 
     assert np.array_equal(np.isnan(combined), np.isnan(out1))
     np.testing.assert_allclose(combined, a * out1 + b * out2, rtol=0.0, atol=1e-13)
@@ -256,10 +271,10 @@ def test_batched_nodes_equal_single_node_calls(network, hourly_tedges, diurnal_d
         "spinup": None,
     }
 
-    batched = source_to_endmember(cin=cin, report_nodes=nodes, **shared)
+    batched = _stack(source_to_endmember(cin=cin, report_nodes=nodes, **shared))
 
     for i, node in enumerate(nodes):
-        single = source_to_endmember(cin=cin, report_nodes=[node], **shared)
+        single = _stack(source_to_endmember(cin=cin, report_nodes=[node], **shared))
         assert np.array_equal(np.isnan(batched[i]), np.isnan(single[0]))
         np.testing.assert_allclose(batched[i], single[0], rtol=1e-14, atol=0.0)
 
@@ -275,15 +290,17 @@ def test_decay_residual_matches_the_closed_form(network, hourly_tedges, constant
     demand = constant_demand(network, hourly_tedges)
     n_segments = len(network.segments)
     rates = np.full(n_segments, 0.3) if scalar else np.linspace(0.1, 0.9, n_segments)
-    decay_rate = 0.3 if scalar else pd.Series(rates, index=network.segments.index)
+    decay_rate = 0.3 if scalar else dict(zip(network.segments.index, rates, strict=True))
 
-    cout = source_to_endmember(
-        cin=np.ones(len(hourly_tedges) - 1),
-        flow=demand,
-        tedges=hourly_tedges,
-        cout_tedges=hourly_tedges,
-        network=network,
-        decay_rate=decay_rate,
+    cout = _stack(
+        source_to_endmember(
+            cin=np.ones(len(hourly_tedges) - 1),
+            flow=demand,
+            tedges=hourly_tedges,
+            cout_tedges=hourly_tedges,
+            network=network,
+            decay_rate=decay_rate,
+        )
     )
 
     volume = network.segments["volume"].to_numpy(dtype=float)
@@ -309,11 +326,9 @@ def test_zero_decay_reproduces_the_conservative_result(network, hourly_tedges, d
         "network": network,
     }
 
-    conservative = source_to_endmember(**shared)
-    zero_scalar = source_to_endmember(decay_rate=0.0, **shared)
-    zero_series = source_to_endmember(
-        decay_rate=pd.Series(np.zeros(len(network.segments)), index=network.segments.index), **shared
-    )
+    conservative = _stack(source_to_endmember(**shared))
+    zero_scalar = _stack(source_to_endmember(decay_rate=0.0, **shared))
+    zero_series = _stack(source_to_endmember(decay_rate=dict.fromkeys(network.segments.index, 0.0), **shared))
 
     np.testing.assert_allclose(zero_scalar, conservative, rtol=0.0, atol=1e-15)
     np.testing.assert_allclose(zero_series, conservative, rtol=0.0, atol=1e-15)
@@ -329,7 +344,7 @@ def _oracle_case(network, tedges):
     rng = np.random.default_rng(20250729)
     cin = rng.uniform(0.5, 2.5, len(tedges) - 1)
     cout_tedges = pd.date_range("2025-06-01 01:40", periods=17, freq="5h")
-    decay = pd.Series(np.linspace(0.05, 0.5, len(network.segments)), index=network.segments.index)
+    decay = dict(zip(network.segments.index, np.linspace(0.05, 0.5, len(network.segments)), strict=True))
     return cin, cout_tedges, decay
 
 
@@ -339,14 +354,16 @@ def test_matches_brute_force_oracle_without_decay(network, short_tedges, diurnal
     demand = diurnal_demand(network, short_tedges)
     cin, cout_tedges, _ = _oracle_case(network, short_tedges)
 
-    cout = source_to_endmember(
-        cin=cin,
-        flow=demand,
-        tedges=short_tedges,
-        cout_tedges=cout_tedges,
-        network=network,
-        report_nodes=[node],
-        spinup=None,
+    cout = _stack(
+        source_to_endmember(
+            cin=cin,
+            flow=demand,
+            tedges=short_tedges,
+            cout_tedges=cout_tedges,
+            network=network,
+            report_nodes=[node],
+            spinup=None,
+        )
     )
     reference = _oracle_path(network=network, demand=demand, node=node, tedges=short_tedges).cout(
         cin=cin, cout_tedges_days=tedges_to_days(cout_tedges, ref=short_tedges[0])
@@ -365,18 +382,20 @@ def test_matches_brute_force_oracle_with_per_segment_decay(network, short_tedges
     demand = diurnal_demand(network, short_tedges)
     cin, cout_tedges, decay = _oracle_case(network, short_tedges)
 
-    cout = source_to_endmember(
-        cin=cin,
-        flow=demand,
-        tedges=short_tedges,
-        cout_tedges=cout_tedges,
-        network=network,
-        report_nodes=[node],
-        decay_rate=decay,
-        spinup=None,
+    cout = _stack(
+        source_to_endmember(
+            cin=cin,
+            flow=demand,
+            tedges=short_tedges,
+            cout_tedges=cout_tedges,
+            network=network,
+            report_nodes=[node],
+            decay_rate=decay,
+            spinup=None,
+        )
     )
     reference = _oracle_path(
-        network=network, demand=demand, node=node, tedges=short_tedges, decay=decay.to_numpy()
+        network=network, demand=demand, node=node, tedges=short_tedges, decay=list(decay.values())
     ).cout(cin=cin, cout_tedges_days=tedges_to_days(cout_tedges, ref=short_tedges[0]))
 
     assert np.array_equal(np.isnan(cout[0]), np.isnan(reference))
@@ -417,8 +436,10 @@ def test_transport_composes_through_an_internal_node(network, hourly_tedges, diu
     mid_tedges = hourly_tedges[0] + pd.to_timedelta(nanoseconds[nanoseconds <= round(edges_days[-1] * 86_400e9)])
     assert len(mid_tedges) > len(hourly_tedges)  # the arrival edges genuinely refine the grid
 
-    quality_at_b = source_to_endmember(
-        cin=cin, flow=demand, tedges=hourly_tedges, cout_tedges=mid_tedges, network=network, report_nodes=["B"]
+    quality_at_b = _stack(
+        source_to_endmember(
+            cin=cin, flow=demand, tedges=hourly_tedges, cout_tedges=mid_tedges, network=network, report_nodes=["B"]
+        )
     )[0]
     assert not np.isnan(quality_at_b).any()
 
@@ -439,16 +460,20 @@ def test_transport_composes_through_an_internal_node(network, hourly_tedges, diu
     cout_tedges = pd.date_range(
         hourly_tedges[0] + pd.Timedelta(days=2), hourly_tedges[0] + pd.Timedelta(days=9), freq="2h"
     )
-    direct = source_to_endmember(
-        cin=cin, flow=demand, tedges=hourly_tedges, cout_tedges=cout_tedges, network=network, report_nodes=["T1"]
+    direct = _stack(
+        source_to_endmember(
+            cin=cin, flow=demand, tedges=hourly_tedges, cout_tedges=cout_tedges, network=network, report_nodes=["T1"]
+        )
     )[0]
-    composed = source_to_endmember(
-        cin=quality_at_b,
-        flow=sub_demand,
-        tedges=mid_tedges,
-        cout_tedges=cout_tedges,
-        network=sub_network,
-        report_nodes=["T1"],
+    composed = _stack(
+        source_to_endmember(
+            cin=quality_at_b,
+            flow=sub_demand,
+            tedges=mid_tedges,
+            cout_tedges=cout_tedges,
+            network=sub_network,
+            report_nodes=["T1"],
+        )
     )[0]
 
     assert not np.isnan(direct).any()
@@ -474,8 +499,8 @@ def test_spinup_none_marks_the_leading_bins_nan(network, hourly_tedges, constant
         "network": network,
     }
 
-    strict = source_to_endmember(spinup=None, **shared)
-    warm = source_to_endmember(spinup="constant", **shared)
+    strict = _stack(source_to_endmember(spinup=None, **shared))
+    warm = _stack(source_to_endmember(spinup="constant", **shared))
 
     assert not np.isnan(warm).any()
     for i, node in enumerate(network.endmembers):
@@ -512,8 +537,8 @@ def test_an_over_cap_endmember_does_not_suppress_the_warm_start_of_its_siblings(
         "network": network,
     }
 
-    solo = source_to_endmember(report_nodes=["T1"], **shared)
-    both = source_to_endmember(report_nodes=["T1", "T2"], **shared)
+    solo = _stack(source_to_endmember(report_nodes=["T1"], **shared))
+    both = _stack(source_to_endmember(report_nodes=["T1", "T2"], **shared))
 
     assert not np.isnan(solo[0]).any(), "T1 sits behind 340 m3 and is warm-startable on its own"
     assert np.isnan(both[1]).any(), "T2 sits behind 2e6 m3 and cannot be warm-started at all"
@@ -540,23 +565,27 @@ def test_warm_start_reproduces_a_genuinely_constant_history(network, hourly_tedg
     cin = np.random.default_rng(3).uniform(0.5, 2.5, len(hourly_tedges) - 1)
     cin[:head] = cin[head]
 
-    truth = source_to_endmember(
-        cin=cin,
-        flow=demand,
-        tedges=hourly_tedges,
-        cout_tedges=hourly_tedges,
-        network=network,
-        decay_rate=1.0,
-        spinup=None,
+    truth = _stack(
+        source_to_endmember(
+            cin=cin,
+            flow=demand,
+            tedges=hourly_tedges,
+            cout_tedges=hourly_tedges,
+            network=network,
+            decay_rate=1.0,
+            spinup=None,
+        )
     )[:, head:]
-    warm = source_to_endmember(
-        cin=cin[head:],
-        flow={name: series[head:] for name, series in demand.items()},
-        tedges=hourly_tedges[head:],
-        cout_tedges=hourly_tedges[head:],
-        network=network,
-        decay_rate=1.0,
-        spinup="constant",
+    warm = _stack(
+        source_to_endmember(
+            cin=cin[head:],
+            flow={name: series[head:] for name, series in demand.items()},
+            tedges=hourly_tedges[head:],
+            cout_tedges=hourly_tedges[head:],
+            network=network,
+            decay_rate=1.0,
+            spinup="constant",
+        )
     )
 
     assert not np.isnan(warm).any()
@@ -582,7 +611,7 @@ def test_round_trip_recovers_the_source_signal(network, hourly_tedges, diurnal_d
     decay_rate = {
         "none": 0.0,
         "scalar": 0.4,
-        "per_segment": pd.Series(np.linspace(0.1, 0.8, len(network.segments)), index=network.segments.index),
+        "per_segment": dict(zip(network.segments.index, np.linspace(0.1, 0.8, len(network.segments)), strict=True)),
     }[decay_kind]
     nodes = ["T1", "T4"]
     shared = {
@@ -593,7 +622,7 @@ def test_round_trip_recovers_the_source_signal(network, hourly_tedges, diurnal_d
         "decay_rate": decay_rate,
     }
 
-    measured = source_to_endmember(cin=cin, report_nodes=nodes, **shared)
+    measured = _stack(source_to_endmember(cin=cin, report_nodes=nodes, **shared))
     recovered = endmember_to_source(cout=_by_node(nodes, measured), **shared)
 
     interior = slice(24, -24)
@@ -625,11 +654,11 @@ def test_a_constant_source_under_decay_is_recovered_at_a_noise_working_lambda(ne
         "tedges": hourly_tedges,
         "cout_tedges": hourly_tedges,
         "network": network,
-        "decay_rate": pd.Series(np.linspace(0.1, 0.8, len(network.segments)), index=network.segments.index),
+        "decay_rate": dict(zip(network.segments.index, np.linspace(0.1, 0.8, len(network.segments)), strict=True)),
     }
     nodes = ["T1", "T4"]
 
-    measured = source_to_endmember(cin=cin, report_nodes=nodes, **shared)
+    measured = _stack(source_to_endmember(cin=cin, report_nodes=nodes, **shared))
     assert np.nanmean(measured) < 0.9 * constant, "the operator must actually attenuate, or the test is vacuous"
     recovered = endmember_to_source(cout=_by_node(nodes, measured), regularization_strength=1e-2, **shared)
 
@@ -656,7 +685,7 @@ def test_a_production_spell_comes_back_nan_not_zero(single_pipe_35):
     cin = _reverse_signal(n_bins)
     shared = {"flow": demand, "tedges": tedges, "cout_tedges": tedges, "network": single_pipe_35}
 
-    cout = source_to_endmember(cin=cin, **shared)
+    cout = _stack(source_to_endmember(cin=cin, **shared))
     recovered = endmember_to_source(cout=_by_node(shared["network"].endmembers, cout), **shared)
 
     # The spell is the only thing lost besides the tail the record ends before delivering:
@@ -694,7 +723,7 @@ def test_a_branch_closed_at_the_junction_leaves_the_crossing_bins_unconstrained(
         "network": network,
     }
 
-    cout = source_to_endmember(cin=cin, report_nodes=["T2"], **shared)
+    cout = _stack(source_to_endmember(cin=cin, report_nodes=["T2"], **shared))
     recovered = endmember_to_source(cout=_by_node(["T2"], cout), **shared)
 
     # Which source bins those are is settled away from the operator, with the oracle's root
@@ -753,7 +782,7 @@ def test_round_trip_tolerates_a_measurement_outage(network, hourly_tedges, diurn
         "network": network,
     }
 
-    measured = source_to_endmember(cin=cin, report_nodes=nodes, **shared)
+    measured = _stack(source_to_endmember(cin=cin, report_nodes=nodes, **shared))
     edges_days = tedges_to_days(hourly_tedges)
     outage_lo, outage_hi = 4.0, 5.5  # days since the record start
     blanked = (edges_days[:-1] >= outage_lo) & (edges_days[1:] <= outage_hi)
@@ -796,28 +825,32 @@ def test_source_to_endmember_rejects_invalid_input(network, hourly_tedges, const
     shared = {"flow": demand, "tedges": hourly_tedges, "cout_tedges": hourly_tedges, "network": network}
 
     with pytest.raises(ValueError, match=r"tedges must have one more element than cin"):
-        source_to_endmember(cin=np.ones(n_bins - 1), **shared)
+        _stack(source_to_endmember(cin=np.ones(n_bins - 1), **shared))
     with pytest.raises(ValueError, match=r"cin contains NaN values"):
-        source_to_endmember(cin=np.where(np.arange(n_bins) == 5, np.nan, 1.0), **shared)
+        _stack(source_to_endmember(cin=np.where(np.arange(n_bins) == 5, np.nan, 1.0), **shared))
     with pytest.raises(ValueError, match=r"tedges must be strictly increasing"):
-        source_to_endmember(
-            cin=np.ones(n_bins),
-            flow=demand,
-            tedges=hourly_tedges[::-1],
-            cout_tedges=hourly_tedges,
-            network=network,
+        _stack(
+            source_to_endmember(
+                cin=np.ones(n_bins),
+                flow=demand,
+                tedges=hourly_tedges[::-1],
+                cout_tedges=hourly_tedges,
+                network=network,
+            )
         )
     with pytest.raises(ValueError, match=r"unknown node\(s\): \['Reservoir'\]"):
-        source_to_endmember(cin=np.ones(n_bins), report_nodes=["T1", "Reservoir"], **shared)
+        _stack(source_to_endmember(cin=np.ones(n_bins), report_nodes=["T1", "Reservoir"], **shared))
     with pytest.raises(ValueError, match=r"retardation_factor must be >= 1\.0"):
-        source_to_endmember(cin=np.ones(n_bins), retardation_factor=0.5, **shared)
+        _stack(source_to_endmember(cin=np.ones(n_bins), retardation_factor=0.5, **shared))
     with pytest.raises(ValueError, match=r"decay_rate must be non-negative"):
-        source_to_endmember(cin=np.ones(n_bins), decay_rate=-0.1, **shared)
+        _stack(source_to_endmember(cin=np.ones(n_bins), decay_rate=-0.1, **shared))
     with pytest.raises(ValueError, match=r"decay_rate is missing segment\(s\): \['C-T4'\]"):
-        source_to_endmember(
-            cin=np.ones(n_bins),
-            decay_rate=pd.Series(np.full(6, 0.1), index=network.segments.index[:6]),
-            **shared,
+        _stack(
+            source_to_endmember(
+                cin=np.ones(n_bins),
+                decay_rate=dict.fromkeys(network.segments.index[:6], 0.1),
+                **shared,
+            )
         )
 
 
@@ -826,7 +859,7 @@ def test_endmember_to_source_rejects_invalid_input(network, hourly_tedges, const
     demand = constant_demand(network, hourly_tedges)
     n_bins = len(hourly_tedges) - 1
     shared = {"flow": demand, "tedges": hourly_tedges, "cout_tedges": hourly_tedges, "network": network}
-    measured = source_to_endmember(cin=np.ones(n_bins), **shared)
+    measured = _stack(source_to_endmember(cin=np.ones(n_bins), **shared))
 
     with pytest.raises(ValueError, match=r"unknown node\(s\) in cout: \['Reservoir'\]"):
         endmember_to_source(
@@ -841,3 +874,71 @@ def test_endmember_to_source_rejects_invalid_input(network, hourly_tedges, const
             endmember_to_source(
                 cout=_by_node(shared["network"].endmembers, measured), regularization_strength=strength, **shared
             )
+
+
+def test_the_result_is_keyed_by_report_node_in_the_requested_order(network, hourly_tedges, constant_demand):
+    """The forward result names its rows, and a reverse call consumes it verbatim.
+
+    Positional rows were the one alignment rule a caller could get wrong silently, and the
+    round trip is where it would have bitten: the reverse takes its observation set from the
+    keys, so handing it the forward result unchanged has to be the whole story.
+    """
+    demand = constant_demand(network, hourly_tedges)
+    cin = _reverse_signal(len(hourly_tedges) - 1)
+    shared = {"flow": demand, "tedges": hourly_tedges, "cout_tedges": hourly_tedges, "network": network}
+    nodes = ["T4", "B", "T1"]  # deliberately not the order the network lists them in
+
+    measured = source_to_endmember(cin=cin, report_nodes=nodes, **shared)
+    assert list(measured) == nodes
+    assert all(series.shape == (len(hourly_tedges) - 1,) for series in measured.values())
+
+    # The mapping goes straight back in, and the answer does not depend on the key order.
+    recovered = endmember_to_source(cout=measured, **shared)
+    shuffled = endmember_to_source(cout={node: measured[node] for node in reversed(nodes)}, **shared)
+    np.testing.assert_array_equal(shuffled, recovered)
+    interior = slice(24, -24)
+    np.testing.assert_allclose(recovered[interior], cin[interior], rtol=0.0, atol=1e-9)
+
+
+def test_a_per_segment_constant_is_a_scalar_or_a_mapping(network, hourly_tedges, constant_demand):
+    """Scalar and mapping forms agree exactly where they describe the same physics."""
+    demand = constant_demand(network, hourly_tedges)
+    cin = np.ones(len(hourly_tedges) - 1)
+    shared = {"flow": demand, "tedges": hourly_tedges, "cout_tedges": hourly_tedges, "network": network}
+
+    for name, value in (("decay_rate", 0.4), ("retardation_factor", 2.5)):
+        scalar = _stack(source_to_endmember(cin=cin, **{name: value}, **shared))
+        spelled_out = _stack(
+            source_to_endmember(cin=cin, **{name: dict.fromkeys(network.segments.index, value)}, **shared)
+        )
+        np.testing.assert_array_equal(spelled_out, scalar, err_msg=name)
+
+    # And a mapping that misses or invents a segment is an error, not a silent default.
+    with pytest.raises(ValueError, match=r"decay_rate is missing segment\(s\)"):
+        source_to_endmember(cin=cin, decay_rate={"Plant-A": 0.1}, **shared)
+    with pytest.raises(ValueError, match=r"retardation_factor holds key\(s\) that are not segments"):
+        source_to_endmember(
+            cin=cin, retardation_factor={**dict.fromkeys(network.segments.index, 1.0), "T9": 1.0}, **shared
+        )
+
+
+def test_a_per_segment_retardation_factor_retards_only_its_own_segment(
+    two_branch, hourly_tedges, constant_demand, analytic_travel_time
+):
+    """Retarding one pipe moves the paths through it and leaves the sibling alone."""
+    demand = constant_demand(two_branch, hourly_tedges)
+    n_bins = len(hourly_tedges) - 1
+    step_bin = 40
+    cin = np.where(np.arange(n_bins) >= step_bin, 1.0, 0.0)
+    shared = {"flow": demand, "tedges": hourly_tedges, "cout_tedges": hourly_tedges, "network": two_branch}
+
+    plain = source_to_endmember(cin=cin, **shared)
+    retarded = source_to_endmember(cin=cin, retardation_factor={"Plant-A": 1.0, "A-T1": 3.0, "A-T2": 1.0}, **shared)
+
+    # T2's path holds neither retarded pipe, so its answer moves only by the round-off of a
+    # longer warm-start prefix -- the one thing retarding a sibling does reach.
+    np.testing.assert_allclose(retarded["T2"], plain["T2"], rtol=0.0, atol=1e-11)
+    # A-T1 holds 40 m3 at a third of the 300 m3/day production, so tripling it adds
+    # 2 * 40 * 3 / 300 = 0.8 day to T1's travel time and nothing to T2's.
+    tau_hours = (analytic_travel_time(two_branch, demand, "T1") + 0.8) * _HOURS_PER_DAY
+    np.testing.assert_allclose(retarded["T1"], _step_ramp(n_bins, step_bin, tau_hours), rtol=0.0, atol=1e-12)

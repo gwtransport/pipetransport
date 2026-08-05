@@ -64,11 +64,12 @@ See the ./LICENSE file or go to https://github.com/gwtransport/pipetransport/blo
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import numpy as np
 import numpy.typing as npt
-import pandas as pd
 
-from pipetransport._validation import _validate_non_negative, _validate_positive
+from pipetransport._validation import _per_segment, _validate_non_negative, _validate_positive
 from pipetransport.network import PipeNetwork  # noqa: TC001 -- runtime dependency of the signature
 
 
@@ -289,9 +290,9 @@ def segment_decay_rate(
     *,
     network: PipeNetwork,
     bulk_decay_rate: float = 0.0,
-    wall_decay_rate: float = 0.0,
-    mass_transfer_coefficient: float | None = None,
-) -> pd.Series:
+    wall_decay_rate: float | Mapping[str, float] = 0.0,
+    mass_transfer_coefficient: float | Mapping[str, float] = np.inf,
+) -> dict[str, float]:
     """Per-segment first-order decay rate from bulk and wall reaction.
 
     Combines a bulk rate with a wall rate scaled by the surface-to-volume ratio of each pipe
@@ -299,39 +300,47 @@ def segment_decay_rate(
 
         ``k = k_b + k_w * k_f / (R_h * (k_w + k_f))``  with ``R_h = D / 4``
 
-    Leaving ``mass_transfer_coefficient`` at ``None`` takes the limit of fast mass transfer,
-    ``k = k_b + 4 * k_w / D``, which is the wall-reaction-controlled case and an upper bound
-    on the wall contribution.
+    Leaving ``mass_transfer_coefficient`` at its default ``inf`` takes the limit of fast mass
+    transfer, ``k = k_b + 4 * k_w / D``, which is the wall-reaction-controlled case and an
+    upper bound on the wall contribution. It needs no branch: written as
+    ``k_w / (R_h (k_w/k_f + 1))`` the limit falls out of ``k_w / inf`` being exactly zero.
+
+    This helper exists for the *wall* term, so it needs the pipe diameter. A bulk-only rate is
+    one number that goes straight to ``decay_rate`` without coming through here.
 
     Parameters
     ----------
     network : PipeNetwork
         Network whose segments carry a ``"diameter"`` column [m].
     bulk_decay_rate : float, optional
-        Bulk decay rate k_b [1/day], non-negative. Default 0.0.
-    wall_decay_rate : float, optional
-        Wall reaction rate constant k_w [m/day], non-negative. Default 0.0.
-    mass_transfer_coefficient : float or None, optional
-        Mass transfer coefficient k_f [m/day] between bulk and wall, strictly positive.
-        ``None`` (default) assumes mass transfer is not limiting. It depends on velocity, so
-        pass a value representative of the operating range rather than a per-time-step one.
+        Bulk decay rate k_b [1/day], non-negative. A property of the water rather than of a
+        pipe, so it is one number. Default 0.0.
+    wall_decay_rate : float or mapping, optional
+        Wall reaction rate constant k_w [m/day], non-negative, shared or per segment (pipe
+        materials and their biofilms differ across one network). Default 0.0.
+    mass_transfer_coefficient : float or mapping, optional
+        Mass transfer coefficient k_f [m/day] between bulk and wall, strictly positive,
+        shared or per segment. Default ``inf``: mass transfer not limiting. It depends on
+        velocity, so pass a value representative of the operating range rather than a
+        per-time-step one.
 
     Returns
     -------
-    pandas.Series
-        Decay rate [1/day] indexed by segment name, ready to pass as ``decay_rate`` to
+    dict of str to float
+        Decay rate [1/day] keyed by segment name, ready to pass as ``decay_rate`` to
         :func:`pipetransport.transport.source_to_endmember`.
 
     Raises
     ------
     ValueError
-        If the network was built from ``volume`` alone (no ``"diameter"`` column) while a
-        wall rate is requested, if either rate is negative, or if
-        ``mass_transfer_coefficient`` is not strictly positive.
+        If the network was built from ``volume`` alone (no ``"diameter"`` column), if a rate
+        is negative, if a mapping misses a segment or names one the network does not have, or
+        if a mass transfer coefficient is not strictly positive.
 
     See Also
     --------
-    pipetransport.transport.source_to_endmember : Consumes the returned Series.
+    pipetransport.transport.source_to_endmember : Consumes the returned mapping.
+    pipetransport.heat.segment_heat_rate : The heat analogue of this helper.
 
     Examples
     --------
@@ -343,24 +352,22 @@ def segment_decay_rate(
     >>> rates = segment_decay_rate(
     ...     network=network, bulk_decay_rate=0.3, wall_decay_rate=0.02
     ... )
-    >>> float(rates["Plant-A"].round(3)), float(rates["C-T4"].round(3))
+    >>> round(rates["Plant-A"], 3), round(rates["C-T4"], 3)
     (0.5, 1.1)
     """
-    _validate_non_negative(bulk_decay_rate, name="bulk_decay_rate")
-    _validate_non_negative(wall_decay_rate, name="wall_decay_rate")
-    if wall_decay_rate == 0.0:
-        return pd.Series(bulk_decay_rate, index=network.segments.index, dtype=float, name="decay_rate")
     if "diameter" not in network.segments.columns:
         msg = "a wall reaction needs the segment diameter; build the network from length and diameter"
         raise ValueError(msg)
+    index = network.segments.index
+    _validate_non_negative(bulk_decay_rate, name="bulk_decay_rate")
+    k_wall = _per_segment(wall_decay_rate, index, name="wall_decay_rate")
+    _validate_non_negative(k_wall, name="wall_decay_rate")
+    k_film = _per_segment(mass_transfer_coefficient, index, name="mass_transfer_coefficient")
+    if not np.all((k_film > 0.0) | np.isposinf(k_film)):
+        msg = "mass_transfer_coefficient must be positive (inf is the not-limiting limit)"
+        raise ValueError(msg)
     hydraulic_radius = network.segments["diameter"].to_numpy(dtype=float) / 4.0
-    if mass_transfer_coefficient is None:
-        wall = wall_decay_rate / hydraulic_radius
-    else:
-        _validate_positive(mass_transfer_coefficient, name="mass_transfer_coefficient")
-        wall = (
-            wall_decay_rate
-            * mass_transfer_coefficient
-            / (hydraulic_radius * (wall_decay_rate + mass_transfer_coefficient))
-        )
-    return pd.Series(bulk_decay_rate + wall, index=network.segments.index, name="decay_rate")
+    # ``k_w / inf`` is exactly 0.0, so the fast-transfer limit needs no branch, and a zero
+    # wall rate gives exactly zero however fast the transfer.
+    wall = k_wall / (hydraulic_radius * (k_wall / k_film + 1.0))
+    return {str(name): float(rate) for name, rate in zip(index, bulk_decay_rate + wall, strict=True)}

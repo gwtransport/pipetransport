@@ -137,11 +137,12 @@ Forward transport, water age and chlorine residual for the example network, in o
    # Log removal at the bulk rate alone: a diagnostic reading of the age, not the residual, which
    # carries the wall term too and comes from the transport call above.
    mu = decay_rate_to_log10_decay_rate(0.3)
-   credit = residence_time_to_log_removal(residence_times=age, log10_decay_rate=mu)
-   for node, res, hours, log_removal in zip(network.endmembers, residual, age * 24.0, credit):
+   for node, hours in age.items():
+       credit = residence_time_to_log_removal(residence_times=hours, log10_decay_rate=mu)
        print(
-           f"{node}: age {np.nanmean(hours):5.2f} h, residual {np.nanmin(res):.3f} mg/L, "
-           f"bulk credit {np.nanmean(log_removal):.3f} log"
+           f"{node}: age {np.nanmean(hours) * 24:5.2f} h, "
+           f"residual {np.nanmin(residual[node]):.3f} mg/L, "
+           f"bulk credit {np.nanmean(credit):.3f} log"
        )
 
    # Every row of the operator sums to 1 without decay: a constant input is delivered unchanged.
@@ -149,7 +150,7 @@ Forward transport, water age and chlorine residual for the example network, in o
        cin=np.ones(len(tedges) - 1), flow=demand, tedges=tedges,
        cout_tedges=tedges, network=network,
    )
-   np.testing.assert_allclose(conservative, 1.0, rtol=0.0, atol=1e-12)
+   np.testing.assert_allclose(list(conservative.values()), 1.0, rtol=0.0, atol=1e-12)
 
 Where to read next
 ------------------

@@ -143,7 +143,7 @@ and must arrive within the interval the map sends that bin to, carrying its wate
    from pipetransport.transport import source_to_endmember
    from pipetransport.utils import cumulative_flow_volume
 
-   segments = pd.DataFrame({"from": ["Plant"], "to": ["T1"], "volume": [100.0]}, index=["Plant-T1"])
+   segments = {"Plant-T1": {"from": "Plant", "to": "T1", "volume": 100.0}}
    network = PipeNetwork(segments=segments, source="Plant")
 
    tedges = pd.date_range("2025-06-01", periods=73, freq="h")
@@ -160,7 +160,7 @@ and must arrive within the interval the map sends that bin to, carrying its wate
    cin[30] = 1.0
    cout = source_to_endmember(
        cin=cin, flow={"T1": demand}, tedges=tedges, cout_tedges=tedges, network=network
-   )[0]
+   )["T1"]
    expected = np.arange(int(np.floor(arrival[30] * 24)), int(np.ceil(arrival[31] * 24)))
    np.testing.assert_array_equal(np.flatnonzero(cout > 0.0), expected)
 
@@ -236,8 +236,8 @@ throughflow-weighted mean, and the package reproduces it exactly:
    cin = 1.0 + 0.3 * np.sin(2 * np.pi * np.arange(len(tedges) - 1) / 17.0)
 
    kwargs = {"cin": cin, "flow": demand, "tedges": tedges, "network": network, "report_nodes": ["T4"]}
-   hourly = source_to_endmember(cout_tedges=tedges, **kwargs)[0]
-   six_hourly = source_to_endmember(cout_tedges=tedges[::6], **kwargs)[0]
+   hourly = source_to_endmember(cout_tedges=tedges, **kwargs)["T4"]
+   six_hourly = source_to_endmember(cout_tedges=tedges[::6], **kwargs)["T4"]
 
    # Weight of each hourly bin = the water T4 draws in it = the width of its label interval.
    volume = (network.node_flow(flow=demand, nodes=["T4"])[0] / 24.0).reshape(-1, 6)
@@ -272,6 +272,35 @@ doing it are not equally safe:
   configuration --- half a per cent of the plant-to-soil contrast.
 
 When resolutions differ, refine everything to the finest grid; never coarsen to the coarsest.
+
+Where pandas is, and is not
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+pandas enters the interface in one place: ``pd.DatetimeIndex`` defines time edges. Everything else
+going in is arrays and plain mappings. Named collections -- segments by name, demand by endmember,
+surface forcing by cover class, observations by node, per-segment constants by segment -- are
+mappings, and every series in them is a bare array, positional on its grid. The package never reads
+an index off a value container, so there is nothing to silently misalign.
+
+One echo is deliberate: wherever the package hands you a validated artifact, it takes that artifact
+back. The network constructors accept the ``DataFrame`` that :attr:`~pipetransport.network.PipeNetwork.segments`
+exposes, so a table read from file or a network being upgraded passes straight in, just as the flow
+methods accept the array they themselves coerced. Nothing further is: a raw
+``pd.DataFrame(...)`` of a segment mapping would come back transposed, which is exactly the class of
+silent misread the rest of this section exists to remove.
+
+Coming back out, results follow the same naming rule -- exchange and decay rates by segment,
+delivered series by node -- so a reverse call consumes a forward result verbatim. The one derived
+table handed back as pandas is ``network.segments``: the validated form of the mapping the network
+was built from, with the volume guaranteed and the defaults filled, kept in a DataFrame because that
+is what it is convenient to read vectorized.
+
+What is a column and what is an argument: the segment mapping carries properties of the physical
+network -- geometry, burial, wall, soil -- of which there is one truth per network, validated when
+the network is built. Call arguments carry properties of the scenario -- the solute's decay and
+retardation, the demand, the forcing -- of which one network sees many; per-segment scenario
+constants are a scalar or a mapping by segment name. That is why ``kappa_soil`` is a column of a
+:class:`~pipetransport.heat.HeatNetwork` while ``decay_rate`` is an argument of the transport pair.
 
 .. _concept-effective-volume:
 
@@ -355,18 +384,19 @@ of age.
    row_of = {name: i for i, name in enumerate(network.segments.index)}
 
    age = water_age(flow=demand, tedges=tedges, cout_tedges=tedges, network=network)  # days
-   for i, node in enumerate(network.endmembers):
+   for node, series in age.items():
        rows = [row_of[segment] for segment in network.paths[node]]
        effective = np.sum(volume[rows] / fraction[rows])
-       np.testing.assert_allclose(age[i, -1], effective / production, rtol=1e-12)
+       np.testing.assert_allclose(series[-1], effective / production, rtol=1e-12)
        print(f"{node}: path holds {volume[rows].sum():6.1f} m3, effective {effective:6.1f} m3, "
-             f"age {age[i, -1] * 24:5.2f} h")
+             f"age {series[-1] * 24:5.2f} h")
 
    # Mass conservation ties the two together: flow-weighting the effective volumes over the
    # endmembers returns the total network water volume, so the mean age of all delivered water
    # is the network turnover time, V_total / Q_0.
    share = np.array([demand[name][0] for name in network.endmembers]) / production
-   np.testing.assert_allclose(share @ age[:, -1], network.segments["volume"].sum() / production)
+   last = np.array([age[name][-1] for name in network.endmembers])
+   np.testing.assert_allclose(share @ last, network.segments["volume"].sum() / production)
 
 In the example network T4's path holds *less* water than T1's (330 m³ against 371 m³) yet its
 effective volume is far larger (683 m³ against 440 m³), and its water is delivered at 20.5 h instead
@@ -434,9 +464,9 @@ variable age:
    print(f"production swings {production.min():.0f}-{production.max():.0f} m3/day")
    print(f"T4's own demand swings {demand['T4'].min():.0f}-{demand['T4'].max():.0f} m3/day")
 
-   age_hours = water_age(flow=demand, tedges=tedges, cout_tedges=tedges, network=network) * 24.0
-   for node, series in zip(network.endmembers, age_hours):
-       print(f"{node}: age {np.nanmin(series):5.2f}-{np.nanmax(series):5.2f} h")
+   age = water_age(flow=demand, tedges=tedges, cout_tedges=tedges, network=network)
+   for node, series in age.items():
+       print(f"{node}: age {np.nanmin(series) * 24:5.2f}-{np.nanmax(series) * 24:5.2f} h")
 
 In the example network the production varies by about :math:`\pm 3\,\%` while T4's own demand varies
 by :math:`\pm 70\,\%`; T4's age swings from 18.0 h to 25.2 h, whereas T1, on a branch carrying three
@@ -499,7 +529,7 @@ transport operator carries a per-segment rate rather than one rate for the whole
 
    network = example_network()
    tedges = pd.date_range("2025-06-01", periods=49, freq="h")
-   demand = np.array([[240.0], [360.0], [120.0], [80.0]]) * np.ones(48)
+   demand = {name: np.full(48, rate) for name, rate in zip(network.endmembers, (240.0, 360.0, 120.0, 80.0))}
 
    # k = 0.3 + 4 * 0.02 / D: 0.5 /day in the 400 mm trunk, 1.1 /day in the 100 mm branch.
    decay = segment_decay_rate(network=network, bulk_decay_rate=0.3, wall_decay_rate=0.02)
@@ -512,11 +542,11 @@ transport operator carries a per-segment rate rather than one rate for the whole
    flow = network.segment_flow(flow=demand)[:, 0]
    volume = network.segments["volume"].to_numpy()
    row_of = {name: i for i, name in enumerate(network.segments.index)}
-   for i, node in enumerate(network.endmembers):
+   for node, series in residual.items():
        rows = [row_of[segment] for segment in network.paths[node]]
-       phi = np.sum(decay.to_numpy()[rows] * volume[rows] / flow[rows])
-       np.testing.assert_allclose(residual[i, -1], np.exp(-phi), rtol=1e-13)
-       print(f"{node}: residual {residual[i, -1]:.3f} of what left the plant")
+       phi = np.sum([decay[segment] for segment in network.paths[node]] * volume[rows] / flow[rows])
+       np.testing.assert_allclose(series[-1], np.exp(-phi), rtol=1e-13)
+       print(f"{node}: residual {series[-1]:.3f} of what left the plant")
 
 Age is a diagnostic, not a shortcut
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -599,19 +629,12 @@ pay off:
 
    from pipetransport.heat import HeatNetwork, segment_heat_rate, source_to_endmember
 
-   segments = pd.DataFrame(
-       {
-           "from": ["Plant"],
-           "to": ["T1"],
-           "length": [1000.0],
-           "diameter": [0.1],
-           "cover": ["grass"],
-           "alpha": [0.05],
-           "kappa_soil": [0.025],
-           "eta": [0.41],
-       },
-       index=["Plant-T1"],
-   )
+   segments = {
+       "Plant-T1": {
+           "from": "Plant", "to": "T1", "length": 1000.0, "diameter": 0.1,
+           "cover": "grass", "alpha": 0.05, "kappa_soil": 0.025, "eta": 0.41,
+       }
+   }
    network = HeatNetwork(segments=segments, source="Plant")
 
    tedges = pd.date_range("2025-01-01", periods=120 * 24 + 1, freq="h")
@@ -624,16 +647,16 @@ pay off:
        surface_temperature={"grass": np.full(n_bins, 20.0)},
    )
 
-   two_way = source_to_endmember(**shared)
-   one_way = source_to_endmember(**shared, max_sweeps=1)
+   two_way = source_to_endmember(**shared)["T1"]
+   one_way = source_to_endmember(**shared, max_sweeps=1)["T1"]
 
    # A fully developed halo is the analytic steady buried-pipe law, which is what one-way assumes.
-   rate = float(segment_heat_rate(network=network)["Plant-T1"])
+   rate = segment_heat_rate(network=network)["Plant-T1"]
    steady = 20.0 + (8.0 - 20.0) * np.exp(-rate * transit_days)
-   np.testing.assert_allclose(one_way[0, -1], steady, rtol=1e-9)
+   np.testing.assert_allclose(one_way[-1], steady, rtol=1e-9)
 
    for day in (1, 7, 30, 119):
-       correction = two_way[0, day * 24] - one_way[0, day * 24]
+       correction = two_way[day * 24] - one_way[day * 24]
        print(f"day {day:3d}: halo correction {correction:+.2f} K")
 
 Cold water into warm soil takes up 2.42 K more than the one-way model allows on the first day,
@@ -682,22 +705,24 @@ sampling points together pin down more than the sum of what each does alone.
    from pipetransport.network import PipeNetwork
    from pipetransport.transport import source_to_endmember
 
-   segments = pd.DataFrame(
-       {"from": ["Plant", "A", "A"], "to": ["A", "T1", "T2"], "volume": [300.0, 40.0, 60.0]},
-       index=["Plant-A", "A-T1", "A-T2"],
-   )
+   segments = {
+       "Plant-A": {"from": "Plant", "to": "A", "volume": 300.0},
+       "A-T1": {"from": "A", "to": "T1", "volume": 40.0},
+       "A-T2": {"from": "A", "to": "T2", "volume": 60.0},
+   }
    network = PipeNetwork(segments=segments, source="Plant")
    tedges = pd.date_range("2025-06-01", periods=97, freq="h")
 
-   demand = np.stack([np.full(96, 400.0), np.full(96, 200.0)])
-   demand[1, 40:48] = 0.0  # T2 draws nothing for eight hours
+   shut = np.full(96, 200.0)
+   shut[40:48] = 0.0  # T2 draws nothing for eight hours
+   demand = {"T1": np.full(96, 400.0), "T2": shut}
 
    cout = source_to_endmember(
        cin=np.sin(np.arange(96) / 5.0) + 2.0, flow=demand, tedges=tedges,
        cout_tedges=tedges, network=network,
    )
-   np.testing.assert_array_equal(np.flatnonzero(np.isnan(cout[1])), np.arange(40, 48))
-   assert not np.isnan(cout[0]).any()  # T1 keeps drawing, so T1 keeps reporting
+   np.testing.assert_array_equal(np.flatnonzero(np.isnan(cout["T2"])), np.arange(40, 48))
+   assert not np.isnan(cout["T1"]).any()  # T1 keeps drawing, so T1 keeps reporting
 
 References
 ----------

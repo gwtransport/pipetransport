@@ -73,7 +73,7 @@ Available class and functions:
 - :func:`sol_air_temperature` - The surface forcing per land cover: air temperature plus
   the absorbed solar radiation, less the longwave and latent losses, over the surface film.
 - :func:`soil_temperature` - Exact bin-averaged undisturbed soil temperature at depth from
-  a piecewise-constant surface series (Robin surface; a Dirichlet surface is ``eta=inf``).
+  a piecewise-constant surface series (Robin surface; ``radiation_length=0`` is Dirichlet).
 - :func:`segment_heat_rate` - Per-segment exchange rate [1/day] from the wall and soil
   resistances, analogous to :func:`pipetransport.logremoval.segment_decay_rate`.
 - :func:`source_to_endmember` - Delivered temperature at the reporting nodes, two-way by
@@ -492,8 +492,7 @@ def soil_temperature(
     tedges: pd.DatetimeIndex,
     depth: float,
     alpha: float,
-    kappa: float | None = None,
-    eta: float | None = None,
+    radiation_length: float = 0.0,
     t_pre: float | None = None,
 ) -> npt.NDArray[np.floating]:
     """Compute the bin-averaged undisturbed soil temperature at depth from a surface series.
@@ -520,11 +519,12 @@ def soil_temperature(
         Depth below the surface [m], positive.
     alpha : float
         Soil thermal diffusivity [m²/day], positive.
-    kappa, eta : float or None, optional
-        Soil conductivity ratio [m²/day] and surface film coefficient [m/day]. Given
-        together they impose the physical Robin surface condition with radiation length
-        ``kappa/eta``; both ``None`` (default, equivalent to ``eta=inf``) is a
-        prescribed-temperature (Dirichlet) surface.
+    radiation_length : float, optional
+        ``kappa / eta`` [m], the only combination of the soil conductivity ratio and the
+        surface film coefficient the kernel depends on: it sets the Robin surface condition
+        by displacing the surface downward by that length. Default 0.0, a
+        prescribed-temperature (Dirichlet) surface -- the ``eta = inf`` limit, reached
+        without a branch.
     t_pre : float or None, optional
         Uniform surface temperature before the record, the state the first surface step is
         measured against. Defaults to the first surface value -- a record that opens
@@ -543,8 +543,8 @@ def soil_temperature(
     Raises
     ------
     ValueError
-        If ``tedges`` is malformed or not uniformly spaced, the series holds NaN, a
-        parameter is not positive, or only one of ``kappa`` and ``eta`` is given.
+        If ``tedges`` is malformed or not uniformly spaced, the series holds NaN, ``depth``
+        or ``alpha`` is not positive, or ``radiation_length`` is negative.
 
     See Also
     --------
@@ -580,16 +580,9 @@ def soil_temperature(
     _validate_no_nan(surface, name="surface_temperature")
     _validate_positive(depth, name="depth")
     _validate_positive(alpha, name="alpha")
-    if (kappa is None) != (eta is None):
-        msg = "kappa and eta displace the surface together; provide both or neither"
+    if not radiation_length >= 0.0:
+        msg = "radiation_length must be non-negative (0 is a prescribed-temperature surface)"
         raise ValueError(msg)
-    radiation_length = 0.0
-    if kappa is not None and eta is not None:
-        _validate_positive(kappa, name="kappa")
-        if not eta > 0.0:
-            msg = "eta must be positive"
-            raise ValueError(msg)
-        radiation_length = kappa / eta
     pre = float(surface[0]) if t_pre is None else float(t_pre)
 
     steps = np.diff(surface, prepend=pre)
@@ -620,8 +613,9 @@ class HeatNetwork(PipeNetwork):
 
     Parameters
     ----------
-    segments : pandas.DataFrame
-        One row per pipe segment as :class:`~pipetransport.network.PipeNetwork`, plus:
+    segments : mapping or pandas.DataFrame
+        The pipe segments as :class:`~pipetransport.network.PipeNetwork` takes them, each
+        carrying in addition:
 
         ``length``, ``diameter``
             Required [m] (inner diameter). Heat reads the pipe three ways -- the exchange
@@ -688,34 +682,46 @@ class HeatNetwork(PipeNetwork):
 
     Examples
     --------
-    >>> import pandas as pd
     >>> from pipetransport.heat import HeatNetwork, segment_heat_rate
-    >>> segments = pd.DataFrame(
-    ...     {
-    ...         "from": ["Plant", "A"],
-    ...         "to": ["A", "T1"],
-    ...         "length": [2000.0, 800.0],
-    ...         "diameter": [0.40, 0.15],
-    ...         "cover": ["grass", "paved"],
-    ...         "alpha": [0.05, 0.075],
-    ...         "kappa_soil": [0.025, 0.035],
-    ...         "eta": [0.41, 0.41],
+    >>> grass = {"cover": "grass", "alpha": 0.05, "kappa_soil": 0.025, "eta": 0.41}
+    >>> paved = {"cover": "paved", "alpha": 0.075, "kappa_soil": 0.035, "eta": 0.41}
+    >>> segments = {
+    ...     "Plant-A": {
+    ...         "from": "Plant",
+    ...         "to": "A",
+    ...         "length": 2000.0,
+    ...         "diameter": 0.40,
+    ...         **grass,
     ...     },
-    ...     index=["Plant-A", "A-T1"],
-    ... )
+    ...     "A-T1": {
+    ...         "from": "A",
+    ...         "to": "T1",
+    ...         "length": 800.0,
+    ...         "diameter": 0.15,
+    ...         **paved,
+    ...     },
+    ... }
     >>> network = HeatNetwork(segments=segments, source="Plant")
     >>> float(network.segments.loc["Plant-A", "depth"])  # filled in
     1.0
-    >>> float(round(segment_heat_rate(network=network)["A-T1"], 2))
+    >>> round(segment_heat_rate(network=network)["A-T1"], 2)
     3.7
     """
 
-    def __init__(self, *, segments: pd.DataFrame, source: str) -> None:
+    def __init__(self, *, segments: Mapping[str, Mapping] | pd.DataFrame, source: str) -> None:
         super().__init__(segments=segments, source=source)
         segments = self.segments  # the validated copy the base class stored
-        missing = [c for c in ("length", "diameter", "cover", "alpha", "kappa_soil") if c not in segments.columns]
+        required = ("length", "diameter", "cover", "alpha", "kappa_soil")
+        missing = [c for c in required if c not in segments.columns]
         if missing:
             msg = f"HeatNetwork segments need column(s): {missing}"
+            raise ValueError(msg)
+        # A mapping whose segments do not all carry the same keys arrives with NaN in the
+        # gaps, so an omission has to be named as one rather than surfacing as a NaN rate.
+        blank = segments[list(required)].isna()
+        if blank.to_numpy().any():
+            gaps = [f"{name!r} is missing {sorted(blank.columns[row])}" for name, row in blank.iterrows() if row.any()]
+            msg = f"every segment needs {list(required)}; segment {'; segment '.join(gaps)}"
             raise ValueError(msg)
         # PipeNetwork accepts a volume-only table and, given a volume, never looks at the
         # geometry; heat reads the pipe three ways, so the geometry has to be there, be
@@ -748,8 +754,9 @@ class HeatNetwork(PipeNetwork):
             ("kappa_pipe", np.inf),
             ("film_coefficient", np.inf),
         ):
-            if column not in segments.columns:
-                segments[column] = default
+            # Absent for every segment or only for some: either way the gap is the default,
+            # so one pipe may carry a wall while its neighbours omit one.
+            segments[column] = default if column not in segments.columns else segments[column].fillna(default)
         _validate_positive(segments["alpha"], name="alpha")
         _validate_positive(segments["kappa_soil"], name="kappa_soil")
         _validate_positive(segments["depth"], name="depth")
@@ -771,7 +778,7 @@ class HeatNetwork(PipeNetwork):
             raise ValueError(msg)
 
 
-def segment_heat_rate(*, network: HeatNetwork) -> pd.Series:
+def segment_heat_rate(*, network: HeatNetwork) -> dict[str, float]:
     """Compute the per-segment heat exchange rate [1/day] from the wall and soil resistances.
 
     The water column loses heat through the water-side film, the pipe wall and the soil in
@@ -801,8 +808,8 @@ def segment_heat_rate(*, network: HeatNetwork) -> pd.Series:
 
     Returns
     -------
-    pandas.Series
-        Exchange rate [1/day] indexed by segment name.
+    dict of str to float
+        Exchange rate [1/day] keyed by segment name.
 
     Raises
     ------
@@ -823,7 +830,7 @@ def segment_heat_rate(*, network: HeatNetwork) -> pd.Series:
     >>> from pipetransport.examples import example_heat_network
     >>> from pipetransport.heat import segment_heat_rate
     >>> rates = segment_heat_rate(network=example_heat_network())
-    >>> float(round(rates["C-T4"], 2)), float(round(rates["Plant-A"], 2))
+    >>> round(rates["C-T4"], 2), round(rates["Plant-A"], 2)
     (5.65, 0.49)
     """
     if not isinstance(network, HeatNetwork):
@@ -839,7 +846,8 @@ def segment_heat_rate(*, network: HeatNetwork) -> pd.Series:
     film = 1.0 / (2.0 * np.pi * r_i * segments["film_coefficient"].to_numpy(dtype=float))
     wall = np.log(r_o / r_i) / (2.0 * np.pi * segments["kappa_pipe"].to_numpy(dtype=float))
     soil = np.log(2.0 * d_eff / r_o) / (2.0 * np.pi * kappa_soil)
-    return pd.Series(1.0 / ((film + wall + soil) * np.pi * r_i**2), index=segments.index, name="heat_rate")
+    rate = 1.0 / ((film + wall + soil) * np.pi * r_i**2)
+    return {str(name): float(value) for name, value in zip(segments.index, rate, strict=True)}
 
 
 class _HeatSystem(NamedTuple):
@@ -984,11 +992,11 @@ def _build_system(
             tedges=tedges_p,
             depth=float(depth),
             alpha=float(alpha),
-            kappa=float(kappa),
-            eta=float(eta),
+            # kappa / inf is exactly 0.0: a prescribed-temperature surface, no branch.
+            radiation_length=float(kappa) / float(eta),
         )
 
-    rate = segment_heat_rate(network=network).to_numpy(dtype=float)
+    rate = np.array([segment_heat_rate(network=network)[str(name)] for name in segments.index])
     r_o = segments["diameter"].to_numpy(dtype=float) / 2.0 + segments["wall_thickness"].to_numpy(dtype=float)
     d_eff = depth_seg + kappa_seg / eta_seg
     dbar = _deficit_kernel(n_bins, dt_days, r_o=r_o, d_eff=d_eff, alpha=alpha_seg, kappa=kappa_seg)
@@ -1363,7 +1371,7 @@ def source_to_endmember(
     max_sweeps: int = 5000,
     atol: float = 1e-9,
     spinup: str | None = "constant",
-) -> npt.NDArray[np.floating]:
+) -> dict[str, npt.NDArray[np.floating]]:
     """Compute the delivered water temperature at each reporting node.
 
     The delivered temperature is the transport operator's affine reading
@@ -1455,10 +1463,12 @@ def source_to_endmember(
 
     Returns
     -------
-    numpy.ndarray
-        Delivered temperature of shape ``(len(report_nodes), len(cout_tedges) - 1)``, in the
-        unit of ``tin``; the flow-weighted average over each output bin. NaN marks bins
-        the record does not constrain.
+    dict of str to ndarray
+        Delivered temperature keyed by reporting node, in ``report_nodes`` order, each a
+        series of ``len(cout_tedges) - 1`` values in the unit of ``tin``: the flow-weighted
+        average over each output bin. NaN marks bins the record does not constrain. The
+        mapping is what :func:`endmember_to_source` takes as ``tout``, so a round trip
+        composes verbatim.
 
     Raises
     ------
@@ -1502,10 +1512,10 @@ def source_to_endmember(
     ...     network=network,
     ...     surface_temperature=surface,
     ... )
-    >>> cout.shape
-    (4, 168)
+    >>> list(cout)
+    ['T1', 'T2', 'T3', 'T4']
     >>> bool(
-    ...     np.all(np.diff([8.0, np.nanmean(cout[3]), 30.0]) > 0)
+    ...     np.all(np.diff([8.0, np.nanmean(cout["T4"]), 30.0]) > 0)
     ... )  # between plant and sol-air
     True
     """
@@ -1530,7 +1540,7 @@ def source_to_endmember(
     targets = _converge_targets(system, tin_padded, max_sweeps=max_sweeps, atol=atol)
     out = apply_banded(system.reporting, tin_padded) + apply_segment_targets(system.reporting, targets)
     out[~system.reporting.valid_out] = np.nan
-    return out
+    return dict(zip(system.nodes, out, strict=True))
 
 
 def endmember_to_source(
@@ -1674,9 +1684,7 @@ def endmember_to_source(
     ...     surface_temperature=surface,
     ... )
     >>> measured = source_to_endmember(tin=tin, report_nodes=["T1", "T4"], **shared)
-    >>> recovered = endmember_to_source(
-    ...     tout={"T1": measured[0], "T4": measured[1]}, **shared
-    ... )
+    >>> recovered = endmember_to_source(tout=measured, **shared)
     >>> inner = slice(36, -96)  # both edges lean on unconstrained bins; see Notes
     >>> residual = float(np.nanmax(np.abs(recovered[inner] - tin[inner])))
     >>> residual < 1e-8  # the Tikhonov pull, O(lambda) once the target preserves constants

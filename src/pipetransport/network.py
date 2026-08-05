@@ -44,12 +44,18 @@ class PipeNetwork:
 
     Parameters
     ----------
-    segments : pandas.DataFrame
-        One row per pipe segment, indexed by a unique segment name. Required columns
-        ``"from"`` and ``"to"`` name the upstream and downstream node of the segment. The
-        water volume comes either from a ``"volume"`` column [m³] or from ``"length"`` [m]
-        and ``"diameter"`` [m] (inner diameter), as ``pi/4 * diameter**2 * length``. Any
-        further columns are carried through unchanged.
+    segments : mapping or pandas.DataFrame
+        The pipe segments, keyed by a unique segment name, each carrying its own properties:
+        ``"from"`` and ``"to"`` name the upstream and downstream node, and the water volume
+        comes either from a ``"volume"`` entry [m³] or from ``"length"`` [m] and
+        ``"diameter"`` [m] (inner diameter), as ``pi/4 * diameter**2 * length``. Any further
+        entries are carried through unchanged, and a property one segment omits is filled
+        from its default where the reading code has one.
+
+        A ``DataFrame`` in the form :attr:`segments` exposes -- one row per segment, indexed
+        by name -- is accepted too, so a table read from file and a network being upgraded
+        both pass straight in. Nothing else is: the raw ``pd.DataFrame(...)`` constructor
+        reads a mapping column-wise and would transpose the segments silently.
     source : str
         Name of the production node. Must be a node of the graph and must have no
         incoming segment.
@@ -57,7 +63,9 @@ class PipeNetwork:
     Attributes
     ----------
     segments : pandas.DataFrame
-        Copy of the input table with a guaranteed ``"volume"`` column, in input row order.
+        The validated table the input became: one row per segment in input order, with a
+        guaranteed ``"volume"`` column and any defaults filled in. It is a derived artifact
+        rather than the input form, and the constructors take it back as is.
     source : str
         Name of the production node.
     nodes : tuple of str
@@ -71,6 +79,8 @@ class PipeNetwork:
 
     Raises
     ------
+    TypeError
+        If ``segments`` is neither a mapping nor a DataFrame.
     ValueError
         If the segment table is empty or malformed, if the geometry is not positive, if
         ``source`` is not a node or has an incoming segment, or if the graph is not a tree
@@ -84,17 +94,12 @@ class PipeNetwork:
 
     Examples
     --------
-    >>> import pandas as pd
     >>> from pipetransport.network import PipeNetwork
-    >>> segments = pd.DataFrame(
-    ...     {
-    ...         "from": ["Plant", "A", "A"],
-    ...         "to": ["A", "T1", "T2"],
-    ...         "length": [2000.0, 800.0, 400.0],
-    ...         "diameter": [0.40, 0.15, 0.20],
-    ...     },
-    ...     index=["Plant-A", "A-T1", "A-T2"],
-    ... )
+    >>> segments = {
+    ...     "Plant-A": {"from": "Plant", "to": "A", "length": 2000.0, "diameter": 0.40},
+    ...     "A-T1": {"from": "A", "to": "T1", "length": 800.0, "diameter": 0.15},
+    ...     "A-T2": {"from": "A", "to": "T2", "length": 400.0, "diameter": 0.20},
+    ... }
     >>> network = PipeNetwork(segments=segments, source="Plant")
     >>> network.endmembers
     ('T1', 'T2')
@@ -104,8 +109,19 @@ class PipeNetwork:
     251.3
     """
 
-    def __init__(self, *, segments: pd.DataFrame, source: str) -> None:
-        segments = pd.DataFrame(segments).copy()
+    def __init__(self, *, segments: Mapping[str, Mapping] | pd.DataFrame, source: str) -> None:
+        # Two forms, dispatched explicitly. Never ``pd.DataFrame(segments)``: its dict handling
+        # is column-oriented, so a mapping of row-dicts would come back transposed in silence.
+        if isinstance(segments, Mapping):
+            segments = pd.DataFrame.from_dict(dict(segments), orient="index")
+        elif isinstance(segments, pd.DataFrame):
+            segments = segments.copy()
+        else:
+            msg = (
+                "segments must be a mapping of segment name to its properties, or the DataFrame "
+                "form network.segments exposes (one row per segment, indexed by name)"
+            )
+            raise TypeError(msg)
         if segments.empty:
             msg = "segments must hold at least one pipe segment"
             raise ValueError(msg)

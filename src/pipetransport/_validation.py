@@ -16,6 +16,8 @@ This module has no public API; importers are the package modules themselves plus
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import numpy as np
 import numpy.typing as npt
 import pandas as pd  # noqa: TC002  -- pandas is a hard runtime dependency; import unconditionally
@@ -121,23 +123,60 @@ def _validate_positive(arr: npt.ArrayLike, *, name: str, message: str | None = N
         raise ValueError(msg)
 
 
-def _validate_retardation_factor(value: float) -> None:
-    """Validate that the retardation factor is ``>= 1`` (anti-retardation is unphysical).
+def _validate_retardation_factor(value: npt.ArrayLike) -> None:
+    """Validate that every retardation factor is ``>= 1`` (anti-retardation is unphysical).
 
-    The check is written as ``not value >= 1.0`` rather than ``value < 1.0`` so that NaN is
-    rejected too: ``NaN >= 1.0`` is False, so the bare ``< 1.0`` form would let NaN pass and
-    silently propagate an all-NaN transport output.
+    The check is written as ``not (value >= 1.0).all()`` rather than ``(value < 1.0).any()``
+    so that NaN is rejected too: ``NaN >= 1.0`` is False, so the bare ``< 1.0`` form would let
+    NaN pass and silently propagate an all-NaN transport output.
 
     Parameters
     ----------
-    value : float
-        Retardation factor to check.
+    value : array-like
+        Retardation factor, scalar or one per segment.
 
     Raises
     ------
     ValueError
-        If ``value`` is NaN or ``value < 1.0``.
+        If any entry is NaN or below 1.
     """
-    if not value >= 1.0:
+    if not np.all(np.asarray(value, dtype=float) >= 1.0):
         msg = "retardation_factor must be >= 1.0"
         raise ValueError(msg)
+
+
+def _per_segment(value: float | Mapping[str, float], index: pd.Index, *, name: str) -> npt.NDArray[np.floating]:
+    """Coerce a scalar or a segment-keyed mapping to an array in segment-table order.
+
+    Parameters
+    ----------
+    value : float or mapping
+        One value shared by every segment, or a mapping from segment name to its own.
+    index : pandas.Index
+        Segment names, in the order the returned array is to follow.
+    name : str
+        Parameter name used in the error messages.
+
+    Returns
+    -------
+    ndarray
+        One value per segment, in ``index`` order.
+
+    Raises
+    ------
+    ValueError
+        If the mapping misses a segment or holds a key that is not one.
+    """
+    if not isinstance(value, Mapping):
+        return np.full(len(index), float(value))
+    named = dict(zip(map(str, value), np.asarray(list(value.values()), dtype=float), strict=True))
+    names = [str(segment) for segment in index]
+    missing = [segment for segment in names if segment not in named]
+    if missing:
+        msg = f"{name} is missing segment(s): {missing}"
+        raise ValueError(msg)
+    unknown = sorted(set(named) - set(names))
+    if unknown:
+        msg = f"{name} holds key(s) that are not segments: {unknown}"
+        raise ValueError(msg)
+    return np.array([named[segment] for segment in names], dtype=float)
