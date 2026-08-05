@@ -320,6 +320,8 @@ limit of the decaying one, not a separate code path.
 **How it is checked.** Partly. Negative rates are rejected, and a ``Series`` of rates must cover
 every segment. The kinetic form itself is your modelling choice.
 
+.. _assumption-soil-columns:
+
 Heat exchange with the soil
 ---------------------------
 
@@ -379,12 +381,18 @@ pipe that has in reality been running for years is modelled as one switched on a
 meeting soil that accepts heat almost without resistance. On a 100 mm service line with a sustained
 12 K difference the delivered temperature is several kelvin too close to the soil at the start of the
 record; a week of lead-in brings that under 1 K, a month under 0.4 K and a season under 0.1 K.
-Supply lead-in you intend to discard, and discard it.
+Supply lead-in and leave ``cout_tedges`` on the period you care about; the output grid is free, so
+nothing needs discarding.
 
-**What you can do.** Start the record well before the period you care about, and give
-``surface_tedges`` a year or more of history so the soil field at depth is not leaning on ``t_pre``.
-Use bin widths that resolve the forcing you care about --- the halo memory reads the flux history
-only through bin averages. Keep parallel mains out, or merge them into one equivalent segment.
+**What you can do.** Start ``tedges`` about three weeks --- :math:`d_\text{eff}^2/\alpha` --- before
+the period you care about, with realistic history: the measured surface record, a typical demand
+pattern, and a production temperature near the record's opening value. That one lead-in serves both
+slow memories: it lets the network build the halo the model otherwise starts without (the measured
+decay above), and it delivers about half of any recent surface swing to a metre's depth --- the
+seasonal baseline older than the lead-in enters as the first value of each surface series, so open
+the lead-in where the record is representative rather than at an extreme. Use bin widths that resolve
+the forcing you care about --- the halo memory reads the flux history only through bin averages. Keep
+parallel mains out, or merge them into one equivalent segment.
 
 **How it is checked.** Partly. Geometry and soil parameters must be positive and the burial depth
 must exceed the pipe radius; every segment's cover class must appear in the ``soil`` table and in the

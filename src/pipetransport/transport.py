@@ -94,7 +94,8 @@ def source_to_endmember(
         ``"constant"`` (default) warm-starts the record by extending it backwards at the
         first observed demand and quality, so the earliest output bins carry a value instead
         of NaN. ``None`` keeps strict validity: any output bin fed even partly from before
-        the record is NaN.
+        the record is NaN. The heat pair layers two slower memories on top of this one; see
+        :func:`pipetransport.heat.source_to_endmember`.
 
     Returns
     -------

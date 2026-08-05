@@ -490,27 +490,27 @@ def soil_temperature(
     kappa: float | None = None,
     eta: float | None = None,
     t_pre: float | None = None,
-    surface_tedges: pd.DatetimeIndex | None = None,
 ) -> npt.NDArray[np.floating]:
     """Compute the bin-averaged undisturbed soil temperature at depth from a surface series.
 
     Exact superposition of half-space step responses: the piecewise-constant surface
     (sol-air) series steps at each of its bin edges, each step arrives at depth as an
     erfc-family response, and the average over every output bin uses the closed-form time
-    integral -- no quadrature, no grid. Before ``surface_tedges[0]`` the soil is uniformly
-    at ``t_pre``; after the last surface bin the series holds its final value. A one-week
-    heatwave arrives at 1 m attenuated to roughly a quarter to a third of its surface
-    amplitude, peaking a day or two after it ends; the annual wave arrives at about
+    integral -- no quadrature, no grid. Before ``tedges[0]`` the surface is uniformly at
+    ``t_pre``, so the record opens from the soil state that history has settled into. A
+    one-week heatwave arrives at 1 m attenuated to roughly a quarter to a third of its
+    surface amplitude, peaking a day or two after it ends; the annual wave arrives at about
     two-thirds amplitude, three to four weeks delayed.
 
     Parameters
     ----------
     surface_temperature : array-like
         Sol-air temperature per surface bin (see :func:`sol_air_temperature`), length
-        ``len(surface_tedges) - 1``.
+        ``len(tedges) - 1``.
     tedges : pandas.DatetimeIndex
-        Output bin edges; may start before ``surface_tedges[0]`` (those bins return
-        ``t_pre``) and end after its last edge.
+        Bin edges of both the surface series and the returned soil series, uniformly spaced
+        (the superposition over surface steps is a convolution). One value per bin in, one
+        per bin out.
     depth : float
         Depth below the surface [m], positive.
     alpha : float
@@ -521,14 +521,13 @@ def soil_temperature(
         ``kappa/eta``; both ``None`` (default, equivalent to ``eta=inf``) is a
         prescribed-temperature (Dirichlet) surface.
     t_pre : float or None, optional
-        Uniform soil temperature before the surface record. Defaults to the first surface
-        value.
-    surface_tedges : pandas.DatetimeIndex or None, optional
-        Bin edges of the surface series; defaults to ``tedges``, and must be uniform with
-        the same bin width, which is what makes the superposition a convolution. It is free
-        to start and end elsewhere: supply a record starting well before the period of
-        interest -- after one year roughly 87 % of a step has arrived at 1 m, so the first
-        months of output lean on ``t_pre``.
+        Uniform surface temperature before the record, the state the first surface step is
+        measured against. Defaults to the first surface value -- a record that opens
+        settled. The record's own history takes over as it arrives at depth: after one year
+        roughly 87 % of a step has reached 1 m, after three weeks about half, so the early
+        bins lean on ``t_pre`` in proportion. To serve a longer history, evaluate on the
+        longer ``tedges`` and slice the output -- refining and extending the record is the
+        caller's job, per the one-grid contract.
 
     Returns
     -------
@@ -539,9 +538,8 @@ def soil_temperature(
     Raises
     ------
     ValueError
-        If a time axis is malformed or the two do not share one uniform bin width, the
-        series holds NaN, a parameter is not positive, or only one of ``kappa`` and ``eta``
-        is given.
+        If ``tedges`` is malformed or not uniformly spaced, the series holds NaN, a
+        parameter is not positive, or only one of ``kappa`` and ``eta`` is given.
 
     See Also
     --------
@@ -567,18 +565,11 @@ def soil_temperature(
     """
     tedges = pd.DatetimeIndex(tedges)
     surface = np.asarray(surface_temperature, dtype=float)
-    surface_tedges = tedges if surface_tedges is None else pd.DatetimeIndex(surface_tedges)
-    _validate_tedges(surface_tedges, surface, tedges_name="surface_tedges", values_name="surface_temperature")
-    _validate_tedges(tedges, np.empty(len(tedges) - 1), tedges_name="tedges", values_name="the output")
-    bin_width = tedges[1] - tedges[0]
-    if (
-        np.unique(np.diff(tedges.asi8)).size != 1
-        or np.unique(np.diff(surface_tedges.asi8)).size != 1
-        or surface_tedges[1] - surface_tedges[0] != bin_width
-    ):
+    _validate_tedges(tedges, surface, tedges_name="tedges", values_name="surface_temperature")
+    if np.unique(np.diff(tedges.asi8)).size != 1:
         msg = (
-            "tedges and surface_tedges must share one uniform bin width (the step response depends only on the "
-            "lag, which makes the superposition over surface steps a convolution)"
+            "tedges must be uniformly spaced (the step response depends only on the lag, "
+            "which makes the superposition over surface steps a convolution)"
         )
         raise ValueError(msg)
     _validate_no_nan(surface, name="surface_temperature")
@@ -596,26 +587,20 @@ def soil_temperature(
         radiation_length = kappa / eta
     pre = float(surface[0]) if t_pre is None else float(t_pre)
 
-    step_times = tedges_to_days(surface_tedges)[:-1]
     steps = np.diff(surface, prepend=pre)
-    out_edges = tedges_to_days(tedges, ref=surface_tedges[0])
-    # The response depends on the lag alone, so on one shared bin width the lags of the
-    # (output edge, surface step) pairs take ``n_out + n_step`` distinct values rather than
-    # their product: the superposition is a convolution over those. A year of hourly forcing
-    # costs 17_560 kernel evaluations instead of 77 million, and a vector instead of an N^2
-    # matrix that had to be chunked to fit.
-    n_out, n_step = len(out_edges) - 1, len(step_times)
-    dt_days = bin_width / pd.Timedelta(days=1)
-    lag = (out_edges[0] - step_times[0]) + (np.arange(n_out + n_step) - (n_step - 1)) * dt_days
+    n = len(surface)
+    dt_days = (tedges[1] - tedges[0]) / pd.Timedelta(days=1)
+    # The response depends on the lag alone, so the (output edge, surface step) pairs take
+    # ``2 n`` distinct lag values rather than their product: the superposition is a
+    # convolution over those. A year of hourly forcing costs 17_520 kernel evaluations
+    # instead of 77 million, and a vector instead of an N^2 matrix that had to be chunked
+    # to fit.
+    lag = (np.arange(2 * n) - (n - 1)) * dt_days
     kernel = _step_response_integral(lag, depth=depth, alpha=alpha, radiation_length=radiation_length)
     # Differenced to a bin-averaged response before the convolution rather than after it, so
     # the transform's round-off is not amplified by the 1/dt of the final differencing.
-    response = fftconvolve(np.diff(kernel) / dt_days, steps)[n_step - 1 : n_step - 1 + n_out]
-    # The response is causal, and exactly so: an output bin ending at or before the first
-    # surface step integrates a kernel that is identically zero over its whole span. The
-    # transform blurs that exact zero by its own round-off, so it is restored rather than
-    # approximated -- the pre-history is a value the caller supplied, not a computed one.
-    return pre + np.where(out_edges[1:] <= step_times[0], 0.0, response)
+    response = fftconvolve(np.diff(kernel) / dt_days, steps)[n - 1 : 2 * n - 1]
+    return pre + response
 
 
 def segment_heat_rate(
@@ -804,7 +789,6 @@ def _build_system(
     network: PipeNetwork,
     soil: pd.DataFrame,
     surface_temperature: pd.DataFrame,
-    surface_tedges: pd.DatetimeIndex | None,
     nodes: list[str] | tuple[str, ...] | None,
     kappa_pipe: float | pd.Series | None,
     film_coefficient: float | pd.Series | None,
@@ -866,6 +850,12 @@ def _build_system(
     if surface_missing:
         msg = f"surface_temperature is missing cover class(es): {surface_missing}"
         raise ValueError(msg)
+    _validate_tedges(
+        tedges,
+        surface_temperature.to_numpy(dtype=float).T,
+        tedges_name="tedges",
+        values_name="surface_temperature",
+    )
 
     requested = tuple(network.endmembers) if nodes is None else tuple(nodes)
     unknown = [node for node in requested if node not in network.paths]
@@ -910,18 +900,19 @@ def _build_system(
     t_inf = np.empty((len(segments), n_bins))
     cover_names = covers.to_numpy()
     pairs = {(str(cover), float(depth)) for cover, depth in zip(cover_names, depth_seg, strict=True)}
-    surface_grid = tedges if surface_tedges is None else pd.DatetimeIndex(surface_tedges)
     for cover, depth in pairs:
         eta_cover = float(soil.loc[cover, "eta"])
         rows = (cover_names == cover) & (depth_seg == depth)
+        record = surface_temperature[cover].to_numpy(dtype=float)
+        # The warm-start prefix sees the record's opening surface held constant -- the same
+        # constant-history policy the spin-up applies to flow and tin.
         t_inf[rows] = soil_temperature(
-            surface_temperature=surface_temperature[cover].to_numpy(dtype=float),
+            surface_temperature=np.concatenate([np.full(n_pad, record[0]), record]),
             tedges=tedges_p,
             depth=depth,
             alpha=float(soil.loc[cover, "alpha"]),
             kappa=float(soil.loc[cover, "kappa"]),
             eta=eta_cover,
-            surface_tedges=surface_grid,
         )
 
     rate = segment_heat_rate(
@@ -1304,7 +1295,6 @@ def source_to_endmember(
     network: PipeNetwork,
     soil: pd.DataFrame,
     surface_temperature: pd.DataFrame,
-    surface_tedges: pd.DatetimeIndex | None = None,
     nodes: list[str] | tuple[str, ...] | None = None,
     kappa_pipe: float | pd.Series | None = None,
     film_coefficient: float | pd.Series | None = None,
@@ -1346,11 +1336,7 @@ def source_to_endmember(
         ``eta`` [m/day] (``inf`` for a prescribed-temperature surface).
     surface_temperature : pandas.DataFrame
         Sol-air temperature per cover class (one column per class), constant over each
-        ``surface_tedges`` bin; see :func:`sol_air_temperature`.
-    surface_tedges : pandas.DatetimeIndex or None, optional
-        Edges of the surface record; defaults to ``tedges``. A record reaching a year or
-        more back sharpens the soil state at depth; earlier history is the uniform
-        pre-record mean (the first value of each column).
+        ``tedges`` bin; see :func:`sol_air_temperature`.
     nodes : list of str or None, optional
         Nodes to report at. Defaults to ``network.endmembers``.
     kappa_pipe : float or pandas.Series or None, optional
@@ -1382,7 +1368,36 @@ def source_to_endmember(
         its logarithm, so there is little to buy by relaxing it: 1e-7 is the loosest value
         that leaves the package's own tests meaningful, and costs a third of the runtime.
     spinup : {"constant"} or None, optional
-        Warm-start policy; see :func:`pipetransport.transport.source_to_endmember`.
+        Warm-start policy for the water the pipes hold when the record opens; see
+        :func:`pipetransport.transport.source_to_endmember` for the mechanics. Default
+        ``"constant"``.
+
+        The heat pair has three memories on three clocks, and this parameter serves only
+        the fastest:
+
+        * **The water in the pipes** (hours to days -- one transit). ``"constant"`` pads
+          the record internally with the leading flow and ``tin[0]``, so the record opens
+          with every pipe holding settled water. Automatic; no data needed.
+        * **The halo the network has built in the soil around itself** (days to weeks --
+          the deficit kernel decays over ``d_eff**2 / alpha``, about three weeks for a
+          pipe at a metre in typical soil). The model assumes it is absent: the record
+          opens onto undisturbed soil, as if every pipe were laid that day. See
+          :ref:`assumption-soil-columns` for measured consequences.
+        * **The undisturbed soil state at depth** (weeks to seasons). Surface history
+          from before ``tedges[0]`` is the uniform first value of each
+          ``surface_temperature`` series.
+
+        The second and third are the caller's to warm up, and one recipe serves both:
+        prepend about three weeks -- ``d_eff**2 / alpha`` -- of realistic history to
+        ``tedges`` (the measured surface record, a typical demand pattern, a production
+        temperature near the record's opening value) and leave ``cout_tedges`` on the
+        period of interest; the output grid is free, so nothing needs discarding. Three
+        weeks lets the network build the bulk of its halo and delivers about half of any
+        recent surface swing to a metre's depth (a year would deliver 87 %); the seasonal
+        baseline older than the lead-in enters as the first surface value, so open the
+        lead-in where the record is representative rather than at an extreme. The cost is
+        the operator, about 1.3 MiB and the proportional build time per extra day at
+        hourly bins on the example network.
 
     Returns
     -------
@@ -1470,7 +1485,6 @@ def source_to_endmember(
         network=network,
         soil=soil,
         surface_temperature=surface_temperature,
-        surface_tedges=surface_tedges,
         nodes=nodes,
         kappa_pipe=kappa_pipe,
         film_coefficient=film_coefficient,
@@ -1493,7 +1507,6 @@ def endmember_to_source(
     network: PipeNetwork,
     soil: pd.DataFrame,
     surface_temperature: pd.DataFrame,
-    surface_tedges: pd.DatetimeIndex | None = None,
     nodes: list[str] | tuple[str, ...] | None = None,
     kappa_pipe: float | pd.Series | None = None,
     film_coefficient: float | pd.Series | None = None,
@@ -1517,7 +1530,7 @@ def endmember_to_source(
     tout : DataFrame, mapping, or array-like
         Measured temperature at the reporting nodes, constant over each ``cout_tedges``
         bin; a DataFrame or mapping is keyed by node name. NaN marks a gap.
-    flow, tedges, cout_tedges, network, soil, surface_temperature, surface_tedges, nodes, kappa_pipe, film_coefficient, max_sweeps, atol, spinup
+    flow, tedges, cout_tedges, network, soil, surface_temperature, nodes, kappa_pipe, film_coefficient, max_sweeps, atol, spinup
         As in :func:`source_to_endmember`.
     regularization_strength : float, optional
         Tikhonov parameter of each banded solve; see
@@ -1557,6 +1570,10 @@ def endmember_to_source(
 
     Notes
     -----
+    The lead-in recipe of :func:`source_to_endmember` applies unchanged, and is cheaper to
+    satisfy here: ``tout`` is measured, so the observations usually reach back before the
+    period of interest anyway.
+
     The halo is brought to its own fixed point inside every outer step, so the cost is a
     product of two iterations rather than a sum. The outer step extrapolates over its last few
     iterates rather than simply repeating, which reaches pipes plain repetition cannot -- but
@@ -1644,7 +1661,6 @@ def endmember_to_source(
         network=network,
         soil=soil,
         surface_temperature=surface_temperature,
-        surface_tedges=surface_tedges,
         nodes=nodes,
         kappa_pipe=kappa_pipe,
         film_coefficient=film_coefficient,

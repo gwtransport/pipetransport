@@ -257,42 +257,41 @@ def test_soil_temperature_reproduces_the_published_attenuation(
     assert 0.5 * (tail.max() - tail.min()) == pytest.approx(weekly_amplitude, abs=5e-4)
 
 
-def test_soil_temperature_holds_the_pre_history_before_the_surface_record():
-    """Output bins preceding the surface record are exactly the pre-history temperature."""
-    surface_tedges = pd.date_range("2025-02-01", periods=31, freq="D")
-    tedges = pd.date_range("2025-01-01", periods=62, freq="D")
-    out = heat.soil_temperature(
-        surface_temperature=np.full(30, 25.0),
-        tedges=tedges,
-        surface_tedges=surface_tedges,
-        depth=1.0,
-        t_pre=9.0,
-        **GRASS,
-    )
-    np.testing.assert_array_equal(out[:31], 9.0)
-    assert out[-1] > 9.0
+def test_soil_temperature_measures_the_record_against_t_pre():
+    """``t_pre`` is the state the first surface step is measured against, and only that.
+
+    A record that opens settled must return its own constant *exactly* -- every step is zero,
+    so nothing is superposed at all -- and a record that opens onto a jump must respond to
+    the jump alone. The second half pins that the response is linear in the step: the same
+    field is the unit-step answer scaled by the step's size and offset by the pre-history,
+    which a kernel wired to the absolute temperature rather than to the step could not do.
+    """
+    tedges = pd.date_range("2025-01-01", periods=31, freq="D")
+    settled = heat.soil_temperature(surface_temperature=np.full(30, 25.0), tedges=tedges, depth=1.0, **GRASS)
+    np.testing.assert_array_equal(settled, 25.0)
+
+    stepped = heat.soil_temperature(surface_temperature=np.full(30, 25.0), tedges=tedges, depth=1.0, t_pre=9.0, **GRASS)
+    assert stepped[0] > 9.0
+    assert np.all(np.diff(stepped) > 0.0), "a step at the surface arrives monotonically at depth"
+    assert stepped[-1] < 25.0, "a month is not long enough for a step to fully arrive at 1 m"
+
+    unit = heat.soil_temperature(surface_temperature=np.ones(30), tedges=tedges, depth=1.0, t_pre=0.0, **GRASS)
+    np.testing.assert_allclose(stepped, 9.0 + 16.0 * unit, rtol=1e-14)
 
 
-@pytest.mark.parametrize(
-    "surface_freq",
-    ["12h", "D"],
-    ids=["finer than the output grid", "coarser than the output grid"],
-)
-def test_soil_temperature_rejects_a_surface_grid_of_a_different_width(surface_freq):
-    """The superposition is a convolution only while both grids share one bin width.
+def test_soil_temperature_rejects_a_non_uniform_grid():
+    """The superposition is a convolution only on a uniform grid.
 
     The lag of an (output edge, surface step) pair is then a function of their index
     difference alone, which is what turns a quadratic matrix product into a transform. A
-    surface record on its own spacing has to be resampled by the caller, who knows whether
+    record on its own spacing has to be resampled by the caller, who knows whether
     interpolating or bin-averaging it is the right thing to do.
     """
-    tedges = pd.date_range("2025-01-01", periods=25, freq="h")
-    surface_tedges = pd.date_range("2025-01-01", periods=5, freq=surface_freq)
-    with pytest.raises(ValueError, match="uniform bin width"):
+    tedges = pd.DatetimeIndex([*pd.date_range("2025-01-01", periods=25, freq="h"), "2025-01-02T02:00:00"])
+    with pytest.raises(ValueError, match="uniformly spaced"):
         heat.soil_temperature(
-            surface_temperature=np.full(len(surface_tedges) - 1, 20.0),
+            surface_temperature=np.full(len(tedges) - 1, 20.0),
             tedges=tedges,
-            surface_tedges=surface_tedges,
             depth=1.0,
             **GRASS,
         )
@@ -1257,7 +1256,6 @@ def test_one_way_model_is_the_first_iterate(heat_network, hourly_tedges, diurnal
 
     system = heat._build_system(
         **shared,
-        surface_tedges=None,
         nodes=None,
         kappa_pipe=None,
         film_coefficient=None,
@@ -1297,7 +1295,6 @@ def test_each_segment_relaxes_toward_its_own_cover_and_depth(
         network=heat_network,
         soil=soil,
         surface_temperature=surface_temperature,
-        surface_tedges=None,
         nodes=None,
         kappa_pipe=None,
         film_coefficient=None,
@@ -1311,14 +1308,14 @@ def test_each_segment_relaxes_toward_its_own_cover_and_depth(
     assert len(set(zip(segments["cover"], segments["depth"], strict=True))) > 1, "fixture must mix covers and depths"
     for row, name in enumerate(segments.index):
         cover, depth = segments.loc[name, "cover"], float(segments.loc[name, "depth"])
+        record = surface_temperature[cover].to_numpy(dtype=float)
         expected = heat.soil_temperature(
-            surface_temperature=surface_temperature[cover].to_numpy(dtype=float),
+            surface_temperature=np.concatenate([np.full(system.n_pad, record[0]), record]),
             tedges=padded,
             depth=depth,
             alpha=float(soil.loc[cover, "alpha"]),
             kappa=float(soil.loc[cover, "kappa"]),
             eta=float(soil.loc[cover, "eta"]),
-            surface_tedges=hourly_tedges,
         )
         np.testing.assert_array_equal(system.t_inf[row], expected, err_msg=f"segment {name} ({cover}, {depth} m)")
 
@@ -1348,7 +1345,6 @@ def test_the_pipe_wall_moves_the_radius_the_halo_is_read_at(heat_pipe, soil):
     )
     system = heat._build_system(
         **shared,
-        surface_tedges=None,
         nodes=None,
         kappa_pipe=0.008,
         film_coefficient=None,
@@ -1678,7 +1674,6 @@ def test_the_inflow_rows_read_the_water_the_parent_delivered(heat_network, short
         network=heat_network,
         soil=inert,
         surface_temperature=surface(short_tedges, amplitude=3.0),
-        surface_tedges=None,
         nodes=None,
         kappa_pipe=None,
         film_coefficient=None,
@@ -1718,7 +1713,6 @@ def test_leaf_delivery_rows_agree_with_the_transport_module(heat_network, short_
         network=heat_network,
         soil=soil,
         surface_temperature=surface(short_tedges, amplitude=3.0),
-        surface_tedges=None,
         nodes=None,
         kappa_pipe=None,
         film_coefficient=None,
@@ -1766,7 +1760,6 @@ def test_wall_flux_vanishes_without_a_temperature_difference(heat_network, hourl
         network=heat_network,
         soil=soil,
         surface_temperature=pd.DataFrame({"grass": np.full(n, 14.0), "paved": np.full(n, 14.0)}),
-        surface_tedges=None,
         nodes=None,
         kappa_pipe=None,
         film_coefficient=None,
@@ -1862,7 +1855,6 @@ def test_declaring_a_pipe_as_series_segments_leaves_the_transport_operator_alone
             network=network,
             soil=soil,
             surface_temperature=surface(hourly_tedges, amplitude=3.0),
-            surface_tedges=None,
             nodes=None,
             kappa_pipe=None,
             film_coefficient=None,
@@ -2267,7 +2259,6 @@ def test_the_warm_start_prefix_drives_no_wall_flux(heat_pipe, soil, surface):
     )
     system = heat._build_system(
         **{k: v for k, v in shared.items() if k != "tin"},
-        surface_tedges=None,
         nodes=None,
         kappa_pipe=None,
         film_coefficient=None,
@@ -2665,17 +2656,24 @@ def test_the_public_surface_holds_at_its_edges(heat_network, soil, surface):
     mixed.loc["paved", "eta"] = np.inf
     assert np.isfinite(heat.source_to_endmember(cout_tedges=tedges, nodes=["T1"], **{**common, "soil": mixed})).all()
 
-    # the recommended usage: a surface record reaching back before the period of interest
+    # the recommended usage: a record reaching back before the period of interest, reported
+    # on an output grid that covers the period alone -- nothing to discard
     long_tedges = pd.date_range("2025-05-02", periods=32 * 24 + 1, freq="h")
+    n_long = len(long_tedges) - 1
     early = heat.source_to_endmember(
         cout_tedges=tedges,
         nodes=["T1"],
-        surface_tedges=long_tedges,
-        **{**common, "surface_temperature": surface(long_tedges, amplitude=2.0)},
+        **{
+            **common,
+            "tedges": long_tedges,
+            "tin": np.full(n_long, 8.0),
+            "flow": np.full((len(heat_network.endmembers), n_long), 300.0),
+            "surface_temperature": surface(long_tedges, amplitude=2.0),
+        },
     )
     assert np.isfinite(early).all()
     assert not np.allclose(early, heat.source_to_endmember(cout_tedges=tedges, nodes=["T1"], **common)), (
-        "a developed soil history has to change the answer, or the argument does nothing"
+        "a lead-in warms up both the soil state and the halo, so it has to change the answer"
     )
 
 
