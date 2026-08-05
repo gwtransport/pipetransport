@@ -12,14 +12,20 @@ each pipe's cumulative throughflow in turn. Under a diurnal demand pattern the a
 tap swings by hours over the day, because the pipes hold a fixed water volume that a varying
 flow pushes through at a varying rate.
 
-Available functions:
+Available functions, the two directions of the same travel time:
 
-- :func:`full` - Bin-averaged travel time [days] for every reporting node. The
-  ``"endmember_to_source"`` direction answers "how old is the water delivered now", averaged
-  over each ``cout_tedges`` bin and reported on that grid; ``"source_to_endmember"`` answers
-  "how long until the water produced now arrives", averaged over each ``tedges`` bin and
-  reported on that grid. Both averages are volume-weighted, matching the bin averaging of
-  :mod:`pipetransport.transport`, and both are NaN where the record does not constrain the bin.
+- :func:`source_to_endmember` - How long the water produced during each ``tedges`` bin takes to
+  reach each reporting node, reported on ``tedges``.
+
+- :func:`endmember_to_source` - How old the water delivered during each ``cout_tedges`` bin is,
+  reported on ``cout_tedges``.
+
+Both averages are volume-weighted, matching the bin averaging of :mod:`pipetransport.transport`,
+and both are NaN where the record does not constrain the bin. The names match the transport and
+heat pairs, but the asymmetry there does not apply: neither direction takes an observation, so
+both report per node and both keep ``report_nodes``. In particular this
+:func:`endmember_to_source` is a per-node report looking backward in time, not a reconstruction
+of a source series.
 
 This file is part of pipetransport which is released under AGPL-3.0 license.
 See the ./LICENSE file or go to https://github.com/gwtransport/pipetransport/blob/main/LICENSE for full license details.
@@ -27,6 +33,7 @@ See the ./LICENSE file or go to https://github.com/gwtransport/pipetransport/blo
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import pandas as pd
@@ -38,48 +45,33 @@ if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
 
-_DIRECTIONS = ("endmember_to_source", "source_to_endmember")
 
-
-def full(
+def source_to_endmember(
     *,
-    flow: npt.ArrayLike | pd.DataFrame | dict,
+    flow: Mapping[str, npt.ArrayLike],
     tedges: pd.DatetimeIndex,
-    cout_tedges: pd.DatetimeIndex | None = None,
     network: PipeNetwork,
-    nodes: list[str] | tuple[str, ...] | None = None,
-    direction: str = "endmember_to_source",
+    report_nodes: list[str] | tuple[str, ...] | None = None,
     retardation_factor: float = 1.0,
     spinup: str | None = "constant",
 ) -> npt.NDArray[np.floating]:
-    """Compute the bin-averaged travel time from the source to each reporting node.
+    """Compute how long the water produced in each bin takes to reach each reporting node.
+
+    The average over a ``tedges`` bin is weighted by the volume destined for that node, so
+    production that mostly serves other branches contributes little to the bin's mean.
 
     Parameters
     ----------
-    flow : DataFrame, mapping, or array-like
-        Demand at every endmember [m³/day], constant over each ``tedges`` bin. A DataFrame or
-        mapping is keyed by endmember name; an array must have shape
-        ``(n_endmembers, len(tedges) - 1)`` ordered as ``network.endmembers``.
+    flow : mapping
+        Demand at every endmember [m³/day], keyed by endmember name: one bin-constant array
+        per endmember on the ``tedges`` bins.
     tedges : pandas.DatetimeIndex
-        Time edges of the ``flow`` bins. Length ``n_flow + 1``.
-    cout_tedges : pandas.DatetimeIndex or None, optional
-        Output grid for ``direction="endmember_to_source"``. Defaults to ``tedges``. Ignored
-        by the other direction, which always reports on ``tedges``.
+        Time edges of the ``flow`` bins, and of the output. Length ``n_flow + 1``.
     network : PipeNetwork
         The distribution network.
-    nodes : list of str or None, optional
+    report_nodes : list of str or None, optional
         Nodes to report at, in output row order. Any node is allowed; a junction reports the
         age of the water passing through it. Defaults to ``network.endmembers``.
-    direction : {"endmember_to_source", "source_to_endmember"}, optional
-        Which question to answer.
-
-        - ``"endmember_to_source"`` (default): how long ago the water delivered at the node
-          during each ``cout_tedges`` bin left the source. Averaged with the node's
-          throughflow as weight.
-        - ``"source_to_endmember"``: how long the water produced during each ``tedges`` bin
-          takes to reach the node. Averaged with the node-destined volume as weight, so
-          production that mostly serves other branches contributes little.
-
     retardation_factor : float, optional
         Multiplier on every segment volume, ``>= 1``. Default 1.0.
     spinup : {"constant"} or None, optional
@@ -90,20 +82,109 @@ def full(
     Returns
     -------
     numpy.ndarray
-        Mean travel time [days] of shape ``(len(nodes), n_bins)``, with ``n_bins`` taken from
-        ``cout_tedges`` for ``"endmember_to_source"`` and from ``tedges`` for
-        ``"source_to_endmember"``. NaN marks bins the record does not constrain.
+        Mean travel time [days] of shape ``(len(report_nodes), len(tedges) - 1)``. NaN marks
+        bins the record does not constrain.
 
     Raises
     ------
     ValueError
-        If ``direction`` is not one of the two accepted values, if a time axis is not
-        strictly increasing or has the wrong length, if ``flow`` holds NaN or negative
-        values, if ``retardation_factor < 1``, or if a requested node is not part of the
-        network.
+        If a time axis is not strictly increasing or has the wrong length, if ``flow`` holds
+        NaN or negative values, if ``retardation_factor < 1``, or if a requested node is not
+        part of the network.
 
     See Also
     --------
+    endmember_to_source : The other direction -- the age of the water delivered now.
+    pipetransport.transport.source_to_endmember : Transport behind these same travel times.
+    :ref:`concept-water-age` : What age means in a distribution network.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> import pandas as pd
+    >>> from pipetransport.examples import example_network, example_demand
+    >>> from pipetransport.residence_time import source_to_endmember
+    >>>
+    >>> network = example_network()
+    >>> tedges = pd.date_range("2025-06-01", "2025-06-08", freq="h")
+    >>> demand = example_demand(tedges=tedges, network=network)
+    >>> lead = source_to_endmember(flow=demand, tedges=tedges, network=network)
+    >>> lead.shape
+    (4, 168)
+
+    T4 sits at the end of a long, thin, low-demand branch, so its water takes longest:
+
+    >>> bool(np.nanmean(lead[3]) > np.nanmean(lead[0]))
+    True
+    """
+    tedges = pd.DatetimeIndex(tedges)
+    _, transfer, n_pad = network_transfer(
+        network=network,
+        flow=flow,
+        tedges=tedges,
+        cout_tedges=tedges,
+        report_nodes=report_nodes,
+        decay_rate=0.0,
+        retardation_factor=retardation_factor,
+        spinup=spinup,
+    )
+    # The warm-start prefix is an assumed history, not a result; drop it so the rows align
+    # with the user-provided tedges.
+    return transfer.residence_time_in[:, n_pad:]
+
+
+def endmember_to_source(
+    *,
+    flow: Mapping[str, npt.ArrayLike],
+    tedges: pd.DatetimeIndex,
+    cout_tedges: pd.DatetimeIndex,
+    network: PipeNetwork,
+    report_nodes: list[str] | tuple[str, ...] | None = None,
+    retardation_factor: float = 1.0,
+    spinup: str | None = "constant",
+) -> npt.NDArray[np.floating]:
+    """Compute how long ago the water delivered in each output bin left the source.
+
+    The average over a ``cout_tedges`` bin is weighted by the node's own throughflow, which
+    is what makes it the age of the water the tap actually delivered.
+
+    Parameters
+    ----------
+    flow : mapping
+        Demand at every endmember [m³/day], keyed by endmember name: one bin-constant array
+        per endmember on the ``tedges`` bins.
+    tedges : pandas.DatetimeIndex
+        Time edges of the ``flow`` bins. Length ``n_flow + 1``.
+    cout_tedges : pandas.DatetimeIndex
+        Time edges of the output bins; alignment and resolution are free.
+    network : PipeNetwork
+        The distribution network.
+    report_nodes : list of str or None, optional
+        Nodes to report at, in output row order. Any node is allowed; a junction reports the
+        age of the water passing through it. Defaults to ``network.endmembers``.
+    retardation_factor : float, optional
+        Multiplier on every segment volume, ``>= 1``. Default 1.0.
+    spinup : {"constant"} or None, optional
+        ``"constant"`` (default) warm-starts the record by extending it backwards at the
+        first observed demand, so the earliest bins carry a value instead of NaN. ``None``
+        keeps strict validity.
+
+    Returns
+    -------
+    numpy.ndarray
+        Mean age [days] of shape ``(len(report_nodes), len(cout_tedges) - 1)``. NaN marks
+        bins the record does not constrain.
+
+    Raises
+    ------
+    ValueError
+        If a time axis is not strictly increasing or has the wrong length, if ``flow`` holds
+        NaN or negative values, if ``retardation_factor < 1``, or if a requested node is not
+        part of the network.
+
+    See Also
+    --------
+    source_to_endmember : The other direction -- the lead time of the water produced now.
     pipetransport.transport.source_to_endmember : Transport behind these same travel times.
     pipetransport.logremoval.residence_time_to_log_removal : Turn age into first-order removal.
     :ref:`concept-water-age` : What age means in a distribution network.
@@ -120,12 +201,14 @@ def full(
     >>> import numpy as np
     >>> import pandas as pd
     >>> from pipetransport.examples import example_network, example_demand
-    >>> from pipetransport.residence_time import full
+    >>> from pipetransport.residence_time import endmember_to_source
     >>>
     >>> network = example_network()
     >>> tedges = pd.date_range("2025-06-01", "2025-06-08", freq="h")
     >>> demand = example_demand(tedges=tedges, network=network)
-    >>> age = full(flow=demand, tedges=tedges, network=network)
+    >>> age = endmember_to_source(
+    ...     flow=demand, tedges=tedges, cout_tedges=tedges, network=network
+    ... )
     >>> age.shape
     (4, 168)
 
@@ -134,22 +217,14 @@ def full(
     >>> bool(np.nanmean(age[3]) > np.nanmean(age[0]))
     True
     """
-    if direction not in _DIRECTIONS:
-        msg = f"direction must be one of {_DIRECTIONS}; got {direction!r}"
-        raise ValueError(msg)
-    tedges = pd.DatetimeIndex(tedges)
-    _, transfer, n_pad = network_transfer(
+    _, transfer, _ = network_transfer(
         network=network,
         flow=flow,
-        tedges=tedges,
-        cout_tedges=tedges if cout_tedges is None else cout_tedges,
-        nodes=nodes,
+        tedges=pd.DatetimeIndex(tedges),
+        cout_tedges=cout_tedges,
+        report_nodes=report_nodes,
         decay_rate=0.0,
         retardation_factor=retardation_factor,
         spinup=spinup,
     )
-    if direction == "endmember_to_source":
-        return transfer.residence_time_out
-    # The warm-start prefix is an assumed history, not a result; drop it so the rows align
-    # with the user-provided tedges.
-    return transfer.residence_time_in[:, n_pad:]
+    return transfer.residence_time_out

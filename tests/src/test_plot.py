@@ -130,20 +130,21 @@ def test_network_colour_spans_the_value_range(network):
 
 def test_network_values_override_recolours_and_relabels(network, hourly_tedges):
     demand = example_demand(tedges=hourly_tedges, network=network)
-    mean_flow = pd.Series(network.segment_flow(flow=demand).mean(axis=1), index=network.segments.index)
+    mean_flow = dict(zip(network.segments.index, network.segment_flow(flow=demand).mean(axis=1), strict=True))
     ax = plot.network(network=network, values=mean_flow, value_label="mean throughflow [m³/day]")
 
     colors = [line.get_color() for line in ax.get_lines()[: len(network.segments)]]
-    span = (mean_flow - mean_flow.min()) / (mean_flow.max() - mean_flow.min())
-    np.testing.assert_allclose(colors, [_ramp(f) for f in span.to_numpy(float)], rtol=0.0, atol=0.0)
+    values = np.array([mean_flow[name] for name in network.segments.index])
+    span = (values - values.min()) / (values.max() - values.min())
+    np.testing.assert_allclose(colors, [_ramp(f) for f in span], rtol=0.0, atol=0.0)
     # The trunk carries the whole production and C-T4 a tenth of it, so they take the ramp ends.
-    assert mean_flow.idxmax() == "Plant-A"
-    assert mean_flow.idxmin() == "C-T4"
+    assert max(mean_flow, key=mean_flow.get) == "Plant-A"
+    assert min(mean_flow, key=mean_flow.get) == "C-T4"
     assert ax.figure.axes[1].get_ylabel() == "mean throughflow [m³/day]"
 
 
 def test_network_raises_when_values_misses_a_segment(network):
-    partial = pd.Series(1.0, index=network.segments.index[:-1])
+    partial = dict.fromkeys(network.segments.index[:-1], 1.0)
     with pytest.raises(ValueError, match=r"values is missing segment\(s\): \['C-T4'\]"):
         plot.network(network=network, values=partial)
 
@@ -233,15 +234,16 @@ def test_flow_allocation_labels_axes_and_legend(network, short_tedges):
     np.testing.assert_allclose(ax.get_xlim(), mdates.date2num([short_tedges[0], short_tedges[-1]]), rtol=1e-13)
 
 
-def test_flow_allocation_accepts_an_array_and_draws_into_the_given_ax(network, short_tedges):
+def test_flow_allocation_draws_into_the_given_ax(network, short_tedges):
     demand = example_demand(tedges=short_tedges, network=network)
     fig, ax = plt.subplots()
-    returned = plot.flow_allocation(network=network, flow=demand.to_numpy(float).T, tedges=short_tedges, ax=ax)
+    returned = plot.flow_allocation(network=network, flow=demand, tedges=short_tedges, ax=ax)
 
     assert returned is ax
     assert plt.get_fignums() == [fig.number]
-    # Array input ordered as network.endmembers is the same picture as the named DataFrame.
-    reference = plot.flow_allocation(network=network, flow=demand, tedges=short_tedges)
+    # Insertion order is not row order: the keys decide, so a shuffled mapping draws the same.
+    shuffled = {name: demand[name] for name in reversed(list(demand))}
+    reference = plot.flow_allocation(network=network, flow=shuffled, tedges=short_tedges)
     for drawn, expected in zip(ax.get_lines(), reference.get_lines(), strict=True):
         np.testing.assert_allclose(drawn.get_ydata(), expected.get_ydata(), rtol=0.0, atol=0.0)
 
@@ -252,14 +254,13 @@ def test_flow_allocation_accepts_an_array_and_draws_into_the_given_ax(network, s
 
 
 def test_endmember_series_draws_one_step_curve_per_row(network, short_tedges):
-    values = np.vstack([np.linspace(1.0, 4.0, len(short_tedges) - 1) * (i + 1) for i in range(4)])
-    ax = plot.endmember_series(
-        values=values, tedges=short_tedges, labels=list(network.endmembers), ylabel="water age [h]", title="Age"
-    )
+    rows = [np.linspace(1.0, 4.0, len(short_tedges) - 1) * (i + 1) for i in range(4)]
+    values = dict(zip(network.endmembers, rows, strict=True))
+    ax = plot.endmember_series(values=values, tedges=short_tedges, ylabel="water age [h]", title="Age")
 
     lines = ax.get_lines()
     assert len(lines) == 4
-    for line, row, color in zip(lines, values, plot.series_colors(4), strict=True):
+    for line, row, color in zip(lines, rows, plot.series_colors(4), strict=True):
         expected_x, expected_y = step_plot_coords(short_tedges, row)
         np.testing.assert_array_equal(line.get_xdata(), expected_x)
         np.testing.assert_allclose(line.get_ydata(), expected_y, rtol=0.0, atol=0.0)
@@ -269,37 +270,37 @@ def test_endmember_series_draws_one_step_curve_per_row(network, short_tedges):
     assert [text.get_text() for text in ax.get_legend().get_texts()] == list(network.endmembers)
 
 
-def test_endmember_series_accepts_a_single_flat_row(short_tedges):
+def test_endmember_series_accepts_a_single_series(short_tedges):
     row = np.linspace(0.0, 1.0, len(short_tedges) - 1)
-    ax = plot.endmember_series(values=row, tedges=short_tedges, labels=["T1"])
+    ax = plot.endmember_series(values={"T1": row}, tedges=short_tedges)
 
     assert len(ax.get_lines()) == 1
     np.testing.assert_allclose(ax.get_lines()[0].get_ydata(), np.repeat(row, 2), rtol=0.0, atol=0.0)
 
 
 @pytest.mark.parametrize(
-    ("shape", "labels", "message"),
+    ("values", "wrong"),
     [
-        ((2, 3), ["a", "b"], r"values must have shape \(2, 4\), got \(2, 3\)"),
-        ((3, 4), ["a", "b"], r"values must have shape \(2, 4\), got \(3, 4\)"),
-        ((4,), ["a", "b"], r"values must have shape \(2, 4\), got \(1, 4\)"),
+        pytest.param({"a": np.zeros(3), "b": np.zeros(4)}, r"\['a'\]", id="one series short"),
+        pytest.param({"a": np.zeros(5), "b": np.zeros(5)}, r"\['a', 'b'\]", id="every series long"),
+        pytest.param({"a": np.zeros((2, 4))}, r"\['a'\]", id="two-dimensional"),
     ],
 )
-def test_endmember_series_raises_on_a_shape_mismatch(shape, labels, message):
+def test_endmember_series_raises_on_a_length_mismatch(values, wrong):
     tedges = pd.date_range("2025-06-01", periods=5, freq="h")
-    with pytest.raises(ValueError, match=message):
-        plot.endmember_series(values=np.zeros(shape), tedges=tedges, labels=labels)
+    with pytest.raises(ValueError, match="every series in values must have length 4; wrong: " + wrong):
+        plot.endmember_series(values=values, tedges=tedges)
 
 
 def test_endmember_series_labels_the_peak_of_each_series_up_to_four():
     tedges = pd.date_range("2025-06-01", periods=5, freq="h")
-    values = np.array([[1.0, 5.0, 2.0, 0.0], [3.0, 1.0, 1.0, 9.0], [4.0, 2.0, 7.0, 1.0], [0.0, 0.0, 1.0, 0.0]])
+    rows = np.array([[1.0, 5.0, 2.0, 0.0], [3.0, 1.0, 1.0, 9.0], [4.0, 2.0, 7.0, 1.0], [0.0, 0.0, 1.0, 0.0]])
     labels = ["a", "b", "c", "d"]
-    ax = plot.endmember_series(values=values, tedges=tedges, labels=labels)
+    ax = plot.endmember_series(values=dict(zip(labels, rows, strict=True)), tedges=tedges)
 
     assert len(labels) == _MAX_DIRECT_LABELS
     assert [text.get_text() for text in ax.texts] == labels
-    for text, row, color in zip(ax.texts, values, plot.series_colors(4), strict=True):
+    for text, row, color in zip(ax.texts, rows, plot.series_colors(4), strict=True):
         peak = int(np.argmax(row))
         # The label sits on the step curve, at the left edge of the peak bin where the step starts.
         assert text.xy[0] == tedges[peak]
@@ -309,8 +310,8 @@ def test_endmember_series_labels_the_peak_of_each_series_up_to_four():
 
 def test_endmember_series_drops_the_direct_labels_beyond_four():
     tedges = pd.date_range("2025-06-01", periods=5, freq="h")
-    values = np.arange(20.0).reshape(5, 4)
-    ax = plot.endmember_series(values=values, tedges=tedges, labels=list("abcde"))
+    values = dict(zip("abcde", np.arange(20.0).reshape(5, 4), strict=True))
+    ax = plot.endmember_series(values=values, tedges=tedges)
 
     assert len(values) == _MAX_DIRECT_LABELS + 1
     assert len(ax.texts) == 0
@@ -323,8 +324,8 @@ def test_endmember_series_skips_the_label_of_an_all_nan_row():
     # NaN marks output bins the record does not constrain; a series that is entirely unconstrained
     # has no peak to point at, and must not take the whole figure down with it.
     tedges = pd.date_range("2025-06-01", periods=5, freq="h")
-    values = np.array([[np.nan] * 4, [1.0, 3.0, np.nan, 2.0]])
-    ax = plot.endmember_series(values=values, tedges=tedges, labels=["blind", "seen"])
+    values = {"blind": np.full(4, np.nan), "seen": np.array([1.0, 3.0, np.nan, 2.0])}
+    ax = plot.endmember_series(values=values, tedges=tedges)
 
     assert [text.get_text() for text in ax.texts] == ["seen"]
     assert ax.texts[0].xy == (tedges[1], 3.0)
@@ -334,8 +335,8 @@ def test_endmember_series_skips_the_label_of_an_all_nan_row():
 
 def test_endmember_series_draws_into_the_given_ax_and_returns_it(short_tedges):
     fig, (top, bottom) = plt.subplots(2, 1)
-    values = np.zeros((2, len(short_tedges) - 1))
-    returned = plot.endmember_series(values=values, tedges=short_tedges, labels=["a", "b"], ax=bottom)
+    values = {"a": np.zeros(len(short_tedges) - 1), "b": np.zeros(len(short_tedges) - 1)}
+    returned = plot.endmember_series(values=values, tedges=short_tedges, ax=bottom)
 
     assert returned is bottom
     assert len(bottom.get_lines()) == 2

@@ -159,7 +159,7 @@ and must arrive within the interval the map sends that bin to, carrying its wate
    cin = np.zeros(72)
    cin[30] = 1.0
    cout = source_to_endmember(
-       cin=cin, flow=demand[None, :], tedges=tedges, cout_tedges=tedges, network=network
+       cin=cin, flow={"T1": demand}, tedges=tedges, cout_tedges=tedges, network=network
    )[0]
    expected = np.arange(int(np.floor(arrival[30] * 24)), int(np.ceil(arrival[31] * 24)))
    np.testing.assert_array_equal(np.flatnonzero(cout > 0.0), expected)
@@ -235,7 +235,7 @@ throughflow-weighted mean, and the package reproduces it exactly:
    demand = example_demand(tedges=tedges, network=network)
    cin = 1.0 + 0.3 * np.sin(2 * np.pi * np.arange(len(tedges) - 1) / 17.0)
 
-   kwargs = {"cin": cin, "flow": demand, "tedges": tedges, "network": network, "nodes": ["T4"]}
+   kwargs = {"cin": cin, "flow": demand, "tedges": tedges, "network": network, "report_nodes": ["T4"]}
    hourly = source_to_endmember(cout_tedges=tedges, **kwargs)[0]
    six_hourly = source_to_endmember(cout_tedges=tedges[::6], **kwargs)[0]
 
@@ -246,6 +246,32 @@ throughflow-weighted mean, and the package reproduces it exactly:
 
    plain = hourly.reshape(-1, 6).mean(axis=1)  # the wrong average
    print(f"unweighted mean is off by up to {np.nanmax(np.abs(plain - six_hourly)):.3f}")
+
+.. _concept-one-grid:
+
+One grid, constant per bin
+--------------------------
+
+Every input series lives on ``tedges`` and is constant over each bin; only ``cout_tedges`` is free,
+for the reason just given. Multi-series inputs are **mappings** --- ``flow`` keyed by endmember,
+``surface_temperature`` by land-cover class, ``cout``/``tout`` by the node the measurement was taken
+at --- and the arrays inside them are positional on ``tedges``. There is no index for the package to
+read or for you to misalign, and the keys are checked against the network, so a typo is an error
+rather than a silently shifted row. In the reverse direction the keys go further: they *are* the
+observation set, which is why those functions take no node list.
+
+Bringing mixed-resolution data onto the one grid is deliberately your task, and the two ways of
+doing it are not equally safe:
+
+- **Refining is exact.** A piecewise-constant series subdivides onto any finer grid without error,
+  so the shared grid costs nothing as long as it is the finest grid any input lives on.
+- **Coarsening is an uncontrolled approximation.** Averaging a finer concentration onto the shared
+  grid needs flow-weighting to preserve the delivered mass (the section above), and averaging a
+  finer flow aliases intermittency: a 100 mm main drawing each hour's water in its first quarter
+  hour, modelled against its hourly mean, differs by 0.069 K in delivered temperature on a mild
+  configuration --- half a per cent of the plant-to-soil contrast.
+
+When resolutions differ, refine everything to the finest grid; never coarsen to the coarsest.
 
 .. _concept-effective-volume:
 
@@ -316,18 +342,19 @@ of age.
    import pandas as pd
 
    from pipetransport.examples import example_network
-   from pipetransport.residence_time import full
+   from pipetransport.residence_time import endmember_to_source as water_age
 
    network = example_network()
    tedges = pd.date_range("2025-06-01", periods=49, freq="h")
-   demand = np.array([[240.0], [360.0], [120.0], [80.0]]) * np.ones(48)  # constant -> f is fixed
-   production = demand[:, 0].sum()
+   # constant demand -> every flow fraction f is fixed
+   demand = {name: np.full(48, rate) for name, rate in zip(network.endmembers, (240.0, 360.0, 120.0, 80.0))}
+   production = sum(series[0] for series in demand.values())
 
    fraction = network.segment_flow(flow=demand)[:, 0] / production
    volume = network.segments["volume"].to_numpy()
    row_of = {name: i for i, name in enumerate(network.segments.index)}
 
-   age = full(flow=demand, tedges=tedges, network=network)  # days
+   age = water_age(flow=demand, tedges=tedges, cout_tedges=tedges, network=network)  # days
    for i, node in enumerate(network.endmembers):
        rows = [row_of[segment] for segment in network.paths[node]]
        effective = np.sum(volume[rows] / fraction[rows])
@@ -338,7 +365,7 @@ of age.
    # Mass conservation ties the two together: flow-weighting the effective volumes over the
    # endmembers returns the total network water volume, so the mean age of all delivered water
    # is the network turnover time, V_total / Q_0.
-   share = demand[:, 0] / production
+   share = np.array([demand[name][0] for name in network.endmembers]) / production
    np.testing.assert_allclose(share @ age[:, -1], network.segments["volume"].sum() / production)
 
 In the example network T4's path holds *less* water than T1's (330 m³ against 371 m³) yet its
@@ -360,15 +387,18 @@ decay, disinfection by-product formation, nitrification, biofilm growth, tempera
 with the ground --- and because it is one of the few things a utility can actually change, through
 network design, valving and flushing.
 
-:func:`pipetransport.residence_time.full` reports it in two directions, which answer different
-questions:
+:mod:`pipetransport.residence_time` reports it as a pair, one function per question:
 
-- ``direction="endmember_to_source"`` (default): *how old is the water arriving now?* Averaged over
-  each ``cout_tedges`` bin with the node's throughflow as weight, i.e. uniformly in the label
-  (:ref:`concept-label-coordinate`).
-- ``direction="source_to_endmember"``: *how long until the water produced now arrives?* Averaged
-  over each ``tedges`` bin, weighted by the volume of that bin's production that is actually
-  destined for this node --- so production that mostly serves other branches contributes little.
+- :func:`~pipetransport.residence_time.endmember_to_source`: *how old is the water arriving now?*
+  Averaged over each ``cout_tedges`` bin with the node's throughflow as weight, i.e. uniformly in
+  the label (:ref:`concept-label-coordinate`).
+- :func:`~pipetransport.residence_time.source_to_endmember`: *how long until the water produced now
+  arrives?* Averaged over each ``tedges`` bin, weighted by the volume of that bin's production that
+  is actually destined for this node --- so production that mostly serves other branches
+  contributes little.
+
+The names match the transport and heat pairs, but neither direction takes an observation here, so
+both report per node and both keep ``report_nodes``.
 
 Any node may be a reporting node, not just an endmember; a junction reports the age of the water
 passing through it, and the source reports zero.
@@ -394,17 +424,17 @@ variable age:
    import pandas as pd
 
    from pipetransport.examples import example_demand, example_network
-   from pipetransport.residence_time import full
+   from pipetransport.residence_time import endmember_to_source as water_age
 
    network = example_network()
    tedges = pd.date_range("2025-06-01", "2025-06-05", freq="h")
    demand = example_demand(tedges=tedges, network=network)  # deliberately non-proportional
 
-   production = demand.sum(axis=1).to_numpy()
+   production = sum(demand.values())
    print(f"production swings {production.min():.0f}-{production.max():.0f} m3/day")
    print(f"T4's own demand swings {demand['T4'].min():.0f}-{demand['T4'].max():.0f} m3/day")
 
-   age_hours = full(flow=demand, tedges=tedges, network=network) * 24.0
+   age_hours = water_age(flow=demand, tedges=tedges, cout_tedges=tedges, network=network) * 24.0
    for node, series in zip(network.endmembers, age_hours):
        print(f"{node}: age {np.nanmin(series):5.2f}-{np.nanmax(series):5.2f} h")
 
@@ -499,7 +529,7 @@ average of an exponential exceeds the exponential of the average (Jensen's inequ
 :math:`10^{-3}` on 12-hour bins --- small, because a single bin gathers a narrow band of ages, but it
 grows with the width of that band and with :math:`k`. Pass ``decay_rate`` to
 :func:`~pipetransport.transport.source_to_endmember` for the exact residual; use
-:func:`~pipetransport.residence_time.full` for the age itself.
+:func:`~pipetransport.residence_time.endmember_to_source` for the age itself.
 
 .. _concept-relaxation:
 
@@ -580,11 +610,11 @@ pay off:
    tedges = pd.date_range("2025-01-01", periods=120 * 24 + 1, freq="h")
    n_bins = len(tedges) - 1
    transit_days = 2.0 / 24.0
-   flow = np.full((1, n_bins), float(network.segments.loc["Plant-T1", "volume"]) / transit_days)
+   flow = {"T1": np.full(n_bins, float(network.segments.loc["Plant-T1", "volume"]) / transit_days)}
    shared = dict(
        tin=np.full(n_bins, 8.0), flow=flow, tedges=tedges, cout_tedges=tedges,
        network=network, soil=soil,
-       surface_temperature=pd.DataFrame({"grass": np.full(n_bins, 20.0)}),
+       surface_temperature={"grass": np.full(n_bins, 20.0)},
    )
 
    two_way = source_to_endmember(**shared)

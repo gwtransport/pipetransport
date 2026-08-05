@@ -26,7 +26,8 @@ Pick the module by the question, not by the quantity.
        :func:`~pipetransport.transport.endmember_to_source`
    * - :mod:`pipetransport.residence_time`
      - *How old is the water delivered now --- or how long until the water produced now arrives?*
-     - :func:`~pipetransport.residence_time.full`
+     - :func:`~pipetransport.residence_time.source_to_endmember`,
+       :func:`~pipetransport.residence_time.endmember_to_source`
    * - :mod:`pipetransport.logremoval`
      - *What decay rate does each pipe deserve, and how much disinfectant or pathogen credit is
        left?*
@@ -83,8 +84,8 @@ one regularized banded least-squares problem. ``NaN`` in the measurements marks 
 sparse grab-sample campaign needs no special handling, and several sampling points reinforce one
 another because each constrains a different, demand-dependent window of the production history.
 
-**4. Read the age.** :func:`~pipetransport.residence_time.full` returns the travel times underlying
-the same operator, in either direction (:ref:`concept-water-age`). Use it as a diagnostic --- for
+**4. Read the age.** The :mod:`~pipetransport.residence_time` pair returns the travel times
+underlying the same operator, one function per direction (:ref:`concept-water-age`). Use it as a diagnostic --- for
 siting monitoring points, judging flushing, or explaining a residual profile --- not as a shortcut
 to the residual itself, which :func:`~pipetransport.transport.source_to_endmember` computes exactly.
 
@@ -117,7 +118,7 @@ Forward transport, water age and chlorine residual for the example network, in o
        residence_time_to_log_removal,
        segment_decay_rate,
    )
-   from pipetransport.residence_time import full
+   from pipetransport.residence_time import endmember_to_source as water_age
    from pipetransport.transport import source_to_endmember
 
    network = example_network()
@@ -131,7 +132,7 @@ Forward transport, water age and chlorine residual for the example network, in o
        cin=np.ones(len(tedges) - 1), flow=demand, tedges=tedges,
        cout_tedges=tedges, network=network, decay_rate=decay,
    )
-   age = full(flow=demand, tedges=tedges, network=network)  # days
+   age = water_age(flow=demand, tedges=tedges, cout_tedges=tedges, network=network)  # days
 
    # Log removal at the bulk rate alone: a diagnostic reading of the age, not the residual, which
    # carries the wall term too and comes from the transport call above.

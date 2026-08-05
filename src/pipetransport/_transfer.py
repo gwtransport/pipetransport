@@ -99,6 +99,7 @@ See the ./LICENSE file or go to https://github.com/gwtransport/pipetransport/blo
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
@@ -810,10 +811,10 @@ def apply_segment_targets(
 def network_transfer(
     *,
     network: PipeNetwork,
-    flow: npt.ArrayLike | pd.DataFrame | dict,
+    flow: Mapping[str, npt.ArrayLike] | npt.NDArray[np.floating],
     tedges: pd.DatetimeIndex,
     cout_tedges: pd.DatetimeIndex,
-    nodes: list[str] | tuple[str, ...] | None,
+    report_nodes: list[str] | tuple[str, ...] | None,
     decay_rate: float | pd.Series,
     retardation_factor: float,
     spinup: str | None,
@@ -834,7 +835,7 @@ def network_transfer(
         Input bin edges, length ``n_cin + 1``.
     cout_tedges : DatetimeIndex
         Output bin edges, length ``n_cout + 1``. May differ in alignment and resolution.
-    nodes : list of str or None
+    report_nodes : list of str or None
         Nodes to report at. ``None`` selects :attr:`~pipetransport.network.PipeNetwork.endmembers`.
     decay_rate : float or Series
         First-order decay rate [1/day], one value for every segment or a Series indexed by
@@ -881,7 +882,7 @@ def network_transfer(
         decay = np.broadcast_to(decay, (len(network.segments),))
     _validate_non_negative(decay, name="decay_rate")
 
-    requested = tuple(network.endmembers) if nodes is None else tuple(nodes)
+    requested = tuple(network.endmembers) if report_nodes is None else tuple(report_nodes)
     unknown = [node for node in requested if node not in network.paths]
     if unknown:
         msg = f"unknown node(s): {unknown}; network nodes are {list(network.nodes)}"

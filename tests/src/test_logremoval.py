@@ -21,7 +21,7 @@ from pipetransport.logremoval import (
     residence_time_to_log_removal,
     segment_decay_rate,
 )
-from pipetransport.residence_time import full as residence_time_full
+from pipetransport.residence_time import endmember_to_source as residence_time_at_taps
 from pipetransport.transport import source_to_endmember
 
 LN10 = 2.302585092994046  # ln(10), correctly rounded to double precision
@@ -59,7 +59,14 @@ def test_residence_time_to_log_removal_propagates_unconstrained_bins(network, sh
     demand = diurnal_demand(network, short_tedges)
     log10_decay_rate = 0.4
     # spinup=None leaves the earliest bins unconstrained, so the age array carries NaN.
-    age = residence_time_full(flow=demand, tedges=short_tedges, network=network, nodes=["T1", "T4"], spinup=None)
+    age = residence_time_at_taps(
+        flow=demand,
+        tedges=short_tedges,
+        cout_tedges=short_tedges,
+        network=network,
+        report_nodes=["T1", "T4"],
+        spinup=None,
+    )
 
     log_removal = residence_time_to_log_removal(residence_times=age, log10_decay_rate=log10_decay_rate)
 
@@ -335,7 +342,7 @@ def test_segment_decay_rate_drives_transport_to_the_closed_form_residual(network
         tedges=hourly_tedges,
         cout_tedges=hourly_tedges,
         network=network,
-        nodes=nodes,
+        report_nodes=nodes,
         decay_rate=rates,
     )
 
@@ -373,7 +380,7 @@ def test_segment_decay_rate_drives_transport_to_the_closed_form_residual(network
             tedges=hourly_tedges,
             cout_tedges=hourly_tedges,
             network=network,
-            nodes=nodes,
+            report_nodes=nodes,
             decay_rate=reversed_rates,
         ),
         cout,

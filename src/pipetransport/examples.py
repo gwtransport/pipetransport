@@ -27,6 +27,7 @@ See the ./LICENSE file or go to https://github.com/gwtransport/pipetransport/blo
 from __future__ import annotations
 
 import numpy as np
+import numpy.typing as npt
 import pandas as pd
 
 from pipetransport.network import PipeNetwork
@@ -77,7 +78,7 @@ def example_network() -> PipeNetwork:
     return PipeNetwork(segments=segments, source="Plant")
 
 
-def example_demand(*, tedges: pd.DatetimeIndex, network: PipeNetwork) -> pd.DataFrame:
+def example_demand(*, tedges: pd.DatetimeIndex, network: PipeNetwork) -> dict[str, npt.NDArray[np.floating]]:
     """Build a diurnal, deliberately non-proportional demand pattern for a network.
 
     Each endmember follows ``mean * (1 + amplitude * cos(2*pi*(hour - peak) / 24))`` with its
@@ -88,13 +89,13 @@ def example_demand(*, tedges: pd.DatetimeIndex, network: PipeNetwork) -> pd.Data
     tedges : pandas.DatetimeIndex
         Time bin edges, ``n + 1`` edges for ``n`` bins.
     network : PipeNetwork
-        Network whose endmembers the columns follow.
+        Network whose endmembers the mapping is keyed by.
 
     Returns
     -------
-    pandas.DataFrame
-        Demand [m³/day] with ``n`` rows indexed by bin midpoint and one column per endmember,
-        in ``network.endmembers`` order. Ready to pass as ``flow``.
+    dict of str to ndarray
+        Demand [m³/day] keyed by endmember name, in ``network.endmembers`` order, each an
+        array of ``n`` bin-constant values on ``tedges``. Ready to pass as ``flow``.
 
     See Also
     --------
@@ -103,20 +104,21 @@ def example_demand(*, tedges: pd.DatetimeIndex, network: PipeNetwork) -> pd.Data
 
     Examples
     --------
+    >>> import numpy as np
     >>> import pandas as pd
     >>> from pipetransport.examples import example_network, example_demand
     >>> network = example_network()
     >>> demand = example_demand(
     ...     tedges=pd.date_range("2025-06-01", periods=25, freq="h"), network=network
     ... )
-    >>> list(demand.columns)
+    >>> list(demand)
     ['T1', 'T2', 'T3', 'T4']
 
     Averaged over the day every endmember hits its mean, but the split is far from constant:
 
     >>> float(demand["T4"].mean().round(6))
     80.0
-    >>> share = demand["T4"] / demand.sum(axis=1)
+    >>> share = demand["T4"] / np.sum(list(demand.values()), axis=0)
     >>> bool(share.max() > 1.6 * share.min())
     True
     """
@@ -124,13 +126,10 @@ def example_demand(*, tedges: pd.DatetimeIndex, network: PipeNetwork) -> pd.Data
     midpoint = tedges[:-1] + (tedges[1:] - tedges[:-1]) / 2
     hour = midpoint.hour + midpoint.minute / 60.0 + midpoint.second / 3600.0
     n_endmember = len(network.endmembers)
-    return pd.DataFrame(
-        {
-            name: mean * (1.0 + amplitude * np.cos(2.0 * np.pi * (hour - peak) / 24.0))
-            for name, (mean, amplitude, peak) in (
-                (name, _PROFILES.get(name, (200.0, 0.4, 6.0 + 24.0 * i / n_endmember)))
-                for i, name in enumerate(network.endmembers)
-            )
-        },
-        index=midpoint,
-    )
+    return {
+        name: np.asarray(mean * (1.0 + amplitude * np.cos(2.0 * np.pi * (hour - peak) / 24.0)), dtype=float)
+        for name, (mean, amplitude, peak) in (
+            (name, _PROFILES.get(name, (200.0, 0.4, 6.0 + 24.0 * i / n_endmember)))
+            for i, name in enumerate(network.endmembers)
+        )
+    }

@@ -47,6 +47,11 @@ def _oracle_path(*, network, demand, node, tedges, decay=None):
     )
 
 
+def _by_node(nodes, values):
+    """Key a forward result by the node each row belongs to, ready to pass back as ``cout``."""
+    return dict(zip(nodes, values, strict=True))
+
+
 def _arrival_days(*, network, demand, node, tedges):
     """Arrival time at ``node`` of the parcel leaving the source at each edge of ``tedges``.
 
@@ -76,7 +81,7 @@ def test_constant_source_is_delivered_unchanged(
     cin = np.full(len(hourly_tedges) - 1, 1.0)
 
     cout = source_to_endmember(
-        cin=cin, flow=demand, tedges=hourly_tedges, cout_tedges=cout_tedges, network=network, nodes=nodes
+        cin=cin, flow=demand, tedges=hourly_tedges, cout_tedges=cout_tedges, network=network, report_nodes=nodes
     )
 
     assert cout.shape == (len(nodes), len(cout_tedges) - 1)
@@ -251,10 +256,10 @@ def test_batched_nodes_equal_single_node_calls(network, hourly_tedges, diurnal_d
         "spinup": None,
     }
 
-    batched = source_to_endmember(cin=cin, nodes=nodes, **shared)
+    batched = source_to_endmember(cin=cin, report_nodes=nodes, **shared)
 
     for i, node in enumerate(nodes):
-        single = source_to_endmember(cin=cin, nodes=[node], **shared)
+        single = source_to_endmember(cin=cin, report_nodes=[node], **shared)
         assert np.array_equal(np.isnan(batched[i]), np.isnan(single[0]))
         np.testing.assert_allclose(batched[i], single[0], rtol=1e-14, atol=0.0)
 
@@ -340,7 +345,7 @@ def test_matches_brute_force_oracle_without_decay(network, short_tedges, diurnal
         tedges=short_tedges,
         cout_tedges=cout_tedges,
         network=network,
-        nodes=[node],
+        report_nodes=[node],
         spinup=None,
     )
     reference = _oracle_path(network=network, demand=demand, node=node, tedges=short_tedges).cout(
@@ -366,7 +371,7 @@ def test_matches_brute_force_oracle_with_per_segment_decay(network, short_tedges
         tedges=short_tedges,
         cout_tedges=cout_tedges,
         network=network,
-        nodes=[node],
+        report_nodes=[node],
         decay_rate=decay,
         spinup=None,
     )
@@ -413,7 +418,7 @@ def test_transport_composes_through_an_internal_node(network, hourly_tedges, diu
     assert len(mid_tedges) > len(hourly_tedges)  # the arrival edges genuinely refine the grid
 
     quality_at_b = source_to_endmember(
-        cin=cin, flow=demand, tedges=hourly_tedges, cout_tedges=mid_tedges, network=network, nodes=["B"]
+        cin=cin, flow=demand, tedges=hourly_tedges, cout_tedges=mid_tedges, network=network, report_nodes=["B"]
     )[0]
     assert not np.isnan(quality_at_b).any()
 
@@ -435,10 +440,15 @@ def test_transport_composes_through_an_internal_node(network, hourly_tedges, diu
         hourly_tedges[0] + pd.Timedelta(days=2), hourly_tedges[0] + pd.Timedelta(days=9), freq="2h"
     )
     direct = source_to_endmember(
-        cin=cin, flow=demand, tedges=hourly_tedges, cout_tedges=cout_tedges, network=network, nodes=["T1"]
+        cin=cin, flow=demand, tedges=hourly_tedges, cout_tedges=cout_tedges, network=network, report_nodes=["T1"]
     )[0]
     composed = source_to_endmember(
-        cin=quality_at_b, flow=sub_demand, tedges=mid_tedges, cout_tedges=cout_tedges, network=sub_network, nodes=["T1"]
+        cin=quality_at_b,
+        flow=sub_demand,
+        tedges=mid_tedges,
+        cout_tedges=cout_tedges,
+        network=sub_network,
+        report_nodes=["T1"],
     )[0]
 
     assert not np.isnan(direct).any()
@@ -502,8 +512,8 @@ def test_an_over_cap_endmember_does_not_suppress_the_warm_start_of_its_siblings(
         "network": network,
     }
 
-    solo = source_to_endmember(nodes=["T1"], **shared)
-    both = source_to_endmember(nodes=["T1", "T2"], **shared)
+    solo = source_to_endmember(report_nodes=["T1"], **shared)
+    both = source_to_endmember(report_nodes=["T1", "T2"], **shared)
 
     assert not np.isnan(solo[0]).any(), "T1 sits behind 340 m3 and is warm-startable on its own"
     assert np.isnan(both[1]).any(), "T2 sits behind 2e6 m3 and cannot be warm-started at all"
@@ -525,9 +535,8 @@ def test_warm_start_reproduces_a_genuinely_constant_history(network, hourly_tedg
     above can see.
     """
     head = 72
-    diurnal = diurnal_demand(network, hourly_tedges).to_numpy(float).T
-    demand = diurnal.copy()
-    demand[:, :head] = diurnal[:, head][:, None]
+    diurnal = diurnal_demand(network, hourly_tedges)
+    demand = {name: np.concatenate([np.full(head, series[head]), series[head:]]) for name, series in diurnal.items()}
     cin = np.random.default_rng(3).uniform(0.5, 2.5, len(hourly_tedges) - 1)
     cin[:head] = cin[head]
 
@@ -542,7 +551,7 @@ def test_warm_start_reproduces_a_genuinely_constant_history(network, hourly_tedg
     )[:, head:]
     warm = source_to_endmember(
         cin=cin[head:],
-        flow=demand[:, head:],
+        flow={name: series[head:] for name, series in demand.items()},
         tedges=hourly_tedges[head:],
         cout_tedges=hourly_tedges[head:],
         network=network,
@@ -581,12 +590,11 @@ def test_round_trip_recovers_the_source_signal(network, hourly_tedges, diurnal_d
         "tedges": hourly_tedges,
         "cout_tedges": hourly_tedges,
         "network": network,
-        "nodes": nodes,
         "decay_rate": decay_rate,
     }
 
-    measured = source_to_endmember(cin=cin, **shared)
-    recovered = endmember_to_source(cout=measured, **shared)
+    measured = source_to_endmember(cin=cin, report_nodes=nodes, **shared)
+    recovered = endmember_to_source(cout=_by_node(nodes, measured), **shared)
 
     interior = slice(24, -24)
     np.testing.assert_allclose(recovered[interior], cin[interior], rtol=0.0, atol=1e-9)
@@ -617,13 +625,13 @@ def test_a_constant_source_under_decay_is_recovered_at_a_noise_working_lambda(ne
         "tedges": hourly_tedges,
         "cout_tedges": hourly_tedges,
         "network": network,
-        "nodes": ["T1", "T4"],
         "decay_rate": pd.Series(np.linspace(0.1, 0.8, len(network.segments)), index=network.segments.index),
     }
+    nodes = ["T1", "T4"]
 
-    measured = source_to_endmember(cin=cin, **shared)
+    measured = source_to_endmember(cin=cin, report_nodes=nodes, **shared)
     assert np.nanmean(measured) < 0.9 * constant, "the operator must actually attenuate, or the test is vacuous"
-    recovered = endmember_to_source(cout=measured, regularization_strength=1e-2, **shared)
+    recovered = endmember_to_source(cout=_by_node(nodes, measured), regularization_strength=1e-2, **shared)
 
     interior = slice(24, -24)
     np.testing.assert_allclose(recovered[interior], constant, rtol=0.0, atol=1e-9)
@@ -641,14 +649,15 @@ def test_a_production_spell_comes_back_nan_not_zero(single_pipe_35):
     """
     n_bins = 96
     tedges = pd.date_range("2025-06-01", periods=n_bins + 1, freq="h")
-    demand = np.full((1, n_bins), 600.0)
+    duty = np.full(n_bins, 600.0)
     shut = slice(33, 37)
-    demand[0, shut] = 0.0
+    duty[shut] = 0.0
+    demand = {"T1": duty}
     cin = _reverse_signal(n_bins)
     shared = {"flow": demand, "tedges": tedges, "cout_tedges": tedges, "network": single_pipe_35}
 
     cout = source_to_endmember(cin=cin, **shared)
-    recovered = endmember_to_source(cout=cout, **shared)
+    recovered = endmember_to_source(cout=_by_node(shared["network"].endmembers, cout), **shared)
 
     # The spell is the only thing lost besides the tail the record ends before delivering:
     # the transit is under two hours, so everything else arrives and is recovered.
@@ -683,11 +692,10 @@ def test_a_branch_closed_at_the_junction_leaves_the_crossing_bins_unconstrained(
         "tedges": hourly_tedges,
         "cout_tedges": hourly_tedges,
         "network": network,
-        "nodes": ["T2"],
     }
 
-    cout = source_to_endmember(cin=cin, **shared)
-    recovered = endmember_to_source(cout=cout, **shared)
+    cout = source_to_endmember(cin=cin, report_nodes=["T2"], **shared)
+    recovered = endmember_to_source(cout=_by_node(["T2"], cout), **shared)
 
     # Which source bins those are is settled away from the operator, with the oracle's root
     # finder: a bin whose water both enters and leaves the junction inside one idle window
@@ -714,15 +722,16 @@ def test_a_long_closure_does_not_inflate_the_operator_band(single_pipe):
     """
     n_bins = 3000
     tedges = pd.date_range("2025-06-01", periods=n_bins + 1, freq="h")
-    demand = np.full((1, n_bins), 2400.0)  # 100 m3/h through a 100 m3 pipe: one bin of transit
-    demand[0, 300:2700] = 0.0
+    duty = np.full(n_bins, 2400.0)  # 100 m3/h through a 100 m3 pipe: one bin of transit
+    duty[300:2700] = 0.0
+    demand = {"T1": duty}
 
     _, transfer, _ = network_transfer(
         network=single_pipe,
         flow=demand,
         tedges=tedges,
         cout_tedges=tedges,
-        nodes=None,
+        report_nodes=None,
         decay_rate=0.0,
         retardation_factor=1.0,
         spinup=None,
@@ -742,17 +751,16 @@ def test_round_trip_tolerates_a_measurement_outage(network, hourly_tedges, diurn
         "tedges": hourly_tedges,
         "cout_tedges": hourly_tedges,
         "network": network,
-        "nodes": nodes,
     }
 
-    measured = source_to_endmember(cin=cin, **shared)
+    measured = source_to_endmember(cin=cin, report_nodes=nodes, **shared)
     edges_days = tedges_to_days(hourly_tedges)
     outage_lo, outage_hi = 4.0, 5.5  # days since the record start
     blanked = (edges_days[:-1] >= outage_lo) & (edges_days[1:] <= outage_hi)
     assert blanked.sum() == 36
     gapped = np.where(blanked, np.nan, measured)
 
-    recovered = endmember_to_source(cout=gapped, **shared)
+    recovered = endmember_to_source(cout=_by_node(nodes, gapped), **shared)
 
     # Classify every source bin from arrival times solved independently of the package.
     unconstrained = np.ones(n_bins, dtype=bool)
@@ -800,7 +808,7 @@ def test_source_to_endmember_rejects_invalid_input(network, hourly_tedges, const
             network=network,
         )
     with pytest.raises(ValueError, match=r"unknown node\(s\): \['Reservoir'\]"):
-        source_to_endmember(cin=np.ones(n_bins), nodes=["T1", "Reservoir"], **shared)
+        source_to_endmember(cin=np.ones(n_bins), report_nodes=["T1", "Reservoir"], **shared)
     with pytest.raises(ValueError, match=r"retardation_factor must be >= 1\.0"):
         source_to_endmember(cin=np.ones(n_bins), retardation_factor=0.5, **shared)
     with pytest.raises(ValueError, match=r"decay_rate must be non-negative"):
@@ -820,12 +828,16 @@ def test_endmember_to_source_rejects_invalid_input(network, hourly_tedges, const
     shared = {"flow": demand, "tedges": hourly_tedges, "cout_tedges": hourly_tedges, "network": network}
     measured = source_to_endmember(cin=np.ones(n_bins), **shared)
 
-    with pytest.raises(ValueError, match=r"cout must hold one row per reporting node \(3\), got shape \(2, 240\)"):
-        endmember_to_source(cout=measured[:2], nodes=["T1", "T2", "T3"], **shared)
+    with pytest.raises(ValueError, match=r"unknown node\(s\) in cout: \['Reservoir'\]"):
+        endmember_to_source(
+            cout={**_by_node(shared["network"].endmembers, measured), "Reservoir": measured[0]}, **shared
+        )
+    with pytest.raises(ValueError, match=r"cout must hold at least one observed node"):
+        endmember_to_source(cout={}, **shared)
     with pytest.raises(ValueError, match=r"cout_tedges must have one more element than cout"):
-        endmember_to_source(cout=measured[:, :-1], **shared)
-    with pytest.raises(ValueError, match=r"cout is missing node\(s\): \['T2'\]"):
-        endmember_to_source(cout={"T1": measured[0]}, nodes=["T1", "T2"], **shared)
+        endmember_to_source(cout=_by_node(shared["network"].endmembers, measured[:, :-1]), **shared)
     for strength in (0.0, -1e-6):
         with pytest.raises(ValueError, match=r"regularization_strength must be > 0"):
-            endmember_to_source(cout=measured, regularization_strength=strength, **shared)
+            endmember_to_source(
+                cout=_by_node(shared["network"].endmembers, measured), regularization_strength=strength, **shared
+            )

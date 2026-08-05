@@ -37,20 +37,21 @@ DOCUMENTED_PATHS = {
 }
 
 
-def _hour_of_day(index):
-    """Hour of day of a DatetimeIndex as a float array, so a daily harmonic can be projected onto it."""
-    return np.asarray(index.hour + index.minute / 60.0 + index.second / 3600.0, dtype=float)
+def _bin_hours(tedges):
+    """Hour of day at each bin midpoint, the coordinate ``example_demand`` builds its profiles on."""
+    midpoint = tedges[:-1] + (tedges[1:] - tedges[:-1]) / 2
+    return np.asarray(midpoint.hour + midpoint.minute / 60.0 + midpoint.second / 3600.0, dtype=float)
 
 
-def _daily_harmonic(series):
+def _daily_harmonic(values, tedges):
     """Recover (mean, mean*amplitude, peak hour) of ``mean * (1 + amplitude * cos(2 pi (h - peak) / 24))``.
 
     Exact whenever the samples cover a whole number of days on a uniform grid of at least three
     bins per day: the constant term and the second harmonic both sum to zero over a full period,
     leaving ``sum(v_k exp(-2 pi i h_k / 24)) = N/2 * mean * amplitude * exp(-2 pi i peak / 24)``.
     """
-    values = np.asarray(series, dtype=float)
-    coefficient = np.sum(values * np.exp(-2j * np.pi * _hour_of_day(series.index) / 24.0))
+    values = np.asarray(values, dtype=float)
+    coefficient = np.sum(values * np.exp(-2j * np.pi * _bin_hours(tedges) / 24.0))
     peak = float(-np.angle(coefficient) * 24.0 / (2.0 * np.pi)) % 24.0
     return float(values.mean()), 2.0 * abs(coefficient) / len(values), peak
 
@@ -116,14 +117,24 @@ def test_example_network_delivers_the_oldest_water_at_t4(network, constant_deman
 # ============================================================================
 
 
-def test_example_demand_columns_follow_endmembers_and_index_is_bin_midpoint(network, hourly_tedges):
+def test_example_demand_is_keyed_by_endmember_and_positional_on_tedges(network, hourly_tedges):
+    """One bare array per endmember, one value per bin -- nothing carries a time index.
+
+    The mapping is what makes the demand safe to pass in: there is no index for the package to
+    read or the caller to misalign, so the only alignment rule is the length of the array.
+    """
     demand = example_demand(tedges=hourly_tedges, network=network)
-    assert list(demand.columns) == list(network.endmembers)
-    assert len(demand) == len(hourly_tedges) - 1
-    expected_index = hourly_tedges[:-1] + (hourly_tedges[1:] - hourly_tedges[:-1]) / 2
-    np.testing.assert_array_equal(demand.index.to_numpy(), expected_index.to_numpy())
-    # The DataFrame is ready to pass straight in as `flow`.
-    np.testing.assert_allclose(network.flow_array(demand), demand.to_numpy(float).T, rtol=0.0, atol=0.0)
+    assert list(demand) == list(network.endmembers)
+    for name, series in demand.items():
+        assert isinstance(series, np.ndarray), name
+        assert series.shape == (len(hourly_tedges) - 1,), name
+    # Ready to pass straight in as `flow`, in endmember order.
+    np.testing.assert_allclose(
+        network.flow_array(demand),
+        np.stack([demand[e] for e in network.endmembers]),
+        rtol=0.0,
+        atol=0.0,
+    )
 
 
 def test_example_demand_column_order_follows_a_reordered_endmember_tuple():
@@ -136,8 +147,8 @@ def test_example_demand_column_order_follows_a_reordered_endmember_tuple():
     assert reordered.endmembers == ("T2", "T1")
 
     demand = example_demand(tedges=pd.date_range("2025-06-01", periods=25, freq="h"), network=reordered)
-    assert list(demand.columns) == ["T2", "T1"]
-    # Each column still carries its own profile, so the means did not swap along with the order.
+    assert list(demand) == ["T2", "T1"]
+    # Each key still carries its own profile, so the means did not swap along with the order.
     np.testing.assert_allclose([demand["T2"].mean(), demand["T1"].mean()], [360.0, 240.0], rtol=1e-12)
 
 
@@ -151,7 +162,7 @@ def test_example_demand_averages_to_the_documented_mean_over_whole_days(network,
     tedges = pd.date_range("2025-06-01", periods=periods, freq=freq)
     demand = example_demand(tedges=tedges, network=network)
     np.testing.assert_allclose(
-        demand.mean().to_numpy(float),
+        [demand[e].mean() for e in network.endmembers],
         [_PROFILES[e][0] for e in network.endmembers],
         rtol=1e-12,
     )
@@ -159,7 +170,7 @@ def test_example_demand_averages_to_the_documented_mean_over_whole_days(network,
 
 def test_example_demand_is_strictly_positive_and_within_its_profile_envelope(network, hourly_tedges):
     demand = example_demand(tedges=hourly_tedges, network=network)
-    assert np.all(demand.to_numpy(float) > 0.0)
+    assert all(np.all(series > 0.0) for series in demand.values())
     for name in network.endmembers:
         mean, amplitude, _ = _PROFILES[name]
         assert amplitude < 1.0  # what makes the profile strictly positive in the first place
@@ -171,7 +182,7 @@ def test_example_demand_amplitude_and_peak_hour_match_the_documented_profiles(ne
     demand = example_demand(tedges=hourly_tedges, network=network)
     for name in network.endmembers:
         mean, amplitude, peak = _PROFILES[name]
-        recovered_mean, recovered_amplitude, recovered_peak = _daily_harmonic(demand[name])
+        recovered_mean, recovered_amplitude, recovered_peak = _daily_harmonic(demand[name], hourly_tedges)
         np.testing.assert_allclose(recovered_mean, mean, rtol=1e-12)
         np.testing.assert_allclose(recovered_amplitude, mean * amplitude, rtol=1e-12)
         np.testing.assert_allclose(recovered_peak, peak, rtol=1e-12)
@@ -179,11 +190,11 @@ def test_example_demand_amplitude_and_peak_hour_match_the_documented_profiles(ne
 
 def test_example_demand_reproduces_the_documented_cosine_exactly(network, hourly_tedges):
     demand = example_demand(tedges=hourly_tedges, network=network)
-    hour = _hour_of_day(demand.index)
+    hour = _bin_hours(hourly_tedges)
     for name in network.endmembers:
         mean, amplitude, peak = _PROFILES[name]
         expected = mean * (1.0 + amplitude * np.cos(2.0 * np.pi * (hour - peak) / 24.0))
-        np.testing.assert_allclose(demand[name].to_numpy(float), expected, rtol=0.0, atol=0.0)
+        np.testing.assert_allclose(demand[name], expected, rtol=0.0, atol=0.0)
 
 
 # ============================================================================
@@ -194,8 +205,9 @@ def test_example_demand_reproduces_the_documented_cosine_exactly(network, hourly
 def test_example_demand_endmember_shares_swing_over_the_day(network):
     tedges = pd.date_range("2025-06-01", periods=25, freq="h")
     demand = example_demand(tedges=tedges, network=network)
-    production = demand.sum(axis=1).to_numpy(float)
-    share = demand.to_numpy(float) / production[:, None]
+    stacked = np.stack([demand[e] for e in network.endmembers])
+    production = stacked.sum(axis=0)
+    share = (stacked / production).T
 
     np.testing.assert_allclose(share.sum(axis=1), 1.0, rtol=1e-14)
     # A proportional pattern would give a flat share. Every endmember moves by far more than the
@@ -221,7 +233,7 @@ def test_example_demand_segment_flow_fractions_are_not_constant(network):
     )
 
     # Mass conservation: the summed demand is the production past the source at every bin.
-    np.testing.assert_allclose(production, demand.sum(axis=1).to_numpy(float), rtol=1e-13)
+    np.testing.assert_allclose(production, np.sum([demand[e] for e in network.endmembers], axis=0), rtol=1e-13)
 
 
 def test_example_demand_split_beats_the_proportional_model_by_more_than_rounding(network, two_branch):
@@ -236,9 +248,9 @@ def test_example_demand_split_beats_the_proportional_model_by_more_than_rounding
 
     # By contrast, a two-branch network fed by two copies of the same profile does split
     # proportionally, so the fixed-fraction reduction applies exactly there.
-    single = example_demand(tedges=tedges, network=two_branch)["T1"].to_numpy(float)
-    proportional = np.stack([single, 1.5 * single])
-    fixed = two_branch.segment_flow(flow=proportional) / proportional.sum(axis=0)
+    single = example_demand(tedges=tedges, network=two_branch)["T1"]
+    proportional = {"T1": single, "T2": 1.5 * single}
+    fixed = two_branch.segment_flow(flow=proportional) / (2.5 * single)
     np.testing.assert_allclose(fixed, np.array([1.0, 0.4, 0.6])[:, None] * np.ones(len(single)), rtol=1e-14)
 
 
@@ -263,13 +275,13 @@ def test_example_demand_falls_back_to_positional_profiles(n_endmember):
     tedges = pd.date_range("2025-06-01", periods=241, freq="h")
     demand = example_demand(tedges=tedges, network=other)
 
-    assert list(demand.columns) == list(other.endmembers)
-    hour = _hour_of_day(demand.index)
+    assert list(demand) == list(other.endmembers)
+    hour = _bin_hours(tedges)
     for i, name in enumerate(other.endmembers):
         peak = 6.0 + 24.0 * i / n_endmember
         expected = 200.0 * (1.0 + 0.4 * np.cos(2.0 * np.pi * (hour - peak) / 24.0))
-        np.testing.assert_allclose(demand[name].to_numpy(float), expected, rtol=0.0, atol=0.0)
-    assert np.all(demand.to_numpy(float) > 0.0)
+        np.testing.assert_allclose(demand[name], expected, rtol=0.0, atol=0.0)
+    assert all(np.all(series > 0.0) for series in demand.values())
 
 
 @pytest.mark.parametrize("n_endmember", [2, 3, 5, 8])
@@ -278,7 +290,7 @@ def test_example_demand_fallback_peak_hours_stay_distinct(n_endmember):
     tedges = pd.date_range("2025-06-01", periods=241, freq="h")
     demand = example_demand(tedges=tedges, network=other)
 
-    recovered = np.array([_daily_harmonic(demand[name])[2] for name in other.endmembers])
+    recovered = np.array([_daily_harmonic(demand[name], tedges)[2] for name in other.endmembers])
     expected = 6.0 + 24.0 * np.arange(n_endmember) / n_endmember
     # Peak hour is an angle, so compare it as one: midnight is 0 and 24 alike.
     np.testing.assert_allclose((recovered - expected + 12.0) % 24.0 - 12.0, 0.0, rtol=0.0, atol=1e-9)
@@ -288,9 +300,9 @@ def test_example_demand_fallback_peak_hours_stay_distinct(n_endmember):
     separation = np.minimum(separation, 24.0 - separation)[~np.eye(n_endmember, dtype=bool)]
     np.testing.assert_allclose(separation.min(), 24.0 / n_endmember, rtol=1e-9)
 
-    production = demand.sum(axis=1).to_numpy(float)
-    share = demand.to_numpy(float) / production[:, None]
-    assert np.all(share.max(axis=0) - share.min(axis=0) > 0.03)
+    stacked = np.stack([demand[e] for e in other.endmembers])
+    share = stacked / stacked.sum(axis=0)
+    assert np.all(share.max(axis=1) - share.min(axis=1) > 0.03)
 
 
 def test_example_demand_mixes_canned_and_fallback_profiles():
@@ -300,7 +312,8 @@ def test_example_demand_mixes_canned_and_fallback_profiles():
         index=["S-T3", "S-Z"],
     )
     mixed = PipeNetwork(segments=segments, source="S")
-    demand = example_demand(tedges=pd.date_range("2025-06-01", periods=25, freq="h"), network=mixed)
+    tedges = pd.date_range("2025-06-01", periods=25, freq="h")
+    demand = example_demand(tedges=tedges, network=mixed)
 
-    np.testing.assert_allclose(_daily_harmonic(demand["T3"]), (120.0, 120.0 * 0.35, 12.0), rtol=1e-12)
-    np.testing.assert_allclose(_daily_harmonic(demand["Z"]), (200.0, 80.0, 18.0), rtol=1e-12)
+    np.testing.assert_allclose(_daily_harmonic(demand["T3"], tedges), (120.0, 120.0 * 0.35, 12.0), rtol=1e-12)
+    np.testing.assert_allclose(_daily_harmonic(demand["Z"], tedges), (200.0, 80.0, 18.0), rtol=1e-12)

@@ -151,6 +151,7 @@ See the ./LICENSE file or go to https://github.com/gwtransport/pipetransport/blo
 from __future__ import annotations
 
 import warnings
+from collections.abc import Mapping
 from typing import NamedTuple
 
 import numpy as np
@@ -783,13 +784,13 @@ class _HeatSystem(NamedTuple):
 
 def _build_system(
     *,
-    flow: npt.ArrayLike | pd.DataFrame | dict,
+    flow: Mapping[str, npt.ArrayLike],
     tedges: pd.DatetimeIndex,
     cout_tedges: pd.DatetimeIndex,
     network: PipeNetwork,
     soil: pd.DataFrame,
-    surface_temperature: pd.DataFrame,
-    nodes: list[str] | tuple[str, ...] | None,
+    surface_temperature: Mapping[str, npt.ArrayLike],
+    report_nodes: list[str] | tuple[str, ...] | None,
     kappa_pipe: float | pd.Series | None,
     film_coefficient: float | pd.Series | None,
     spinup: str | None,
@@ -846,18 +847,21 @@ def _build_system(
         if column not in soil.columns:
             msg = f"soil needs the column {column!r} (eta=inf is a prescribed-temperature surface)"
             raise ValueError(msg)
-    surface_missing = [c for c in covers.unique() if c not in surface_temperature.columns]
+    # ``surface_temperature`` is a lookup table, so classes no pipe is buried under are
+    # ignored rather than rejected; only the ones the segments ask for have to be there.
+    surface_missing = [c for c in covers.unique() if c not in surface_temperature]
     if surface_missing:
         msg = f"surface_temperature is missing cover class(es): {surface_missing}"
         raise ValueError(msg)
-    _validate_tedges(
-        tedges,
-        surface_temperature.to_numpy(dtype=float).T,
-        tedges_name="tedges",
-        values_name="surface_temperature",
-    )
+    for cover in covers.unique():
+        _validate_tedges(
+            tedges,
+            np.asarray(surface_temperature[cover], dtype=float),
+            tedges_name="tedges",
+            values_name=f"surface_temperature[{cover!r}]",
+        )
 
-    requested = tuple(network.endmembers) if nodes is None else tuple(nodes)
+    requested = tuple(network.endmembers) if report_nodes is None else tuple(report_nodes)
     unknown = [node for node in requested if node not in network.paths]
     if unknown:
         msg = f"unknown node(s): {unknown}; network nodes are {list(network.nodes)}"
@@ -903,7 +907,7 @@ def _build_system(
     for cover, depth in pairs:
         eta_cover = float(soil.loc[cover, "eta"])
         rows = (cover_names == cover) & (depth_seg == depth)
-        record = surface_temperature[cover].to_numpy(dtype=float)
+        record = np.asarray(surface_temperature[cover], dtype=float)
         # The warm-start prefix sees the record's opening surface held constant -- the same
         # constant-history policy the spin-up applies to flow and tin.
         t_inf[rows] = soil_temperature(
@@ -1289,13 +1293,13 @@ def _update_targets(
 def source_to_endmember(
     *,
     tin: npt.ArrayLike,
-    flow: npt.ArrayLike | pd.DataFrame | dict,
+    flow: Mapping[str, npt.ArrayLike],
     tedges: pd.DatetimeIndex,
     cout_tedges: pd.DatetimeIndex,
     network: PipeNetwork,
     soil: pd.DataFrame,
-    surface_temperature: pd.DataFrame,
-    nodes: list[str] | tuple[str, ...] | None = None,
+    surface_temperature: Mapping[str, npt.ArrayLike],
+    report_nodes: list[str] | tuple[str, ...] | None = None,
     kappa_pipe: float | pd.Series | None = None,
     film_coefficient: float | pd.Series | None = None,
     max_sweeps: int = 5000,
@@ -1319,9 +1323,9 @@ def source_to_endmember(
         Temperature of the produced water leaving the source, constant over each
         ``tedges`` bin. Length ``len(tedges) - 1``. Any temperature unit; all temperature
         inputs share it.
-    flow : DataFrame, mapping, or array-like
-        Demand at every endmember [m³/day] on the same bins; see
-        :func:`pipetransport.transport.source_to_endmember`.
+    flow : mapping
+        Demand at every endmember [m³/day], keyed by endmember name, on the same ``tedges``
+        bins; see :func:`pipetransport.transport.source_to_endmember`.
     tedges : pandas.DatetimeIndex
         Time edges of ``tin`` and ``flow``, uniformly spaced (the halo memory is a
         convolution over lag bins).
@@ -1334,11 +1338,13 @@ def source_to_endmember(
     soil : pandas.DataFrame
         One row per cover class, columns ``alpha`` [m²/day], ``kappa`` [m²/day] and
         ``eta`` [m/day] (``inf`` for a prescribed-temperature surface).
-    surface_temperature : pandas.DataFrame
-        Sol-air temperature per cover class (one column per class), constant over each
-        ``tedges`` bin; see :func:`sol_air_temperature`.
-    nodes : list of str or None, optional
-        Nodes to report at. Defaults to ``network.endmembers``.
+    surface_temperature : mapping
+        Sol-air temperature keyed by cover class: one bin-constant array per class on the
+        ``tedges`` bins; see :func:`sol_air_temperature`. Classes no segment is buried under
+        are ignored, so a full land-cover catalogue may be passed as is.
+    report_nodes : list of str or None, optional
+        Nodes to report at, in output row order. Any node of the network is allowed.
+        Defaults to ``network.endmembers``.
     kappa_pipe : float or pandas.Series or None, optional
         Pipe wall conductivity over the water heat capacity [m²/day]; see
         :func:`segment_heat_rate`. Default None (bare pipe).
@@ -1402,7 +1408,7 @@ def source_to_endmember(
     Returns
     -------
     numpy.ndarray
-        Delivered temperature of shape ``(len(nodes), len(cout_tedges) - 1)``, in the
+        Delivered temperature of shape ``(len(report_nodes), len(cout_tedges) - 1)``, in the
         unit of ``tin``; the flow-weighted average over each output bin. NaN marks bins
         the record does not constrain.
 
@@ -1449,12 +1455,10 @@ def source_to_endmember(
     ...     index=["grass", "paved"],
     ... )
     >>> tedges = pd.date_range("2025-06-01", "2025-06-08", freq="h")
-    >>> surface = pd.DataFrame(
-    ...     {
-    ...         "grass": np.full(len(tedges) - 1, 22.0),
-    ...         "paved": np.full(len(tedges) - 1, 30.0),
-    ...     },
-    ... )
+    >>> surface = {
+    ...     "grass": np.full(len(tedges) - 1, 22.0),
+    ...     "paved": np.full(len(tedges) - 1, 30.0),
+    ... }
     >>> cout = source_to_endmember(
     ...     tin=np.full(len(tedges) - 1, 8.0),
     ...     flow=example_demand(tedges=tedges, network=network),
@@ -1485,7 +1489,7 @@ def source_to_endmember(
         network=network,
         soil=soil,
         surface_temperature=surface_temperature,
-        nodes=nodes,
+        report_nodes=report_nodes,
         kappa_pipe=kappa_pipe,
         film_coefficient=film_coefficient,
         spinup=spinup,
@@ -1500,14 +1504,13 @@ def source_to_endmember(
 
 def endmember_to_source(
     *,
-    tout: npt.ArrayLike | pd.DataFrame | dict,
-    flow: npt.ArrayLike | pd.DataFrame | dict,
+    tout: Mapping[str, npt.ArrayLike],
+    flow: Mapping[str, npt.ArrayLike],
     tedges: pd.DatetimeIndex,
     cout_tedges: pd.DatetimeIndex,
     network: PipeNetwork,
     soil: pd.DataFrame,
-    surface_temperature: pd.DataFrame,
-    nodes: list[str] | tuple[str, ...] | None = None,
+    surface_temperature: Mapping[str, npt.ArrayLike],
     kappa_pipe: float | pd.Series | None = None,
     film_coefficient: float | pd.Series | None = None,
     max_sweeps: int = 5000,
@@ -1527,10 +1530,11 @@ def endmember_to_source(
 
     Parameters
     ----------
-    tout : DataFrame, mapping, or array-like
-        Measured temperature at the reporting nodes, constant over each ``cout_tedges``
-        bin; a DataFrame or mapping is keyed by node name. NaN marks a gap.
-    flow, tedges, cout_tedges, network, soil, surface_temperature, nodes, kappa_pipe, film_coefficient, max_sweeps, atol, spinup
+    tout : mapping
+        Measured temperature, keyed by the node it was measured at: one bin-constant array
+        per node on the ``cout_tedges`` bins. The keys *are* the observation set -- pass
+        only the nodes that were sampled. NaN inside an array marks a gap.
+    flow, tedges, cout_tedges, network, soil, surface_temperature, kappa_pipe, film_coefficient, max_sweeps, atol, spinup
         As in :func:`source_to_endmember`.
     regularization_strength : float, optional
         Tikhonov parameter of each banded solve; see
@@ -1632,7 +1636,7 @@ def endmember_to_source(
     ... )
     >>> tedges = pd.date_range("2025-06-01", "2025-06-11", freq="h")
     >>> demand = example_demand(tedges=tedges, network=network)
-    >>> surface = pd.DataFrame({"grass": np.full(len(tedges) - 1, 25.0)})
+    >>> surface = {"grass": np.full(len(tedges) - 1, 25.0)}
     >>> hours = np.arange(len(tedges) - 1)
     >>> tin = 10.0 + 2.0 * np.sin(2 * np.pi * hours / 72.0)
     >>> shared = dict(
@@ -1642,10 +1646,11 @@ def endmember_to_source(
     ...     network=network,
     ...     soil=soil,
     ...     surface_temperature=surface,
-    ...     nodes=["T1", "T4"],
     ... )
-    >>> measured = source_to_endmember(tin=tin, **shared)
-    >>> recovered = endmember_to_source(tout=measured, **shared)
+    >>> measured = source_to_endmember(tin=tin, report_nodes=["T1", "T4"], **shared)
+    >>> recovered = endmember_to_source(
+    ...     tout={"T1": measured[0], "T4": measured[1]}, **shared
+    ... )
     >>> inner = slice(36, -96)  # both edges lean on unconstrained bins; see Notes
     >>> residual = float(np.nanmax(np.abs(recovered[inner] - tin[inner])))
     >>> residual < 1e-8  # the Tikhonov pull, O(lambda) once the target preserves constants
@@ -1654,6 +1659,16 @@ def endmember_to_source(
     if max_sweeps < 1:
         msg = "max_sweeps must be at least 1 (sweep 1 is the one-way model)"
         raise ValueError(msg)
+    # The keys of ``tout`` are the observation set: every one must be a node, and their order
+    # in the solve is the network's own, so the answer cannot depend on how the caller
+    # happened to build the mapping.
+    unknown = [node for node in tout if node not in network.paths]
+    if unknown:
+        msg = f"unknown node(s) in tout: {unknown}; network nodes are {list(network.nodes)}"
+        raise ValueError(msg)
+    if not tout:
+        msg = "tout must hold at least one observed node"
+        raise ValueError(msg)
     system = _build_system(
         flow=flow,
         tedges=tedges,
@@ -1661,29 +1676,13 @@ def endmember_to_source(
         network=network,
         soil=soil,
         surface_temperature=surface_temperature,
-        nodes=nodes,
+        report_nodes=tuple(node for node in network.nodes if node in tout),
         kappa_pipe=kappa_pipe,
         film_coefficient=film_coefficient,
         spinup=spinup,
     )
     cout_tedges = pd.DatetimeIndex(cout_tedges)
-
-    named: dict | None = None
-    if isinstance(tout, pd.DataFrame):
-        named = {str(column): tout[column].to_numpy(dtype=float) for column in tout.columns}
-    elif isinstance(tout, dict):
-        named = {str(key): value for key, value in tout.items()}
-    if named is not None:
-        missing = [node for node in system.nodes if node not in named]
-        if missing:
-            msg = f"tout is missing node(s): {missing}"
-            raise ValueError(msg)
-        observed = np.stack([np.asarray(named[node], dtype=float) for node in system.nodes])
-    else:
-        observed = np.atleast_2d(np.asarray(tout, dtype=float))
-    if observed.shape[0] != len(system.nodes):
-        msg = f"tout must hold one row per reporting node ({len(system.nodes)}), got shape {observed.shape}"
-        raise ValueError(msg)
+    observed = np.stack([np.asarray(tout[node], dtype=float) for node in system.nodes])
     _validate_tedges(cout_tedges, observed, tedges_name="cout_tedges", values_name="tout")
 
     n_source = len(pd.DatetimeIndex(tedges)) - 1

@@ -83,7 +83,7 @@ def residence_time_to_log_removal(
     ----------
     residence_times : array-like
         Travel times [days], of any shape -- typically the output of
-        :func:`pipetransport.residence_time.full`. NaN propagates.
+        :func:`pipetransport.residence_time.endmember_to_source`. NaN propagates.
     log10_decay_rate : float
         Log10 decay rate mu [log10/day].
 
@@ -96,7 +96,7 @@ def residence_time_to_log_removal(
     --------
     decay_rate_to_log10_decay_rate : Convert a natural-log rate constant to mu.
     log_removal_to_fraction_remaining : Express the result as a surviving fraction.
-    pipetransport.residence_time.full : Travel times to feed in.
+    pipetransport.residence_time.endmember_to_source : Travel times to feed in.
 
     Examples
     --------

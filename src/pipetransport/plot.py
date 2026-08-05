@@ -41,6 +41,7 @@ See the ./LICENSE file or go to https://github.com/gwtransport/pipetransport/blo
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import matplotlib.pyplot as plt
@@ -117,7 +118,7 @@ def _tree_layout(network: PipeNetwork) -> dict[str, tuple[float, float]]:
 def network(
     *,
     network: PipeNetwork,
-    values: pd.Series | None = None,
+    values: Mapping[str, float] | None = None,
     value_label: str = "segment water volume [m³]",
     node_positions: dict[str, tuple[float, float]] | None = None,
     ax: Axes | None = None,
@@ -128,10 +129,10 @@ def network(
     ----------
     network : PipeNetwork
         Network to draw.
-    values : pandas.Series or None, optional
-        Per-segment quantity driving the line colour, indexed by segment name. Defaults to the
+    values : mapping or None, optional
+        Per-segment quantity driving the line colour, keyed by segment name. Defaults to the
         segment water volume. Pass e.g.
-        ``pd.Series(network.segment_flow(flow=demand).mean(axis=1), index=network.segments.index)``
+        ``dict(zip(network.segments.index, network.segment_flow(flow=demand).mean(axis=1)))``
         to colour by mean throughflow instead.
     value_label : str, optional
         Colorbar label describing ``values``.
@@ -165,12 +166,14 @@ def network(
     >>> ax.get_title()
     'Distribution network'
     """
-    magnitude = network.segments["volume"] if values is None else values
-    missing = [name for name in network.segments.index if name not in magnitude.index]
-    if missing:
-        msg = f"values is missing segment(s): {missing}"
-        raise ValueError(msg)
-    magnitude = magnitude.reindex(network.segments.index).astype(float)
+    if values is None:
+        magnitude = network.segments["volume"].to_numpy(dtype=float)
+    else:
+        missing = [name for name in network.segments.index if name not in values]
+        if missing:
+            msg = f"values is missing segment(s): {missing}"
+            raise ValueError(msg)
+        magnitude = np.array([float(values[name]) for name in network.segments.index])
 
     ax = plt.subplots(figsize=(10.5, 5.0))[1] if ax is None else ax
     positions = _tree_layout(network) if node_positions is None else node_positions
@@ -183,9 +186,7 @@ def network(
         x1, y1 = positions[segment["to"]]
         # Width carries geometry, colour carries the quantity: two channels, no redundancy.
         width = 2.0 + 16.0 * float(diameter.iloc[i] / diameter.max()) if diameter is not None else 5.0
-        ax.plot(
-            [x0, x1], [y0, y1], color=ramp(span(magnitude.iloc[i])), linewidth=width, solid_capstyle="round", zorder=1
-        )
+        ax.plot([x0, x1], [y0, y1], color=ramp(span(magnitude[i])), linewidth=width, solid_capstyle="round", zorder=1)
         ax.annotate(
             str(name),
             xy=((x0 + x1) / 2.0, (y0 + y1) / 2.0),
@@ -232,7 +233,7 @@ def network(
 def flow_allocation(
     *,
     network: PipeNetwork,
-    flow: npt.ArrayLike | pd.DataFrame | dict,
+    flow: Mapping[str, npt.ArrayLike],
     tedges: pd.DatetimeIndex,
     ax: Axes | None = None,
 ) -> Axes:
@@ -245,8 +246,8 @@ def flow_allocation(
     ----------
     network : PipeNetwork
         Network whose endmembers label the bands.
-    flow : DataFrame, mapping, or array-like
-        Demand at every endmember [m³/day] on the ``tedges`` bins.
+    flow : mapping
+        Demand at every endmember [m³/day] on the ``tedges`` bins, keyed by endmember name.
     tedges : pandas.DatetimeIndex
         Time bin edges, ``n + 1`` edges for ``n`` bins.
     ax : matplotlib.axes.Axes or None, optional
@@ -303,27 +304,26 @@ def flow_allocation(
 
 def endmember_series(
     *,
-    values: npt.ArrayLike,
+    values: Mapping[str, npt.ArrayLike],
     tedges: pd.DatetimeIndex,
-    labels: list[str] | tuple[str, ...],
     ylabel: str = "",
     title: str = "",
     ax: Axes | None = None,
 ) -> Axes:
     """Draw one bin-constant timeseries per endmember as a step plot.
 
-    Takes any ``(n_series, n_bins)`` result of the package: delivered quality from
+    Takes any per-node result of the package keyed by node: delivered quality from
     :func:`pipetransport.transport.source_to_endmember`, chlorine residual from the same call
-    with a decay rate, or water age from :func:`pipetransport.residence_time.full`.
+    with a decay rate, or water age from
+    :func:`pipetransport.residence_time.endmember_to_source`.
 
     Parameters
     ----------
-    values : array-like
-        Bin-constant values of shape ``(n_series, len(tedges) - 1)``. NaN leaves a gap.
+    values : mapping
+        Bin-constant series keyed by the name to label it with, each of length
+        ``len(tedges) - 1``. NaN leaves a gap.
     tedges : pandas.DatetimeIndex
-        Time bin edges matching the last axis of ``values``.
-    labels : list of str
-        Series names, one per row, in the same order.
+        Time bin edges matching the length of every series.
     ylabel : str, optional
         Y-axis label, including units.
     title : str, optional
@@ -339,13 +339,13 @@ def endmember_series(
     Raises
     ------
     ValueError
-        If ``values`` has the wrong shape for ``tedges`` or ``labels``.
+        If a series in ``values`` has the wrong length for ``tedges``.
 
     See Also
     --------
     flow_allocation : The demand pattern driving these series.
     pipetransport.transport.source_to_endmember : Produces delivered quality and residual.
-    pipetransport.residence_time.full : Produces water age.
+    pipetransport.residence_time.endmember_to_source : Produces water age.
 
     Examples
     --------
@@ -353,31 +353,35 @@ def endmember_series(
     >>> matplotlib.use("Agg")
     >>> import pandas as pd
     >>> from pipetransport.examples import example_network, example_demand
-    >>> from pipetransport.residence_time import full
+    >>> from pipetransport.residence_time import endmember_to_source
     >>> from pipetransport.plot import endmember_series
     >>> net = example_network()
     >>> tedges = pd.date_range("2025-06-01", periods=97, freq="h")
-    >>> age = full(
-    ...     flow=example_demand(tedges=tedges, network=net), tedges=tedges, network=net
+    >>> age = endmember_to_source(
+    ...     flow=example_demand(tedges=tedges, network=net),
+    ...     tedges=tedges,
+    ...     cout_tedges=tedges,
+    ...     network=net,
     ... )
     >>> ax = endmember_series(
-    ...     values=age * 24.0,
+    ...     values=dict(zip(net.endmembers, age * 24.0)),
     ...     tedges=tedges,
-    ...     labels=list(net.endmembers),
     ...     ylabel="water age [h]",
     ... )
     >>> len(ax.get_lines())
     4
     """
     tedges = pd.DatetimeIndex(tedges)
-    values = np.atleast_2d(np.asarray(values, dtype=float))
-    if values.shape != (len(labels), len(tedges) - 1):
-        msg = f"values must have shape ({len(labels)}, {len(tedges) - 1}), got {values.shape}"
+    labels = list(values)
+    rows = [np.asarray(values[name], dtype=float) for name in labels]
+    wrong = [name for name, row in zip(labels, rows, strict=True) if row.shape != (len(tedges) - 1,)]
+    if wrong:
+        msg = f"every series in values must have length {len(tedges) - 1}; wrong: {wrong}"
         raise ValueError(msg)
 
     ax = plt.subplots(figsize=(10.5, 4.0))[1] if ax is None else ax
     colors = series_colors(len(labels))
-    for row, name, color in zip(values, labels, colors, strict=True):
+    for row, name, color in zip(rows, labels, colors, strict=True):
         ax.plot(*step_plot_coords(tedges, row), color=color, linewidth=2.0, label=name, zorder=2)
         # Two palette hues sit below 3:1 on the chart surface, so identity never rests on
         # colour alone: up to four series also carry a direct label at their peak.

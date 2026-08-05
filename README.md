@@ -42,7 +42,7 @@ from pipetransport.transport import source_to_endmember
 
 network = example_network()  # plant -> trunk main -> two district mains -> four taps
 tedges = pd.date_range("2025-06-01", "2025-06-08", freq="h")  # n+1 edges for n bins
-demand = example_demand(tedges=tedges, network=network)  # m3/day, one column per tap
+demand = example_demand(tedges=tedges, network=network)  # m3/day, one array per tap
 
 # A three-hour contamination event leaves the plant on 2 June, 06:00-09:00
 cin = np.zeros(len(tedges) - 1)
@@ -76,11 +76,12 @@ network = example_network()
 tedges = pd.date_range("2025-06-01", "2025-06-15", freq="h")
 demand = example_demand(tedges=tedges, network=network)
 
-# Hourly grab samples at two taps; NaN wherever nothing was sampled
-measured = pd.DataFrame(
-    {"T1": np.full(len(tedges) - 1, 0.6), "T4": np.full(len(tedges) - 1, 0.4)},
-    index=tedges[:-1],
-)
+# Hourly grab samples at two taps; NaN wherever nothing was sampled. The keys say which
+# taps were sampled, so there is no separate node list to keep in step with the rows.
+measured = {
+    "T1": np.full(len(tedges) - 1, 0.6),
+    "T4": np.full(len(tedges) - 1, 0.4),
+}
 
 cin = endmember_to_source(
     cout=measured,
@@ -88,7 +89,6 @@ cin = endmember_to_source(
     tedges=tedges,
     cout_tedges=tedges,
     network=network,
-    nodes=["T1", "T4"],
     regularization_strength=1e-4,  # ~ (noise / signal)^2
 )  # (336,), NaN where no measurement constrains the bin
 print(f"reconstructed {np.isfinite(cin).sum()} of {len(cin)} production bins")
@@ -104,7 +104,7 @@ import pandas as pd
 
 from pipetransport.examples import example_demand, example_network
 from pipetransport.logremoval import segment_decay_rate
-from pipetransport.residence_time import full
+from pipetransport.residence_time import endmember_to_source as water_age
 from pipetransport.transport import source_to_endmember
 
 network = example_network()
@@ -122,7 +122,7 @@ residual = source_to_endmember(
     network=network,
     decay_rate=decay,
 )
-age = full(flow=demand, tedges=tedges, network=network)  # days
+age = water_age(flow=demand, tedges=tedges, cout_tedges=tedges, network=network)  # days
 
 for tap, res, hours in zip(network.endmembers, residual, age * 24, strict=True):
     print(f"{tap}: residual {np.nanmin(res):.2f}-{np.nanmax(res):.2f} mg/L, age up to {np.nanmax(hours):.1f} h")
