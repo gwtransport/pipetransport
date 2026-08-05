@@ -331,7 +331,7 @@ an affine map, so tree topology, plug flow and known demand are all still requir
 
 **Assumption.** The soil around a segment behaves as a set of independent radial columns around a
 *constant-flux cylinder* at the pipe wall, with a mirror-image line sink above the ground surface;
-the soil is homogeneous and time-constant per land-cover class; the pipe wall is a memoryless series
+the soil is homogeneous and time-constant per segment; the pipe wall is a memoryless series
 resistance; and the water is well mixed across the pipe section.
 
 **Why it matters.** Independence of the columns is what makes the wall temperature a local quantity
@@ -394,9 +394,10 @@ the lead-in where the record is representative rather than at an extreme. Use bi
 the forcing you care about --- the halo memory reads the flux history only through bin averages. Keep
 parallel mains out, or merge them into one equivalent segment.
 
-**How it is checked.** Partly. Geometry and soil parameters must be positive and the burial depth
-must exceed the pipe radius; every segment's cover class must appear in the ``soil`` table and in the
-surface record; ``tedges`` must be uniformly spaced, since the halo memory is a convolution. The
+**How it is checked.** Partly, and mostly when the :class:`~pipetransport.heat.HeatNetwork` is
+built rather than when it is solved: geometry and soil parameters must be positive, the burial depth
+must clear the outer pipe radius, and any ``volume`` column must agree with the length and diameter.
+At solve time every segment's cover class must appear in the surface record; ``tedges`` must be uniformly spaced, since the halo memory is a convolution. The
 adequacy of the lead-in, the bin width and the trench spacing is your modelling choice.
 
 .. _assumption-uniform-wall-flux:

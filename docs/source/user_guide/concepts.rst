@@ -597,15 +597,22 @@ pay off:
    import numpy as np
    import pandas as pd
 
-   from pipetransport.heat import segment_heat_rate, source_to_endmember
-   from pipetransport.network import PipeNetwork
+   from pipetransport.heat import HeatNetwork, segment_heat_rate, source_to_endmember
 
    segments = pd.DataFrame(
-       {"from": ["Plant"], "to": ["T1"], "length": [1000.0], "diameter": [0.1], "cover": ["grass"]},
+       {
+           "from": ["Plant"],
+           "to": ["T1"],
+           "length": [1000.0],
+           "diameter": [0.1],
+           "cover": ["grass"],
+           "alpha": [0.05],
+           "kappa_soil": [0.025],
+           "eta": [0.41],
+       },
        index=["Plant-T1"],
    )
-   network = PipeNetwork(segments=segments, source="Plant")
-   soil = pd.DataFrame({"alpha": [0.05], "kappa": [0.025], "eta": [0.41]}, index=["grass"])
+   network = HeatNetwork(segments=segments, source="Plant")
 
    tedges = pd.date_range("2025-01-01", periods=120 * 24 + 1, freq="h")
    n_bins = len(tedges) - 1
@@ -613,7 +620,7 @@ pay off:
    flow = {"T1": np.full(n_bins, float(network.segments.loc["Plant-T1", "volume"]) / transit_days)}
    shared = dict(
        tin=np.full(n_bins, 8.0), flow=flow, tedges=tedges, cout_tedges=tedges,
-       network=network, soil=soil,
+       network=network,
        surface_temperature={"grass": np.full(n_bins, 20.0)},
    )
 
@@ -621,7 +628,7 @@ pay off:
    one_way = source_to_endmember(**shared, max_sweeps=1)
 
    # A fully developed halo is the analytic steady buried-pipe law, which is what one-way assumes.
-   rate = float(segment_heat_rate(network=network, kappa=0.025, eta=0.41)["Plant-T1"])
+   rate = float(segment_heat_rate(network=network)["Plant-T1"])
    steady = 20.0 + (8.0 - 20.0) * np.exp(-rate * transit_days)
    np.testing.assert_allclose(one_way[0, -1], steady, rtol=1e-9)
 

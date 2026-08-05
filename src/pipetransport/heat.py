@@ -64,8 +64,12 @@ grass ``kappa`` 0.02-0.03, ``alpha`` 0.04-0.06; paved ``kappa`` 0.02-0.04, ``alp
 0.05-0.08 m²/day; pipe wall ``kappa_pipe`` 0.008 (PE), 0.0035 (PVC) m²/day; ``eta`` 0.41
 m/day (``h_s`` = 20 W/(m² K)).
 
-Available functions:
+Available class and functions:
 
+- :class:`HeatNetwork` - A :class:`~pipetransport.network.PipeNetwork` whose segments carry
+  everything constant in time: geometry, land cover, burial depth, wall, film and soil. The
+  heat pair reads its physics off this table, so the calls carry only what varies on
+  ``tedges``.
 - :func:`sol_air_temperature` - The surface forcing per land cover: air temperature plus
   the absorbed solar radiation, less the longwave and latent losses, over the surface film.
 - :func:`soil_temperature` - Exact bin-averaged undisturbed soil temperature at depth from
@@ -77,9 +81,9 @@ Available functions:
 - :func:`endmember_to_source` - Reverse: production temperature from delivered
   temperatures, the same fixed point wrapped around the banded deconvolution.
 
-The heat pair requires uniformly spaced ``tedges`` (the halo memory is a convolution), and
-segments must carry ``length``, ``diameter`` and a ``cover`` land-class column; ``depth``
-[m, to axis, default 1] and ``wall_thickness`` [m, with ``kappa_pipe``] are optional.
+The heat pair requires uniformly spaced ``tedges`` (the halo memory is a convolution) and a
+:class:`HeatNetwork`, which validates the segment columns when it is built rather than when
+it is solved.
 
 Validity
 --------
@@ -170,7 +174,7 @@ from pipetransport._transfer import (
     resolve_spinup,
 )
 from pipetransport._validation import _validate_no_nan, _validate_positive, _validate_tedges
-from pipetransport.network import PipeNetwork  # noqa: TC001 -- runtime dependency of the signatures
+from pipetransport.network import PipeNetwork
 from pipetransport.utils import solve_inverse_transport_banded, tedges_to_days
 
 # How far ahead of the outer iterate the reverse direction resolves its inner halo fixed
@@ -604,15 +608,170 @@ def soil_temperature(
     return pre + response
 
 
-def segment_heat_rate(
-    *,
-    network: PipeNetwork,
-    kappa: float | pd.Series,
-    depth: float | pd.Series = 1.0,
-    eta: float | pd.Series = np.inf,
-    kappa_pipe: float | pd.Series | None = None,
-    film_coefficient: float | pd.Series | None = None,
-) -> pd.Series:
+class HeatNetwork(PipeNetwork):
+    """A :class:`~pipetransport.network.PipeNetwork` whose segments carry the buried-pipe heat properties.
+
+    The heat pair reads everything that is constant in time off this table -- geometry,
+    burial, wall, film and soil -- so its call signatures carry only what varies on
+    ``tedges``. Validation happens here, when the network is built, rather than at solve
+    time. Soil properties are per segment, not per cover class: two pipes may share a cover
+    and still sit in different ground, and ``cover`` is left one job, keying the surface
+    forcing.
+
+    Parameters
+    ----------
+    segments : pandas.DataFrame
+        One row per pipe segment as :class:`~pipetransport.network.PipeNetwork`, plus:
+
+        ``length``, ``diameter``
+            Required [m] (inner diameter). Heat reads the pipe three ways -- the exchange
+            rate from the diameter, the wall flux from the length, the transit from the
+            volume -- so a volume-only table is rejected, and a ``volume`` column that its
+            length and diameter do not imply is too.
+        ``cover``
+            Required. Land-cover class; the key into ``surface_temperature``.
+        ``alpha``, ``kappa_soil``
+            Required. Soil thermal diffusivity and conductivity over the volumetric heat
+            capacity of water [m²/day].
+        ``depth``
+            Burial depth to the pipe axis [m]. Default 1.0. It must put the pipe below the
+            surface, ``d_eff > r_o``; the exact shape factor ``acosh(d_eff/r_o)`` does not
+            exist below that and the ``ln(2 d_eff/r_o)`` used here runs away to a divergent
+            rate rather than to an error. That log is the large-``d/r`` limit of the exact
+            factor and overstates it by ``1/(4 (d_eff/r_o)**2)``, so accuracy is a matter of
+            how far above the guard the pipe is: 0.01 % for a 100 mm service line and 0.4 %
+            for a 400 mm main at a metre, 5.3 % at ``d_eff = 2 r_o``, 24 % for a DN1600
+            there, and 117 % for a DN2000 -- leaving the default depth on a transmission
+            main is the mis-entry to watch.
+        ``eta``
+            Surface film coefficient [m/day]. Default ``inf``, a prescribed-temperature
+            surface: the radiation length ``kappa_soil / eta`` is then exactly zero and the
+            surface displaces the effective depth by nothing.
+        ``wall_thickness``, ``kappa_pipe``
+            Pipe wall geometry [m] and conductivity over the water heat capacity [m²/day].
+            Defaults 0.0 and ``inf``, which together are exactly the bare pipe: the wall
+            resistance vanishes and the soil is read at the inner radius. PE ~0.008, PVC
+            ~0.0035 m²/day. At a fixed SDR the wall resistance
+            ``ln(SDR/(SDR - 2)) / (2 pi kappa_pipe)`` does not depend on the diameter while
+            the soil resistance falls with it, so the wall's share *grows* with the pipe
+            rather than shrinking: at ``kappa_soil = 0.025`` and ``depth = 1`` it is 10-17 %
+            of the soil resistance for PE SDR17 and 18-30 % for PVC SDR21 across 100-400 mm,
+            lowering the rate by 6-10 % and 13-20 % respectively. Both shares scale with
+            ``kappa_soil / kappa_pipe``, so rescale them for your own soil; PVC is never the
+            ~10 % that PE is.
+        ``film_coefficient``
+            Water-side film coefficient ``h_film / (rho c_w)`` [m/day]. Default ``inf``, the
+            film not limiting. Like the mass transfer coefficient of
+            :func:`pipetransport.logremoval.segment_decay_rate` it depends on velocity, so
+            give a value representative of the operating range (see issue #46). It is
+            negligible for turbulent trunk mains (well under 1 %) but not at the low
+            night-time flows of a service line: fully developed laminar flow (``Nu = 3.66``,
+            ``h_film = 3.66 k_water / D``, taking ``k_water = 0.6 W/(m K)``) gives
+            ``film_coefficient = 0.454 m/day`` in a 100 mm pipe, about 29 % of its soil
+            resistance at ``kappa_soil = 0.025`` and ``depth = 1``.
+    source : str
+        Name of the production node.
+
+    Raises
+    ------
+    ValueError
+        Everything :class:`~pipetransport.network.PipeNetwork` raises, plus: a missing
+        required column, a non-positive parameter (``eta``, ``kappa_pipe`` and
+        ``film_coefficient`` admit ``inf``; ``wall_thickness`` admits 0), a ``volume`` that
+        contradicts the geometry, or a burial that does not clear the outer radius.
+
+    See Also
+    --------
+    source_to_endmember : Forward direction, which reads this table.
+    segment_heat_rate : The exchange rate this table implies, as a standalone diagnostic.
+    pipetransport.examples.example_heat_network : A ready-made four-endmember heat network.
+
+    Examples
+    --------
+    >>> import pandas as pd
+    >>> from pipetransport.heat import HeatNetwork, segment_heat_rate
+    >>> segments = pd.DataFrame(
+    ...     {
+    ...         "from": ["Plant", "A"],
+    ...         "to": ["A", "T1"],
+    ...         "length": [2000.0, 800.0],
+    ...         "diameter": [0.40, 0.15],
+    ...         "cover": ["grass", "paved"],
+    ...         "alpha": [0.05, 0.075],
+    ...         "kappa_soil": [0.025, 0.035],
+    ...         "eta": [0.41, 0.41],
+    ...     },
+    ...     index=["Plant-A", "A-T1"],
+    ... )
+    >>> network = HeatNetwork(segments=segments, source="Plant")
+    >>> float(network.segments.loc["Plant-A", "depth"])  # filled in
+    1.0
+    >>> float(round(segment_heat_rate(network=network)["A-T1"], 2))
+    3.7
+    """
+
+    def __init__(self, *, segments: pd.DataFrame, source: str) -> None:
+        super().__init__(segments=segments, source=source)
+        segments = self.segments  # the validated copy the base class stored
+        missing = [c for c in ("length", "diameter", "cover", "alpha", "kappa_soil") if c not in segments.columns]
+        if missing:
+            msg = f"HeatNetwork segments need column(s): {missing}"
+            raise ValueError(msg)
+        # PipeNetwork accepts a volume-only table and, given a volume, never looks at the
+        # geometry; heat reads the pipe three ways, so the geometry has to be there, be
+        # positive, and agree with any volume it arrived with. Where it does not, the water's
+        # heat capacity per unit length disagrees with the area the exchange rate was built
+        # from, and what a user used to see was a convergence failure naming knobs that
+        # cannot reconcile a geometry.
+        _validate_positive(segments["length"], name="segment length")
+        _validate_positive(segments["diameter"], name="segment diameter")
+        geometric = (
+            np.pi / 4.0 * segments["diameter"].to_numpy(dtype=float) ** 2 * segments["length"].to_numpy(dtype=float)
+        )
+        contradicts = np.abs(segments["volume"].to_numpy(dtype=float) - geometric) > _GEOMETRY_TOLERANCE * geometric
+        if contradicts.any():
+            msg = (
+                f"segment(s) {list(segments.index[contradicts])} carry a 'volume' that their 'length' and "
+                f"'diameter' do not imply, by more than {_GEOMETRY_TOLERANCE:.0%}. The heat pair reads the "
+                f"pipe three ways -- the exchange rate from the diameter, the wall flux from the length, the "
+                f"transit from the volume -- so they must describe one pipe. Drop the volume column to have "
+                f"it derived, or reconcile it with pi/4 * diameter**2 * length."
+            )
+            raise ValueError(msg)
+        # The neutral elements of the three resistances, so every downstream read finds one
+        # schema and no branch: a zero wall thickness IS the bare pipe, and an infinite
+        # conductance contributes exactly no resistance.
+        for column, default in (
+            ("depth", 1.0),
+            ("eta", np.inf),
+            ("wall_thickness", 0.0),
+            ("kappa_pipe", np.inf),
+            ("film_coefficient", np.inf),
+        ):
+            if column not in segments.columns:
+                segments[column] = default
+        _validate_positive(segments["alpha"], name="alpha")
+        _validate_positive(segments["kappa_soil"], name="kappa_soil")
+        _validate_positive(segments["depth"], name="depth")
+        for column in ("eta", "kappa_pipe", "film_coefficient"):
+            values = segments[column].to_numpy(dtype=float)
+            if not np.all((values > 0.0) | np.isposinf(values)):
+                msg = f"{column} must be positive (inf is the no-resistance limit)"
+                raise ValueError(msg)
+        thickness = segments["wall_thickness"].to_numpy(dtype=float)
+        if not np.all(thickness >= 0.0):
+            msg = "wall_thickness must be non-negative (0 is the bare pipe)"
+            raise ValueError(msg)
+        r_o = segments["diameter"].to_numpy(dtype=float) / 2.0 + thickness
+        d_eff = segments["depth"].to_numpy(dtype=float) + (
+            segments["kappa_soil"].to_numpy(dtype=float) / segments["eta"].to_numpy(dtype=float)
+        )
+        if not np.all(d_eff > r_o):
+            msg = "burial depth must exceed the outer pipe radius (d_eff > r_o); the line-source geometry needs d >> r"
+            raise ValueError(msg)
+
+
+def segment_heat_rate(*, network: HeatNetwork) -> pd.Series:
     """Compute the per-segment heat exchange rate [1/day] from the wall and soil resistances.
 
     The water column loses heat through the water-side film, the pipe wall and the soil in
@@ -622,53 +781,23 @@ def segment_heat_rate(
     ``h = 1 / ((R_film + R_wall + R_soil) * pi * r_i**2)``, with
     ``R_film = 1 / (2 pi r_i * film_coefficient)``,
     ``R_wall = ln(r_o/r_i) / (2 pi kappa_pipe)`` and
-    ``R_soil = ln(2 d_eff / r_o) / (2 pi kappa)`` (``d_eff = depth + kappa/eta``).
+    ``R_soil = ln(2 d_eff / r_o) / (2 pi kappa_soil)`` (``d_eff = depth + kappa_soil/eta``).
 
     ``R_soil`` is the steady buried-pipe resistance -- the fully developed halo, whose
     saturation the mirror image above the surface provides. The rate inherits the
     ``1/(D**2 ln D)`` diameter law: a 100 mm service line relaxes an order of magnitude
     faster than a 400 mm trunk main.
 
+    Every term reduces at its own neutral element without a branch: a zero ``wall_thickness``
+    leaves ``ln(r_o/r_i)`` exactly zero and reads the soil at the inner radius, and an
+    infinite ``kappa_pipe``, ``film_coefficient`` or ``eta`` contributes exactly no
+    resistance. Those are the defaults :class:`HeatNetwork` fills in.
+
     Parameters
     ----------
-    network : PipeNetwork
-        Network whose segments carry a ``"diameter"`` column [m] (inner diameter), and a
-        ``"wall_thickness"`` column [m] when ``kappa_pipe`` is given.
-    kappa : float or pandas.Series
-        Soil conductivity over the water heat capacity [m²/day], per segment or shared.
-    depth : float or pandas.Series, optional
-        Burial depth to the pipe axis [m]. Default 1.0. It must put the pipe below the
-        surface, ``d_eff > r_o``; the exact shape factor ``acosh(d_eff/r_o)`` does not exist
-        below that and the ``ln(2 d_eff/r_o)`` used here runs away to a divergent rate rather
-        than to an error. That log is the large-``d/r`` limit of the exact factor and
-        overstates it by ``1/(4 (d_eff/r_o)**2)``, so accuracy is a matter of how far above
-        the guard the pipe is: 0.01 % for a 100 mm service line and 0.4 % for a 400 mm main
-        at a metre, 5.3 % at ``d_eff = 2 r_o``, 24 % for a DN1600 there, and 117 % for a
-        DN2000 -- leaving the default depth on a transmission main is the mis-entry to watch.
-    eta : float or pandas.Series, optional
-        Surface film coefficient [m/day]. ``inf`` (default) is a prescribed-temperature
-        surface: the radiation length ``kappa / eta`` is then zero and the surface displaces
-        the effective depth by nothing.
-    kappa_pipe : float or pandas.Series or None, optional
-        Pipe wall conductivity over the water heat capacity [m²/day]. ``None`` (default)
-        omits the wall term -- the bare-pipe limit, which also reads the soil resistance from
-        ``r_i`` rather than ``r_o``. PE ~0.008, PVC ~0.0035 m²/day. At a fixed SDR the wall
-        resistance ``ln(SDR/(SDR - 2)) / (2 pi kappa_pipe)`` does not depend on the diameter
-        while ``R_soil`` falls with it, so the wall's share *grows* with the pipe rather than
-        shrinking: at ``kappa = 0.025`` and ``depth = 1`` it is 10-17 % of ``R_soil`` for PE
-        SDR17 and 18-30 % for PVC SDR21 across 100-400 mm, lowering the rate by 6-10 % and
-        13-20 % respectively. Both shares scale with ``kappa / kappa_pipe``, so rescale them
-        for your own soil; PVC is never the ~10 % that PE is.
-    film_coefficient : float or pandas.Series or None, optional
-        Water-side film coefficient ``h_film / (rho c_w)`` [m/day]. ``None`` (default)
-        assumes the film is not limiting. Like the mass transfer coefficient of
-        :func:`pipetransport.logremoval.segment_decay_rate` it depends on velocity, so pass
-        a value representative of the operating range. It is negligible for turbulent trunk
-        mains (well under 1 %) but not at the low night-time flows of a service line: fully
-        developed laminar flow (``Nu = 3.66``, ``h_film = 3.66 k_water / D``, taking
-        ``k_water = 0.6 W/(m K)``) gives ``film_coefficient = 0.454 m/day`` in a 100 mm pipe,
-        about 29 % of its soil resistance at ``kappa = 0.025`` and ``depth = 1`` -- 24 % at
-        ``kappa = 0.02``, 35 % at ``kappa = 0.03``.
+    network : HeatNetwork
+        Network whose segments carry the geometry, burial, wall, film and soil columns; see
+        :class:`HeatNetwork` for what each means and how to choose it.
 
     Returns
     -------
@@ -677,9 +806,9 @@ def segment_heat_rate(
 
     Raises
     ------
-    ValueError
-        If a required column is missing, a Series misses a segment, a parameter is not
-        positive, or the geometry gives ``d_eff <= r_o``.
+    TypeError
+        If ``network`` is a plain :class:`~pipetransport.network.PipeNetwork`, which carries
+        none of the columns this reads.
 
     See Also
     --------
@@ -691,62 +820,26 @@ def segment_heat_rate(
     Small pipes equilibrate much faster: a 100 mm service line runs a tenfold higher rate
     than the 400 mm trunk main.
 
-    >>> from pipetransport.examples import example_network
+    >>> from pipetransport.examples import example_heat_network
     >>> from pipetransport.heat import segment_heat_rate
-    >>> network = example_network()
-    >>> rates = segment_heat_rate(network=network, kappa=0.025, depth=1.0, eta=0.41)
-    >>> float(rates["C-T4"].round(2)), float(rates["Plant-A"].round(2))
-    (5.34, 0.53)
+    >>> rates = segment_heat_rate(network=example_heat_network())
+    >>> float(round(rates["C-T4"], 2)), float(round(rates["Plant-A"], 2))
+    (5.65, 0.49)
     """
+    if not isinstance(network, HeatNetwork):
+        msg = "segment_heat_rate reads the heat columns of a HeatNetwork; wrap your segment table in one"
+        raise TypeError(msg)
     segments = network.segments
-    if "diameter" not in segments.columns:
-        msg = "the heat exchange rate needs the segment diameter; build the network from length and diameter"
-        raise ValueError(msg)
-
-    def per_segment(value: float | pd.Series, name: str) -> npt.NDArray[np.floating]:
-        if isinstance(value, pd.Series):
-            missing = [seg for seg in segments.index if seg not in value.index]
-            if missing:
-                msg = f"{name} is missing segment(s): {missing}"
-                raise ValueError(msg)
-            return value.reindex(segments.index).to_numpy(dtype=float)
-        return np.full(len(segments), float(value))
-
-    kappa_seg = per_segment(kappa, "kappa")
-    depth_seg = per_segment(depth, "depth")
-    _validate_positive(kappa_seg, name="kappa")
-    _validate_positive(depth_seg, name="depth")
-    eta_seg = per_segment(eta, "eta")
-    if not np.all((eta_seg > 0.0) | np.isposinf(eta_seg)):
-        msg = "eta must be positive (inf is a prescribed-temperature surface)"
-        raise ValueError(msg)
-
     r_i = segments["diameter"].to_numpy(dtype=float) / 2.0
-    wall_resistance = np.zeros(len(segments))
-    r_o = r_i
-    if kappa_pipe is not None:
-        if "wall_thickness" not in segments.columns:
-            msg = "kappa_pipe needs the segment wall thickness; add a 'wall_thickness' column [m]"
-            raise ValueError(msg)
-        kappa_pipe_seg = per_segment(kappa_pipe, "kappa_pipe")
-        _validate_positive(kappa_pipe_seg, name="kappa_pipe")
-        thickness = segments["wall_thickness"].to_numpy(dtype=float)
-        _validate_positive(thickness, name="wall_thickness")
-        r_o = r_i + thickness
-        wall_resistance = np.log(r_o / r_i) / (2.0 * np.pi * kappa_pipe_seg)
-
-    d_eff = depth_seg + kappa_seg / eta_seg  # kappa/inf is exactly zero: no branch needed
-    if not np.all(d_eff > r_o):
-        msg = "burial depth must exceed the pipe radius (d_eff > r_o); the line-source geometry needs d >> r"
-        raise ValueError(msg)
-    film_resistance = np.zeros(len(segments))
-    if film_coefficient is not None:
-        film_seg = per_segment(film_coefficient, "film_coefficient")
-        _validate_positive(film_seg, name="film_coefficient")
-        film_resistance = 1.0 / (2.0 * np.pi * r_i * film_seg)
-    soil_resistance = np.log(2.0 * d_eff / r_o) / (2.0 * np.pi * kappa_seg)
-    total = film_resistance + wall_resistance + soil_resistance
-    return pd.Series(1.0 / (total * np.pi * r_i**2), index=segments.index, name="heat_rate")
+    r_o = r_i + segments["wall_thickness"].to_numpy(dtype=float)
+    kappa_soil = segments["kappa_soil"].to_numpy(dtype=float)
+    d_eff = segments["depth"].to_numpy(dtype=float) + kappa_soil / segments["eta"].to_numpy(dtype=float)
+    # ``x / inf`` is exactly 0.0 and ``ln(r_i/r_i)`` is exactly 0.0, so the neutral elements
+    # need no branch -- and dividing by inf is not a divide error, so no errstate either.
+    film = 1.0 / (2.0 * np.pi * r_i * segments["film_coefficient"].to_numpy(dtype=float))
+    wall = np.log(r_o / r_i) / (2.0 * np.pi * segments["kappa_pipe"].to_numpy(dtype=float))
+    soil = np.log(2.0 * d_eff / r_o) / (2.0 * np.pi * kappa_soil)
+    return pd.Series(1.0 / ((film + wall + soil) * np.pi * r_i**2), index=segments.index, name="heat_rate")
 
 
 class _HeatSystem(NamedTuple):
@@ -787,12 +880,9 @@ def _build_system(
     flow: Mapping[str, npt.ArrayLike],
     tedges: pd.DatetimeIndex,
     cout_tedges: pd.DatetimeIndex,
-    network: PipeNetwork,
-    soil: pd.DataFrame,
+    network: HeatNetwork,
     surface_temperature: Mapping[str, npt.ArrayLike],
     report_nodes: list[str] | tuple[str, ...] | None,
-    kappa_pipe: float | pd.Series | None,
-    film_coefficient: float | pd.Series | None,
     spinup: str | None,
 ) -> _HeatSystem:
     """Validate the shared inputs and build the operators, targets and kernels once.
@@ -804,10 +894,15 @@ def _build_system(
 
     Raises
     ------
+    TypeError
+        If ``network`` is not a :class:`HeatNetwork`.
     ValueError
-        If a time axis is malformed or non-uniform, a required segment or soil column is
-        missing, a cover class is unmapped, or a requested node is not part of the network.
+        If a time axis is malformed or non-uniform, a cover class is unmapped, or a requested
+        node is not part of the network.
     """
+    if not isinstance(network, HeatNetwork):
+        msg = "the heat pair reads the buried-pipe columns of a HeatNetwork; wrap your segment table in one"
+        raise TypeError(msg)
     tedges = pd.DatetimeIndex(tedges)
     cout_tedges = pd.DatetimeIndex(cout_tedges)
     demand = network.flow_array(flow)
@@ -818,35 +913,7 @@ def _build_system(
         raise ValueError(msg)
 
     segments = network.segments
-    for column in ("length", "diameter", "cover"):
-        if column not in segments.columns:
-            msg = f"the heat pair needs the segment column {column!r}"
-            raise ValueError(msg)
-    # Transport reads only the volume, so a network may carry one that its length and diameter
-    # do not imply and never notice. Heat reads the pipe three ways and they have to be the
-    # same pipe; where they are not, the water's heat capacity per unit length disagrees with
-    # the area the exchange rate was built from, and what the user used to see was a
-    # convergence failure naming knobs that cannot reconcile a geometry.
-    geometric = np.pi / 4.0 * segments["diameter"].to_numpy(dtype=float) ** 2 * segments["length"].to_numpy(dtype=float)
-    contradicts = np.abs(segments["volume"].to_numpy(dtype=float) - geometric) > _GEOMETRY_TOLERANCE * geometric
-    if contradicts.any():
-        msg = (
-            f"segment(s) {list(segments.index[contradicts])} carry a 'volume' that their 'length' and "
-            f"'diameter' do not imply, by more than {_GEOMETRY_TOLERANCE:.0%}. The heat pair reads the "
-            f"pipe three ways -- the exchange rate from the diameter, the wall flux from the length, the "
-            f"transit from the volume -- so they must describe one pipe. Drop the volume column to have "
-            f"it derived, or reconcile it with pi/4 * diameter**2 * length."
-        )
-        raise ValueError(msg)
     covers = segments["cover"]
-    soil_missing = [c for c in covers.unique() if c not in soil.index]
-    if soil_missing:
-        msg = f"soil is missing cover class(es): {soil_missing}"
-        raise ValueError(msg)
-    for column in ("alpha", "kappa", "eta"):
-        if column not in soil.columns:
-            msg = f"soil needs the column {column!r} (eta=inf is a prescribed-temperature surface)"
-            raise ValueError(msg)
     # ``surface_temperature`` is a lookup table, so classes no pipe is buried under are
     # ignored rather than rejected; only the ones the segments ask for have to be there.
     surface_missing = [c for c in covers.unique() if c not in surface_temperature]
@@ -867,14 +934,10 @@ def _build_system(
         msg = f"unknown node(s): {unknown}; network nodes are {list(network.nodes)}"
         raise ValueError(msg)
 
-    alpha_seg = soil["alpha"].reindex(covers).to_numpy(dtype=float)
-    kappa_seg = soil["kappa"].reindex(covers).to_numpy(dtype=float)
-    eta_seg = soil["eta"].reindex(covers).to_numpy(dtype=float)
-    depth_seg = segments["depth"].to_numpy(dtype=float) if "depth" in segments.columns else np.ones(len(segments))
-    kappa_series = pd.Series(kappa_seg, index=segments.index)
-    depth_series = pd.Series(depth_seg, index=segments.index)
-    eta_series = pd.Series(eta_seg, index=segments.index)
-    _validate_positive(alpha_seg, name="soil alpha")
+    alpha_seg = segments["alpha"].to_numpy(dtype=float)
+    kappa_seg = segments["kappa_soil"].to_numpy(dtype=float)
+    eta_seg = segments["eta"].to_numpy(dtype=float)
+    depth_seg = segments["depth"].to_numpy(dtype=float)
 
     # Spin-up, exactly as network_transfer resolves it: each endmember's travel time at the
     # leading flow rate, with resolve_spinup dropping the paths it cannot warm-start one by
@@ -898,37 +961,35 @@ def _build_system(
     dt_days = float(tedges_days[1] - tedges_days[0])
     seg_flow = network.segment_flow(flow=demand_p)
 
-    # Undisturbed soil temperature per segment. The field depends on the cover class and
-    # the burial depth only, and a network normally holds a handful of distinct pairs
-    # against many segments, so it is solved once per pair and broadcast.
+    # Undisturbed soil temperature per segment. The field depends on the cover class and the
+    # four soil parameters only, and a network normally holds a handful of distinct
+    # combinations against many segments, so it is solved once per combination and broadcast.
     t_inf = np.empty((len(segments), n_bins))
     cover_names = covers.to_numpy()
-    pairs = {(str(cover), float(depth)) for cover, depth in zip(cover_names, depth_seg, strict=True)}
-    for cover, depth in pairs:
-        eta_cover = float(soil.loc[cover, "eta"])
-        rows = (cover_names == cover) & (depth_seg == depth)
+    for cover, depth, alpha, kappa, eta in (
+        segments[["cover", "depth", "alpha", "kappa_soil", "eta"]].drop_duplicates().itertuples(index=False)
+    ):
+        rows = (
+            (cover_names == cover)
+            & (depth_seg == depth)
+            & (alpha_seg == alpha)
+            & (kappa_seg == kappa)
+            & (eta_seg == eta)
+        )
         record = np.asarray(surface_temperature[cover], dtype=float)
         # The warm-start prefix sees the record's opening surface held constant -- the same
         # constant-history policy the spin-up applies to flow and tin.
         t_inf[rows] = soil_temperature(
             surface_temperature=np.concatenate([np.full(n_pad, record[0]), record]),
             tedges=tedges_p,
-            depth=depth,
-            alpha=float(soil.loc[cover, "alpha"]),
-            kappa=float(soil.loc[cover, "kappa"]),
-            eta=eta_cover,
+            depth=float(depth),
+            alpha=float(alpha),
+            kappa=float(kappa),
+            eta=float(eta),
         )
 
-    rate = segment_heat_rate(
-        network=network,
-        kappa=kappa_series,
-        depth=depth_series,
-        eta=eta_series,
-        kappa_pipe=kappa_pipe,
-        film_coefficient=film_coefficient,
-    ).to_numpy(dtype=float)
-    thickness = segments["wall_thickness"].to_numpy(dtype=float) if kappa_pipe is not None else np.zeros(len(segments))
-    r_o = segments["diameter"].to_numpy(dtype=float) / 2.0 + thickness
+    rate = segment_heat_rate(network=network).to_numpy(dtype=float)
+    r_o = segments["diameter"].to_numpy(dtype=float) / 2.0 + segments["wall_thickness"].to_numpy(dtype=float)
     d_eff = depth_seg + kappa_seg / eta_seg
     dbar = _deficit_kernel(n_bins, dt_days, r_o=r_o, d_eff=d_eff, alpha=alpha_seg, kappa=kappa_seg)
     # The halo memory convolves this frozen kernel with a new flux history on every sweep, so
@@ -1296,12 +1357,9 @@ def source_to_endmember(
     flow: Mapping[str, npt.ArrayLike],
     tedges: pd.DatetimeIndex,
     cout_tedges: pd.DatetimeIndex,
-    network: PipeNetwork,
-    soil: pd.DataFrame,
+    network: HeatNetwork,
     surface_temperature: Mapping[str, npt.ArrayLike],
     report_nodes: list[str] | tuple[str, ...] | None = None,
-    kappa_pipe: float | pd.Series | None = None,
-    film_coefficient: float | pd.Series | None = None,
     max_sweeps: int = 5000,
     atol: float = 1e-9,
     spinup: str | None = "constant",
@@ -1331,13 +1389,9 @@ def source_to_endmember(
         convolution over lag bins).
     cout_tedges : pandas.DatetimeIndex
         Time edges of the output bins; alignment and resolution are free.
-    network : PipeNetwork
-        Network whose segments carry ``length`` [m], ``diameter`` [m] and ``cover`` (land
-        cover class) columns; optionally ``depth`` [m to axis, default 1] and
-        ``wall_thickness`` [m, required with ``kappa_pipe``].
-    soil : pandas.DataFrame
-        One row per cover class, columns ``alpha`` [m²/day], ``kappa`` [m²/day] and
-        ``eta`` [m/day] (``inf`` for a prescribed-temperature surface).
+    network : HeatNetwork
+        Network carrying everything that is constant in time -- geometry, land cover, burial
+        depth, wall, film and soil -- one row per segment; see :class:`HeatNetwork`.
     surface_temperature : mapping
         Sol-air temperature keyed by cover class: one bin-constant array per class on the
         ``tedges`` bins; see :func:`sol_air_temperature`. Classes no segment is buried under
@@ -1345,12 +1399,6 @@ def source_to_endmember(
     report_nodes : list of str or None, optional
         Nodes to report at, in output row order. Any node of the network is allowed.
         Defaults to ``network.endmembers``.
-    kappa_pipe : float or pandas.Series or None, optional
-        Pipe wall conductivity over the water heat capacity [m²/day]; see
-        :func:`segment_heat_rate`. Default None (bare pipe).
-    film_coefficient : float or pandas.Series or None, optional
-        Water-side film coefficient [m/day]; see :func:`segment_heat_rate`. Default None
-        (film not limiting).
     max_sweeps : int, optional
         Iteration cap. 1 is the one-way model. The sweep count is a property of the physics,
         not of the record length: it is set by how much of the steady soil resistance the
@@ -1437,23 +1485,10 @@ def source_to_endmember(
 
     >>> import numpy as np
     >>> import pandas as pd
-    >>> from pipetransport.examples import example_network, example_demand
+    >>> from pipetransport.examples import example_heat_network, example_demand
     >>> from pipetransport.heat import source_to_endmember
     >>>
-    >>> network = example_network()
-    >>> network.segments["cover"] = [
-    ...     "grass",
-    ...     "grass",
-    ...     "paved",
-    ...     "paved",
-    ...     "grass",
-    ...     "paved",
-    ...     "grass",
-    ... ]
-    >>> soil = pd.DataFrame(
-    ...     {"alpha": [0.05, 0.07], "kappa": [0.025, 0.035], "eta": [0.41, 0.41]},
-    ...     index=["grass", "paved"],
-    ... )
+    >>> network = example_heat_network()
     >>> tedges = pd.date_range("2025-06-01", "2025-06-08", freq="h")
     >>> surface = {
     ...     "grass": np.full(len(tedges) - 1, 22.0),
@@ -1465,7 +1500,6 @@ def source_to_endmember(
     ...     tedges=tedges,
     ...     cout_tedges=tedges,
     ...     network=network,
-    ...     soil=soil,
     ...     surface_temperature=surface,
     ... )
     >>> cout.shape
@@ -1487,11 +1521,8 @@ def source_to_endmember(
         tedges=tedges,
         cout_tedges=cout_tedges,
         network=network,
-        soil=soil,
         surface_temperature=surface_temperature,
         report_nodes=report_nodes,
-        kappa_pipe=kappa_pipe,
-        film_coefficient=film_coefficient,
         spinup=spinup,
     )
     tin_padded = np.concatenate([np.full(system.n_pad, tin[0]), tin])
@@ -1508,11 +1539,8 @@ def endmember_to_source(
     flow: Mapping[str, npt.ArrayLike],
     tedges: pd.DatetimeIndex,
     cout_tedges: pd.DatetimeIndex,
-    network: PipeNetwork,
-    soil: pd.DataFrame,
+    network: HeatNetwork,
     surface_temperature: Mapping[str, npt.ArrayLike],
-    kappa_pipe: float | pd.Series | None = None,
-    film_coefficient: float | pd.Series | None = None,
     max_sweeps: int = 5000,
     atol: float = 1e-9,
     regularization_strength: float = 1e-10,
@@ -1534,7 +1562,7 @@ def endmember_to_source(
         Measured temperature, keyed by the node it was measured at: one bin-constant array
         per node on the ``cout_tedges`` bins. The keys *are* the observation set -- pass
         only the nodes that were sampled. NaN inside an array marks a gap.
-    flow, tedges, cout_tedges, network, soil, surface_temperature, kappa_pipe, film_coefficient, max_sweeps, atol, spinup
+    flow, tedges, cout_tedges, network, surface_temperature, max_sweeps, atol, spinup
         As in :func:`source_to_endmember`.
     regularization_strength : float, optional
         Tikhonov parameter of each banded solve; see
@@ -1626,13 +1654,12 @@ def endmember_to_source(
 
     >>> import numpy as np
     >>> import pandas as pd
-    >>> from pipetransport.examples import example_network, example_demand
+    >>> from pipetransport.examples import example_heat_network, example_demand
     >>> from pipetransport.heat import source_to_endmember, endmember_to_source
     >>>
-    >>> network = example_network()
-    >>> network.segments["cover"] = "grass"
-    >>> soil = pd.DataFrame(
-    ...     {"alpha": [0.05], "kappa": [0.025], "eta": [0.41]}, index=["grass"]
+    >>> network = example_heat_network()
+    >>> network.segments["cover"] = (
+    ...     "grass"  # one field for every pipe keeps the example short
     ... )
     >>> tedges = pd.date_range("2025-06-01", "2025-06-11", freq="h")
     >>> demand = example_demand(tedges=tedges, network=network)
@@ -1644,7 +1671,6 @@ def endmember_to_source(
     ...     tedges=tedges,
     ...     cout_tedges=tedges,
     ...     network=network,
-    ...     soil=soil,
     ...     surface_temperature=surface,
     ... )
     >>> measured = source_to_endmember(tin=tin, report_nodes=["T1", "T4"], **shared)
@@ -1674,11 +1700,8 @@ def endmember_to_source(
         tedges=tedges,
         cout_tedges=cout_tedges,
         network=network,
-        soil=soil,
         surface_temperature=surface_temperature,
         report_nodes=tuple(node for node in network.nodes if node in tout),
-        kappa_pipe=kappa_pipe,
-        film_coefficient=film_coefficient,
         spinup=spinup,
     )
     cout_tedges = pd.DatetimeIndex(cout_tedges)
