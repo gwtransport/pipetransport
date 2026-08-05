@@ -138,6 +138,9 @@ jobs:
           retention-days: 1
 
   check-documentation-links:
+    # Disabled: the repository is private, so the published site the links point at is gone.
+    # Re-enable by removing this `if`.
+    if: false
     runs-on: ubuntu-latest
     needs: build-documentation
     steps:
@@ -166,7 +169,12 @@ jobs:
     # Every slice of the site is assembled here from this run's artifacts and published in one
     # deployment. A failed coverage run still publishes its "failed" badge; a failed docs build
     # publishes nothing, so the last good site stays up.
-    if: ${{ always() && github.ref == 'refs/heads/main' && needs.build-documentation.result == 'success' }}
+    #
+    # Disabled: the repository is private and the site is no longer published to GitHub Pages.
+    # The slices are still built and uploaded as run artifacts; only the deployment is off.
+    # Re-enable with:
+    # if: ${{ always() && github.ref == 'refs/heads/main' && needs.build-documentation.result == 'success' }}
+    if: false
     needs:
       [
         build-documentation,
