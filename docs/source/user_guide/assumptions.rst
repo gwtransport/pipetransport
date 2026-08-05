@@ -349,13 +349,33 @@ the field where the pipe surface actually is. The cylinder response is the only 
 three kernels without a closed form: it is evaluated by quadrature along the branch cut of its Laplace
 transform, once per distinct :math:`\alpha \Delta t / r_o^2` when the system is built, to about
 :math:`10^{-13}` relative. So the module's kernels are exact for piecewise-constant inputs, but one of
-them is exact only to a stated tolerance rather than in closed form. The image keeps its line source:
-read from :math:`2 d_\text{eff}` away rather than from the pipe's own wall, a cylinder is a line to
-the same order the *steady* resistance already is, and it costs the same order --- at most
-:math:`2\times10^{-4}` of :math:`R_\text{soil}` for a 100 mm service line buried a metre and
-:math:`3.5\times10^{-3}` for a 400 mm main, against the :math:`1\times10^{-4}` and
-:math:`3.8\times10^{-3}` that :math:`\ln(2 d_\text{eff}/r_o)` itself gives up against
-:math:`\operatorname{acosh}(d_\text{eff}/r_o)`. Both grow as the burial approaches :math:`r_o`.
+them is exact only to a stated tolerance rather than in closed form.
+
+The image keeps its line source, and what that whole conceptual choice costs --- cylinder at the wall,
+line image at :math:`2 d_\text{eff}`, saturating at :math:`\ln(2 d_\text{eff}/r_o)` --- is measured
+rather than bounded. An independent two-dimensional solve of the true problem in the cross-sectional
+plane, which carries no image at all and is never told a resistance, puts the steady uniform-flux wall
+temperature *above* the package's by :math:`(r_o/2 d_\text{eff})^2/(2\pi\kappa)`, the measured
+coefficient being 1.00, 0.995 and 0.98 at :math:`d_\text{eff}/r_o` of 21, 5.3 and 2.5 --- so
+:math:`1.5\times10^{-4}` of :math:`R_\text{soil}` for a 100 mm service line buried a metre,
+:math:`3.7\times10^{-3}` for a 400 mm main and :math:`2.4\times10^{-2}` at two and a half radii. The
+sign is worth reading: to leading order :math:`\ln(2 d_\text{eff}/r_o)` sits midway between the two
+wall conditions, exceeding the isothermal :math:`\operatorname{acosh}(d_\text{eff}/r_o)` by what it
+falls short of the uniform-flux answer by --- only to leading order, since the quartic terms differ.
+Transiently the gap is *larger* rather than smaller: while the image
+is arriving the model credits the wall with more resistance than has reached it, by up to 2.7 times the
+steady gap, returning to that gap only as :math:`\ln t / t`. All of it grows as the burial approaches
+:math:`r_o`.
+
+The surface film is folded into the same picture by displacing the surface downward by the radiation
+length :math:`\kappa/\eta` and treating it as perfect --- the effective depth
+:math:`d_\text{eff} = d + \kappa/\eta`. A genuine Robin surface is not one image but a distribution of
+them, and summing that distribution in closed form gives
+:math:`2\pi\kappa R = \ln(2 d/r_o) + 2 e^{x} E_1(x)` with :math:`x = 2 d \eta/\kappa`. Measured against
+it --- and independently against the two-dimensional solve, which agrees with the closed form to its
+own discretisation floor --- the displacement captures 99.95 % of what the film does, and always
+errs low: :math:`2.0\times10^{-4}` of :math:`R_\text{soil}` at :math:`h_s = 20` W/(m² K), an order
+below the cylinder-image gap it is combined with. It grows as the film weakens.
 
 **What breaks if it is violated.** Two mains sharing a trench warm each other's soil, which this
 model does not represent --- each segment sees only its own halo, so the delivered temperature of
