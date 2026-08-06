@@ -909,6 +909,318 @@ def pad_paths(chains: list[npt.NDArray[np.intp]]) -> tuple[npt.NDArray[np.intp],
     return paths_idx, active
 
 
+class _CellGrid:
+    """Refined source-time cells of every path, and the geometry read off them.
+
+    Cells are what make the operator exact. Between two consecutive boundaries the travel
+    time, the decay exponent and the arrival are all affine in source time, so every cell
+    mean is closed-form and the operator is a single scatter-add of cell contributions into
+    output bins. This object owns that construction -- the backward refinement sweep that
+    collects every kink of the arrival maps, the forward displacement sweep, the per-cell
+    geometry, and the band layout the scatter needs. What it deliberately does not own is
+    how much of a cell survives its journey: :meth:`bands` takes that as an argument, so a
+    plain reading and a reading weighted over the lag to its output bin's end share one
+    grid, and the displacement arithmetic -- which carries the plateau separation, the
+    round-trip snapping and the label floor -- exists once.
+
+    Three layouts are a contract the callers depend on:
+
+    - ``samples`` is the ``n_edge`` cell boundaries followed by the quarter and the
+      three-quarter point of every cell, so an interior quantity reshapes to
+      ``(n_nodes, 2, n_cells)`` and :func:`_cell_edges` extrapolates it to the boundaries.
+    - Output slots carry a dustbin either side of the real bins, so ``flat_cout`` indexes
+      rows of width ``n_cout + 2`` and the real bins are the ``[1:-1]`` slice.
+    - Rows stay in the caller's order.
+
+    Parameters
+    ----------
+    tedges_days : ndarray
+        Input (source) bin edges in days, strictly increasing, length ``n_cin + 1``.
+    cout_tedges_days : ndarray
+        Output bin edges in days on the same origin, strictly increasing, length
+        ``n_cout + 1``.
+    segment_volume : ndarray
+        Water volume [m³] of every segment of the network, already multiplied by the
+        retardation factor. Length ``n_seg``.
+    segment_flow : ndarray
+        Throughflow [m³/day] of those segments, shape ``(n_seg, n_cin)``.
+    segment_decay : ndarray
+        First-order decay rate [1/day] of those segments, length ``n_seg``.
+    node_flow : ndarray
+        Throughflow [m³/day] past each reporting node, shape ``(n_nodes, n_cin)``. This is
+        the weight of the output bin average and the differential of the label coordinate.
+    paths_idx : ndarray of int
+        Segment row of each path step, shape ``(n_nodes, max_depth)``, ordered from the
+        source outward. Slots beyond a path's depth are ignored.
+    active : ndarray of bool
+        Which slots of ``paths_idx`` are real path steps, shape ``(n_nodes, max_depth)``. A
+        path occupies the leading slots of its row, so a node reporting at the source itself
+        is a row of ``False``.
+
+    Notes
+    -----
+    Travel time, decay exponent and midpoint arrival are sampled at the quarter points of each
+    cell rather than at its boundaries. A cell boundary may sit on a zero-flow plateau of a
+    segment's cumulative volume, where the volume-to-time inverse is multi-valued and the
+    16-ulp plateau separation of :func:`~pipetransport.utils._make_strictly_monotone` scales a
+    one-ulp round trip up to a finite fraction of the stagnation. Interior samples are free of
+    that ambiguity, and all three quantities are affine across a cell, so the pair at ``1/4``
+    and ``3/4`` reproduces them exactly: the mean is the cell mean, and
+    ``1.5 * phi_lo_sample - 0.5 * phi_hi_sample`` extrapolates to the boundary exponents that
+    :func:`_surviving_fraction` integrates between.
+    """
+
+    def __init__(
+        self,
+        *,
+        tedges_days: npt.NDArray[np.floating],
+        cout_tedges_days: npt.NDArray[np.floating],
+        segment_volume: npt.NDArray[np.floating],
+        segment_flow: npt.NDArray[np.floating],
+        segment_decay: npt.NDArray[np.floating],
+        node_flow: npt.NDArray[np.floating],
+        paths_idx: npt.NDArray[np.intp],
+        active: npt.NDArray[np.bool_],
+    ) -> None:
+        self.tedges_days = tedges_days
+        self.cout_tedges_days = cout_tedges_days
+        self.segment_volume = segment_volume
+        self.segment_decay = segment_decay
+        self.paths_idx = paths_idx
+        self.active = active
+        self.n_cin = n_cin = len(tedges_days) - 1
+        self.n_cout = n_cout = len(cout_tedges_days) - 1
+        self.n_nodes, self.max_depth = paths_idx.shape
+        n_nodes, max_depth = self.n_nodes, self.max_depth
+        self.dt_days = dt_days = np.diff(tedges_days)
+
+        # Per-segment cumulative volume, once per segment however many paths share it. Plateaus
+        # from a closed valve make the volume-to-time inversion multi-valued, so they are
+        # separated before the maps below invert them.
+        self.segment_cumulative = cumulative_flow_volume(segment_flow, dt_days, strictly_monotone=True)
+        # Label axis: cumulative throughflow past each reporting node. Only ever read forward
+        # (time to label), so its plateaus are meaningful and stay untouched.
+        node_cumulative = cumulative_flow_volume(node_flow, dt_days)
+
+        # Refined source-time grid, one backward sweep for all nodes. Walking the paths inwards
+        # and re-seeding with tedges at every node collects, in source time, every parcel that
+        # crosses a flow change anywhere along its journey -- the complete set of kinks of the
+        # arrival maps -- and carries the preimage of the output edges along, so each cell also
+        # lands inside a single output bin. Points without an in-record preimage collapse onto
+        # the record's end as zero-width cells, keeping every row the same width; duplicates are
+        # equally harmless, so nothing is pruned.
+        tedges_rows = np.broadcast_to(tedges_days, (n_nodes, n_cin + 1))
+        pts = np.broadcast_to(cout_tedges_days, (n_nodes, n_cout + 1))
+        for depth in range(max_depth - 1, -1, -1):
+            pts = self.travel(np.concatenate([pts, tedges_rows], axis=1), depth, downstream=False)
+        grid = np.concatenate([pts, tedges_rows], axis=1)
+        grid = np.sort(
+            np.clip(np.where(np.isfinite(grid), grid, tedges_days[-1]), tedges_days[0], tedges_days[-1]), axis=1
+        )
+        self.grid = grid
+
+        # Forward sweep over the cell boundaries and the quarter points inside each cell. The
+        # boundaries carry the label; the travel time, the decay exponent and the midpoint arrival
+        # are read off the interior samples (see Notes).
+        self.n_edge = n_edge = grid.shape[1]
+        self.n_cells = grid.shape[1] - 1
+        cell_width = np.diff(grid, axis=1)
+        self.samples = samples = np.concatenate(
+            [grid, grid[:, :-1] + 0.25 * cell_width, grid[:, :-1] + 0.75 * cell_width], axis=1
+        )
+        arrival = samples
+        decay_exponent = np.zeros_like(samples)
+        for depth in range(max_depth):
+            previous, arrival = arrival, self.travel(arrival, depth, downstream=True)
+            decay_exponent += segment_decay[paths_idx[:, depth], None] * (arrival - previous)
+        self.quarter_arrival = quarter_arrival = arrival[:, n_edge:].reshape(n_nodes, 2, -1)
+        # Output-bin membership of every cell, read off the midpoint arrival. It is needed here,
+        # before any exponent factor, because a reading weighted over the lag to that bin's right
+        # edge measures its weight from there; the refined grid carries the preimages of the
+        # output edges, so a cell lies inside a single output bin and both its quarter samples
+        # share that edge -- which is what keeps the weighted exponent affine across the cell,
+        # exactly as the plain one is. Cells arriving past the output range are dustbins that the
+        # slices below drop.
+        self.arrival_mid = arrival_mid = quarter_arrival.mean(axis=1)
+        self.cout_bin = cout_bin = np.searchsorted(cout_tedges_days, arrival_mid, side="right") - 1
+        self.quarter_phi = quarter_phi = decay_exponent[:, n_edge:].reshape(n_nodes, 2, -1)
+        self.cell_travel_time = cell_travel_time = (quarter_arrival - samples[:, n_edge:].reshape(n_nodes, 2, -1)).mean(
+            axis=1
+        )
+        self.phi_lo, self.phi_hi = _cell_edges(quarter_phi)
+        label = _interp_rows(arrival[:, :n_edge], tedges_days, node_cumulative)
+
+        # Output bins: label span and the two conditions that do not depend on the cells. The
+        # edges are clamped into the record exactly as np.interp clamps them.
+        edge_in_record = (cout_tedges_days >= tedges_days[0]) & (cout_tedges_days <= tedges_days[-1])
+        cout_label = _interp_rows(
+            np.broadcast_to(np.clip(cout_tedges_days, tedges_days[0], tedges_days[-1]), (n_nodes, n_cout + 1)),
+            tedges_days,
+            node_cumulative,
+        )
+        cout_label_width = np.diff(cout_label, axis=1)
+        self.row_supported = edge_in_record[:-1] & edge_in_record[1:] & (cout_label_width > 0.0)
+
+        # Cells. Each spans one grid interval; both its boundaries must reach the node inside the
+        # record for it to carry information, and it must carry more water than the plateau
+        # separation of _make_strictly_monotone leaves behind. That separation is what keeps the
+        # volume-to-time inversion single-valued across a closed valve, but it lands in the label
+        # of exactly the cells whose parcels never departed: unfloored, their sliver of width
+        # reads as carried water, and a source bin no measurement constrains comes back with a
+        # finite age and a reconstruction of zero instead of NaN. The floor is relative to the
+        # record's own volume because the sliver is -- it is ulps of the cumulative scale, so any
+        # fixed threshold is crossed by a long enough record.
+        cell_ok = np.isfinite(label[:, :-1]) & np.isfinite(label[:, 1:])
+        midpoint = 0.5 * (grid[:, :-1] + grid[:, 1:])
+        self.cin_bin = cin_bin = np.clip(np.searchsorted(tedges_days, midpoint, side="right") - 1, 0, n_cin - 1)
+        label_floor = _ROUNDTRIP_ULPS * np.spacing(node_cumulative[:, -1:])
+        self.carrying = carrying = cell_ok & (label[:, 1:] - label[:, :-1] > label_floor)
+        self.label_width = label_width = np.where(carrying, label[:, 1:] - label[:, :-1], 0.0)
+
+        # An input bin is constrained only if every parcel leaving in it arrives inside the
+        # record. Every scatter-add below runs on indices flattened with a per-node offset.
+        node_offset = np.arange(n_nodes)[:, None]
+        flat_in = (node_offset * n_cin + cin_bin).ravel()
+        in_slots = n_nodes * n_cin
+        in_volume = np.bincount(flat_in, weights=label_width.ravel(), minlength=in_slots).reshape(n_nodes, n_cin)
+        carried_in = label_width * np.nan_to_num(cell_travel_time)
+        in_travel = np.bincount(flat_in, weights=carried_in.ravel(), minlength=in_slots).reshape(n_nodes, n_cin)
+        broken = np.bincount(flat_in, weights=(~cell_ok).ravel().astype(float), minlength=in_slots).reshape(
+            n_nodes, n_cin
+        )
+        self.valid_in = valid_in = (broken == 0.0) & (in_volume > 0.0)
+        self.residence_time_in = np.where(valid_in, in_travel / np.where(valid_in, in_volume, 1.0), np.nan)
+
+        # Cells arriving before the output range, after it, or outside the record drain into the
+        # two dustbin slots wrapped around each node's real bins and are sliced away below.
+        self.flat_cout = flat_cout = (node_offset * (n_cout + 2) + cout_bin + 1).ravel()
+        self.out_slots = out_slots = n_nodes * (n_cout + 2)
+
+        # Cells are ordered by source time, and arrival, label and the input-bin index all
+        # increase with it, so the cells of one output slot are a contiguous, non-decreasing run
+        # -- globally, since the node offsets dominate. The band bounds are read off each run's
+        # first and last cell instead of a scatter-minimum, over the carrying cells only:
+        # compressing a sorted array keeps it sorted, and a run of non-carrying plateau cells
+        # spans a closure while contributing nothing to it, so reading them would stretch every
+        # band of the operator to the length of the longest closure.
+        self.cin_flat = cin_flat = cin_bin.ravel()
+        carry_cout, carry_cin = flat_cout[carrying.ravel()], cin_flat[carrying.ravel()]
+        n_carry = carry_cout.size
+        slots = np.arange(out_slots)
+        run_lo = np.searchsorted(carry_cout, slots, side="left")
+        run_hi = np.searchsorted(carry_cout, slots, side="right")
+        populated = run_hi > run_lo
+        safe_lo, safe_hi = np.clip(run_lo, 0, max(n_carry - 1, 0)), np.clip(run_hi - 1, 0, max(n_carry - 1, 0))
+        self.col_start_all = col_start_all = np.where(populated, carry_cin[safe_lo], 0).astype(np.intp)
+        col_stop_all = np.where(populated, carry_cin[safe_hi], 0)
+        # The band width is shared across nodes and read off the real slots only: a dustbin run
+        # may span the whole input range.
+        spread = (col_stop_all - col_start_all).reshape(n_nodes, n_cout + 2)[:, 1:-1]
+        self.full_band = int(spread.max(initial=0)) + 1
+
+        self.span = span = np.where(cout_label_width > 0.0, cout_label_width, 1.0)
+        self.span_all = np.ones((n_nodes, n_cout + 2))
+        self.span_all[:, 1:-1] = span
+
+    def travel(self, times: npt.NDArray[np.floating], depth: int, *, downstream: bool) -> npt.NDArray[np.floating]:
+        """Map times across every path's ``depth``-th segment, downstream or back upstream.
+
+        Parameters
+        ----------
+        times : ndarray
+            Times in days of shape ``(n_nodes, m)`` at the segment's entry
+            (``downstream=True``) or exit face.
+        depth : int
+            Position of the segment on each path, counted from the source.
+        downstream : bool
+            Direction of the map.
+
+        Returns
+        -------
+        ndarray
+            Times in days at the other face; NaN where the parcel falls outside the record.
+            Rows whose path is shorter than ``depth`` pass through unchanged.
+        """
+        cumulative = self.segment_cumulative[self.paths_idx[:, depth]]
+        volume = self.segment_volume[self.paths_idx[:, depth], None]
+        target = _interp_rows(times, self.tedges_days, cumulative)
+        target = np.add(target, volume, out=target) if downstream else np.subtract(target, volume, out=target)
+        # Mapping a time back upstream and forward again is not bit-exact -- each composition
+        # step costs about an ulp of the cumulative volume, and the plateau separation above
+        # spends up to 16 more. A bare out-of-range NaN would read that miss as "the parcel
+        # left the record" and void the last output bin, so a target within _ROUNDTRIP_ULPS of
+        # the range is snapped into it. A genuine excursion is still NaN, and NaN input stays
+        # NaN.
+        low, high = cumulative[:, :1], cumulative[:, -1:]
+        slack = _ROUNDTRIP_ULPS * np.spacing(np.maximum(np.abs(low), np.abs(high)))
+        with np.errstate(invalid="ignore"):
+            outside = (target < low - slack) | (target > high + slack)
+        mapped = _interp_rows(np.clip(target, low, high), cumulative, self.tedges_days)
+        np.copyto(mapped, np.nan, where=outside)
+        return np.where(self.active[:, depth, None], mapped, times)
+
+    def bands(
+        self, cell_survive: npt.NDArray[np.floating]
+    ) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.intp], npt.NDArray[np.bool_], npt.NDArray[np.floating]]:
+        """Scatter the surviving cell contributions into the banded operator.
+
+        Parameters
+        ----------
+        cell_survive : ndarray
+            Fraction of each cell's water that reaches the node, shape
+            ``(n_nodes, n_cells)``. A plain reading takes :func:`_surviving_fraction` of the
+            cell's boundary exponents; a weighted reading contracts the same cell against its
+            reading kernel.
+
+        Returns
+        -------
+        band_vals : ndarray
+            Operator bands, shape ``(n_nodes, n_cout, full_band)``.
+        col_start : ndarray of intp
+            First input column of each band.
+        valid_out : ndarray of bool
+            Output bins the source record fully constrains.
+        residence_time_out : ndarray
+            Flow-weighted mean travel time of each output bin, NaN where not constrained.
+        """
+        # Every cell contribution is a share of its output bin's label span: that division is
+        # what turns the label-uniform integral into the flow-weighted bin average. Cells the
+        # label does not reach have zero width; their NaN decay exponents and travel times are
+        # masked out rather than multiplied by it.
+        survived = np.where(self.carrying, self.label_width * cell_survive, 0.0)
+        carried_out = np.where(self.carrying, self.label_width * self.cell_travel_time, 0.0)
+        n_nodes, n_cout, full_band = self.n_nodes, self.n_cout, self.full_band
+        flat_cout, out_slots = self.flat_cout, self.out_slots
+        # Dustbin cells may spread beyond the band; the clip keeps their scatter inside their own
+        # (sliced-away) rows.
+        slot = flat_cout * full_band + np.clip(self.cin_flat - self.col_start_all[flat_cout], 0, full_band - 1)
+        band_vals = (
+            np
+            .bincount(
+                slot, weights=survived.ravel() / self.span_all.ravel()[flat_cout], minlength=out_slots * full_band
+            )
+            .astype(float, copy=False)
+            .reshape(n_nodes, n_cout + 2, full_band)[:, 1:-1]
+        )
+        coverage = (
+            np.bincount(flat_cout, weights=self.label_width.ravel(), minlength=out_slots).reshape(n_nodes, n_cout + 2)[
+                :, 1:-1
+            ]
+            / self.span
+        )
+        out_travel = (
+            np.bincount(flat_cout, weights=carried_out.ravel(), minlength=out_slots).reshape(n_nodes, n_cout + 2)[
+                :, 1:-1
+            ]
+            / self.span
+        )
+
+        valid_out = self.row_supported & (coverage >= 1.0 - _COVERAGE_TOLERANCE)
+        band_vals[~valid_out] = 0.0
+        col_start = self.col_start_all.reshape(n_nodes, n_cout + 2)[:, 1:-1]
+        return band_vals, col_start, valid_out, np.where(valid_out, out_travel, np.nan)
+
+
 def paths_transfer(
     *,
     tedges_days: npt.NDArray[np.floating],
@@ -1024,187 +1336,37 @@ def paths_transfer(
         msg = "target terms require uniformly spaced tedges (the per-segment scan assumes one bin width)"
         raise ValueError(msg)
 
-    # Per-segment cumulative volume, once per segment however many paths share it. Plateaus
-    # from a closed valve make the volume-to-time inversion multi-valued, so they are
-    # separated before the maps below invert them.
-    segment_cumulative = cumulative_flow_volume(segment_flow, dt_days, strictly_monotone=True)
-    # Label axis: cumulative throughflow past each reporting node. Only ever read forward
-    # (time to label), so its plateaus are meaningful and stay untouched.
-    node_cumulative = cumulative_flow_volume(node_flow, dt_days)
+    cells = _CellGrid(
+        tedges_days=tedges_days,
+        cout_tedges_days=cout_tedges_days,
+        segment_volume=segment_volume,
+        segment_flow=segment_flow,
+        segment_decay=segment_decay,
+        node_flow=node_flow,
+        paths_idx=paths_idx,
+        active=active,
+    )
+    grid = cells.grid
+    carrying, label_width = cells.carrying, cells.label_width
+    cin_bin, cout_bin, flat_cout, span_all = cells.cin_bin, cells.cout_bin, cells.flat_cout, cells.span_all
+    quarter_phi, phi_lo, phi_hi = cells.quarter_phi, cells.phi_lo, cells.phi_hi
+    residence_time_in, valid_in = cells.residence_time_in, cells.valid_in
 
-    def travel(times: npt.NDArray[np.floating], depth: int, *, downstream: bool) -> npt.NDArray[np.floating]:
-        """Map times across every path's ``depth``-th segment, downstream or back upstream.
-
-        Parameters
-        ----------
-        times : ndarray
-            Times in days of shape ``(n_nodes, m)`` at the segment's entry
-            (``downstream=True``) or exit face.
-        depth : int
-            Position of the segment on each path, counted from the source.
-        downstream : bool
-            Direction of the map.
-
-        Returns
-        -------
-        ndarray
-            Times in days at the other face; NaN where the parcel falls outside the record.
-            Rows whose path is shorter than ``depth`` pass through unchanged.
-        """
-        cumulative = segment_cumulative[paths_idx[:, depth]]
-        volume = segment_volume[paths_idx[:, depth], None]
-        target = _interp_rows(times, tedges_days, cumulative)
-        target = np.add(target, volume, out=target) if downstream else np.subtract(target, volume, out=target)
-        # Mapping a time back upstream and forward again is not bit-exact -- each composition
-        # step costs about an ulp of the cumulative volume, and the plateau separation above
-        # spends up to 16 more. A bare out-of-range NaN would read that miss as "the parcel
-        # left the record" and void the last output bin, so a target within _ROUNDTRIP_ULPS of
-        # the range is snapped into it. A genuine excursion is still NaN, and NaN input stays
-        # NaN.
-        low, high = cumulative[:, :1], cumulative[:, -1:]
-        slack = _ROUNDTRIP_ULPS * np.spacing(np.maximum(np.abs(low), np.abs(high)))
-        with np.errstate(invalid="ignore"):
-            outside = (target < low - slack) | (target > high + slack)
-        mapped = _interp_rows(np.clip(target, low, high), cumulative, tedges_days)
-        np.copyto(mapped, np.nan, where=outside)
-        return np.where(active[:, depth, None], mapped, times)
-
-    # Refined source-time grid, one backward sweep for all nodes. Walking the paths inwards
-    # and re-seeding with tedges at every node collects, in source time, every parcel that
-    # crosses a flow change anywhere along its journey -- the complete set of kinks of the
-    # arrival maps -- and carries the preimage of the output edges along, so each cell also
-    # lands inside a single output bin. Points without an in-record preimage collapse onto
-    # the record's end as zero-width cells, keeping every row the same width; duplicates are
-    # equally harmless, so nothing is pruned.
-    tedges_rows = np.broadcast_to(tedges_days, (n_nodes, n_cin + 1))
-    pts = np.broadcast_to(cout_tedges_days, (n_nodes, n_cout + 1))
-    for depth in range(max_depth - 1, -1, -1):
-        pts = travel(np.concatenate([pts, tedges_rows], axis=1), depth, downstream=False)
-    grid = np.concatenate([pts, tedges_rows], axis=1)
-    grid = np.sort(np.clip(np.where(np.isfinite(grid), grid, tedges_days[-1]), tedges_days[0], tedges_days[-1]), axis=1)
-
-    # Forward sweep over the cell boundaries and the quarter points inside each cell. The
-    # boundaries carry the label; the travel time, the decay exponent and the midpoint arrival
-    # are read off the interior samples (see Notes). The per-depth stages are kept only when
-    # the bias factors are requested -- and only over the interior samples, which is all the
-    # exit-to-node exponents and the entry/exit bins are read off.
-    n_edge = grid.shape[1]
-    cell_width = np.diff(grid, axis=1)
-    samples = np.concatenate([grid, grid[:, :-1] + 0.25 * cell_width, grid[:, :-1] + 0.75 * cell_width], axis=1)
-    arrival = samples
-    decay_exponent = np.zeros_like(samples)
-    stage_arrival: list[npt.NDArray[np.floating]] = [samples[:, n_edge:]]
-    stage_phi: list[npt.NDArray[np.floating]] = [decay_exponent[:, n_edge:]]
-    for depth in range(max_depth):
-        previous, arrival = arrival, travel(arrival, depth, downstream=True)
-        decay_exponent += segment_decay[paths_idx[:, depth], None] * (arrival - previous)
-        if with_target_terms:
-            # `arrival` is a fresh array each depth, so a view suffices; the exponent
-            # accumulates in place, so its stage is copied.
-            stage_arrival.append(arrival[:, n_edge:])
-            stage_phi.append(decay_exponent[:, n_edge:].copy())
-    quarter_arrival = arrival[:, n_edge:].reshape(n_nodes, 2, -1)
-    # Output-bin membership of every cell, read off the midpoint arrival. It is needed here,
-    # before any exponent factor, because ``bin_end_rate`` measures its weight from that bin's
-    # right edge; the refined grid carries the preimages of the output edges, so a cell lies
-    # inside a single output bin and both its quarter samples share that edge -- which is what
-    # keeps the weighted exponent affine across the cell, exactly as the plain one is. Cells
-    # arriving past the output range are dustbins that the slices below drop; clamping their
-    # lag at zero keeps every exponent non-negative rather than letting a long record
-    # overflow one.
-    arrival_mid = quarter_arrival.mean(axis=1)
-    cout_bin = np.searchsorted(cout_tedges_days, arrival_mid, side="right") - 1
-    bin_end = cout_tedges_days[np.clip(cout_bin, 0, n_cout - 1) + 1]
     # The reading weight of each row is a function of the lag to the output-bin end alone;
     # the lag is affine across a cell exactly as the decay exponent is, so every weighted
     # cell mean stays closed-form. The decay exponent is kept pure here -- the integrated
     # weights carry their own exponential inside the kernel, so the weight machinery owns
     # the split between the two.
+    bin_end = cout_tedges_days[np.clip(cout_bin, 0, n_cout - 1) + 1]
     weight_rate = np.zeros(n_nodes) if bin_end_rate is None else np.asarray(bin_end_rate, dtype=float)
     weight_power = np.zeros(n_nodes, dtype=int) if bin_end_power is None else np.asarray(bin_end_power, dtype=int)
     weight_integrated = (
         np.zeros(n_nodes, dtype=bool) if bin_end_integrated is None else np.asarray(bin_end_integrated, dtype=bool)
     )
     weighted_rows = bin_end_rate is not None or bin_end_power is not None or bin_end_integrated is not None
-    lag_to_bin_end = np.maximum(bin_end[:, None, :] - quarter_arrival, 0.0)
+    lag_to_bin_end = np.maximum(bin_end[:, None, :] - cells.quarter_arrival, 0.0)
     lag_lo, lag_hi = _cell_edges(lag_to_bin_end)
-    quarter_phi = decay_exponent[:, n_edge:].reshape(n_nodes, 2, -1)
-    cell_travel_time = (quarter_arrival - samples[:, n_edge:].reshape(n_nodes, 2, -1)).mean(axis=1)
-    phi_lo, phi_hi = _cell_edges(quarter_phi)
-    label = _interp_rows(arrival[:, :n_edge], tedges_days, node_cumulative)
 
-    # Output bins: label span and the two conditions that do not depend on the cells. The
-    # edges are clamped into the record exactly as np.interp clamps them.
-    edge_in_record = (cout_tedges_days >= tedges_days[0]) & (cout_tedges_days <= tedges_days[-1])
-    cout_label = _interp_rows(
-        np.broadcast_to(np.clip(cout_tedges_days, tedges_days[0], tedges_days[-1]), (n_nodes, n_cout + 1)),
-        tedges_days,
-        node_cumulative,
-    )
-    cout_label_width = np.diff(cout_label, axis=1)
-    row_supported = edge_in_record[:-1] & edge_in_record[1:] & (cout_label_width > 0.0)
-
-    # Cells. Each spans one grid interval; both its boundaries must reach the node inside the
-    # record for it to carry information, and it must carry more water than the plateau
-    # separation of _make_strictly_monotone leaves behind. That separation is what keeps the
-    # volume-to-time inversion single-valued across a closed valve, but it lands in the label
-    # of exactly the cells whose parcels never departed: unfloored, their sliver of width
-    # reads as carried water, and a source bin no measurement constrains comes back with a
-    # finite age and a reconstruction of zero instead of NaN. The floor is relative to the
-    # record's own volume because the sliver is -- it is ulps of the cumulative scale, so any
-    # fixed threshold is crossed by a long enough record.
-    cell_ok = np.isfinite(label[:, :-1]) & np.isfinite(label[:, 1:])
-    midpoint = 0.5 * (grid[:, :-1] + grid[:, 1:])
-    cin_bin = np.clip(np.searchsorted(tedges_days, midpoint, side="right") - 1, 0, n_cin - 1)
-    label_floor = _ROUNDTRIP_ULPS * np.spacing(node_cumulative[:, -1:])
-    carrying = cell_ok & (label[:, 1:] - label[:, :-1] > label_floor)
-    label_width = np.where(carrying, label[:, 1:] - label[:, :-1], 0.0)
-
-    # An input bin is constrained only if every parcel leaving in it arrives inside the
-    # record. Every scatter-add below runs on indices flattened with a per-node offset.
-    node_offset = np.arange(n_nodes)[:, None]
-    flat_in = (node_offset * n_cin + cin_bin).ravel()
-    in_slots = n_nodes * n_cin
-    in_volume = np.bincount(flat_in, weights=label_width.ravel(), minlength=in_slots).reshape(n_nodes, n_cin)
-    carried_in = label_width * np.nan_to_num(cell_travel_time)
-    in_travel = np.bincount(flat_in, weights=carried_in.ravel(), minlength=in_slots).reshape(n_nodes, n_cin)
-    broken = np.bincount(flat_in, weights=(~cell_ok).ravel().astype(float), minlength=in_slots).reshape(n_nodes, n_cin)
-    valid_in = (broken == 0.0) & (in_volume > 0.0)
-    residence_time_in = np.where(valid_in, in_travel / np.where(valid_in, in_volume, 1.0), np.nan)
-
-    # Cells arriving before the output range, after it, or outside the record drain into the
-    # two dustbin slots wrapped around each node's real bins and are sliced away below.
-    flat_cout = (node_offset * (n_cout + 2) + cout_bin + 1).ravel()
-    out_slots = n_nodes * (n_cout + 2)
-
-    # Cells are ordered by source time, and arrival, label and the input-bin index all
-    # increase with it, so the cells of one output slot are a contiguous, non-decreasing run
-    # -- globally, since the node offsets dominate. The band bounds are read off each run's
-    # first and last cell instead of a scatter-minimum, over the carrying cells only:
-    # compressing a sorted array keeps it sorted, and a run of non-carrying plateau cells
-    # spans a closure while contributing nothing to it, so reading them would stretch every
-    # band of the operator to the length of the longest closure.
-    cin_flat = cin_bin.ravel()
-    carry_cout, carry_cin = flat_cout[carrying.ravel()], cin_flat[carrying.ravel()]
-    n_carry = carry_cout.size
-    slots = np.arange(out_slots)
-    run_lo = np.searchsorted(carry_cout, slots, side="left")
-    run_hi = np.searchsorted(carry_cout, slots, side="right")
-    populated = run_hi > run_lo
-    safe_lo, safe_hi = np.clip(run_lo, 0, max(n_carry - 1, 0)), np.clip(run_hi - 1, 0, max(n_carry - 1, 0))
-    col_start_all = np.where(populated, carry_cin[safe_lo], 0).astype(np.intp)
-    col_stop_all = np.where(populated, carry_cin[safe_hi], 0)
-    # The band width is shared across nodes and read off the real slots only: a dustbin run
-    # may span the whole input range.
-    spread = (col_stop_all - col_start_all).reshape(n_nodes, n_cout + 2)[:, 1:-1]
-    full_band = int(spread.max(initial=0)) + 1
-
-    # Every cell contribution is a share of its output bin's label span: that division is
-    # what turns the label-uniform integral into the flow-weighted bin average. Cells the
-    # label does not reach have zero width; their NaN decay exponents and travel times are
-    # masked out rather than multiplied by it. Plain operators keep the direct closed form;
-    # weighted rows go through the weight machinery, whose plain case reduces to the same
-    # expression.
     poly_scale = None
     if bin_end_scale is not None:
         poly_scale = (
@@ -1218,37 +1380,26 @@ def paths_transfer(
         cell_survive = band_weights.powers(np.zeros_like(phi_lo), np.zeros_like(phi_hi), 0)[0]
     else:
         cell_survive = _surviving_fraction(phi_lo, phi_hi)
-    survived = np.where(carrying, label_width * cell_survive, 0.0)
-    carried_out = np.where(carrying, label_width * cell_travel_time, 0.0)
-    span = np.where(cout_label_width > 0.0, cout_label_width, 1.0)
-    span_all = np.ones((n_nodes, n_cout + 2))
-    span_all[:, 1:-1] = span
-    # Dustbin cells may spread beyond the band; the clip keeps their scatter inside their own
-    # (sliced-away) rows.
-    slot = flat_cout * full_band + np.clip(cin_flat - col_start_all[flat_cout], 0, full_band - 1)
-    band_vals = (
-        np
-        .bincount(slot, weights=survived.ravel() / span_all.ravel()[flat_cout], minlength=out_slots * full_band)
-        .astype(float, copy=False)
-        .reshape(n_nodes, n_cout + 2, full_band)[:, 1:-1]
-    )
-    coverage = (
-        np.bincount(flat_cout, weights=label_width.ravel(), minlength=out_slots).reshape(n_nodes, n_cout + 2)[:, 1:-1]
-        / span
-    )
-    out_travel = (
-        np.bincount(flat_cout, weights=carried_out.ravel(), minlength=out_slots).reshape(n_nodes, n_cout + 2)[:, 1:-1]
-        / span
-    )
-
-    valid_out = row_supported & (coverage >= 1.0 - _COVERAGE_TOLERANCE)
-    band_vals[~valid_out] = 0.0
-    col_start = col_start_all.reshape(n_nodes, n_cout + 2)[:, 1:-1]
-    residence_time_out = np.where(valid_out, out_travel, np.nan)
+    band_vals, col_start, valid_out, residence_time_out = cells.bands(cell_survive)
 
     target_terms = None
     if with_target_terms:
-        # Target-independent bias factors, read off the stored sweep stages at the quarter
+        # The per-depth stages of the forward sweep, re-run here rather than kept by the
+        # grid. Storing them for every depth costs the sample array again per segment --
+        # gigabytes on a long fine record -- which a plain build must never pay, and the
+        # sweep is a few per cent of what the bias factors below cost. ``travel`` returns a
+        # fresh array each depth, so an arrival stage is a view; the exponent accumulates in
+        # place, so its stage is copied.
+        arrival = cells.samples
+        phi = np.zeros_like(arrival)
+        stage_arrival = [arrival[:, cells.n_edge :]]
+        stage_phi = [phi[:, cells.n_edge :].copy()]
+        for depth in range(max_depth):
+            previous, arrival = arrival, cells.travel(arrival, depth, downstream=True)
+            phi += segment_decay[paths_idx[:, depth], None] * (arrival - previous)
+            stage_arrival.append(arrival[:, cells.n_edge :])
+            stage_phi.append(phi[:, cells.n_edge :].copy())
+        # Target-independent bias factors, read off those sweep stages at the quarter
         # points and extrapolated to the cell boundaries exactly as the decay exponent is.
         # phi_down -- the exponent from a segment's exit to the node -- is the difference of
         # two accumulator stages and is non-negative, because adding non-negative increments
