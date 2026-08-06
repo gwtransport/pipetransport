@@ -1196,7 +1196,9 @@ def test_segment_heat_rate_resistances_add_in_series():
 # ============================================================================
 
 
-def _build_operator(network, demand, tedges, rates, *, nodes=None, with_target_terms=True, n_target_modes=1):
+def _build_operator(
+    network, demand, tedges, rates, *, nodes=None, with_target_terms=True, n_target_modes=1, bin_end_rate=None
+):
     """Build one operator directly, bypassing the spin-up policy."""
     requested = list(network.endmembers if nodes is None else nodes)
     paths = [network.segments.index.get_indexer(list(network.paths[node])) for node in requested]
@@ -1217,6 +1219,7 @@ def _build_operator(network, demand, tedges, rates, *, nodes=None, with_target_t
         active=active,
         with_target_terms=with_target_terms,
         n_target_modes=n_target_modes,
+        bin_end_rate=bin_end_rate,
     )
 
 
@@ -1231,6 +1234,49 @@ def test_target_terms_leave_the_transport_operator_bit_identical(heat_network, h
     np.testing.assert_array_equal(plain.col_start, with_terms.col_start)
     np.testing.assert_array_equal(plain.valid_out, with_terms.valid_out)
     assert plain.target_terms is None
+
+
+@pytest.mark.parametrize("decay", ["zero", "heat"])
+@pytest.mark.parametrize("stagnant", [False, True])
+def test_zero_reading_weight_is_the_plain_closed_form_bit_for_bit(
+    heat_network, hourly_tedges, diurnal_demand, decay, stagnant
+):
+    """A weight of ``exp(-0 (t_end - t))`` builds the same operator as no weight at all.
+
+    The weighted route contracts the cell basis against ``E_0``, the plain route calls
+    :func:`~pipetransport._transfer._surviving_fraction`; the two are the same integral, so
+    the operators must agree to the last bit rather than merely to a tolerance. This is the
+    only place the two routes can be compared -- they live in separate packages once the
+    heat model ships on its own -- and it is what licenses the weighted route to be the
+    single path there.
+    """
+    demand = heat_network.flow_array(diurnal_demand(heat_network, hourly_tedges))
+    if stagnant:
+        # A closed tap on the first endmember: plateaus in the cumulative volume, which is
+        # where the two routes could most plausibly part company.
+        demand = demand.copy()
+        demand[0, len(hourly_tedges) // 3 : len(hourly_tedges) // 2] = 0.0
+    n_seg = len(heat_network.segments)
+    rates = (
+        np.zeros(n_seg) if decay == "zero" else np.array(list(heat.segment_heat_rate(network=heat_network).values()))
+    )
+
+    unweighted = _build_operator(heat_network, demand, hourly_tedges, rates, with_target_terms=False)
+    zero_weight = _build_operator(
+        heat_network,
+        demand,
+        hourly_tedges,
+        rates,
+        with_target_terms=False,
+        bin_end_rate=np.zeros(len(heat_network.endmembers)),
+    )
+
+    for field in unweighted._fields:
+        left, right = getattr(unweighted, field), getattr(zero_weight, field)
+        if left is None:
+            assert right is None
+        else:
+            np.testing.assert_array_equal(left, right, err_msg=f"field {field}")
 
 
 @pytest.mark.parametrize("rate", [0.0, 0.5, 5.336, 40.0])
