@@ -201,18 +201,15 @@ from scipy.fft import irfft, next_fast_len, rfft
 from scipy.signal import fftconvolve, lfilter
 from scipy.special import erfc, erfcx, exp1, j1, y1
 
-from pipetransport._transfer import (
-    NetworkTransfer,
+from pipetransport._heat_transfer import (
+    TargetTerms,
     _e_table,
     _legendre_monomial,
-    _running_start,
-    apply_banded,
     apply_content_snapshots,
     apply_segment_targets,
-    pad_paths,
     paths_transfer,
-    resolve_spinup,
 )
+from pipetransport._transfer import NetworkTransfer, _running_start, apply_banded, pad_paths, resolve_spinup
 from pipetransport._validation import _validate_no_nan, _validate_positive, _validate_tedges
 from pipetransport.network import PipeNetwork
 from pipetransport.utils import solve_inverse_transport_banded, tedges_to_days
@@ -940,7 +937,9 @@ class _HeatSystem(NamedTuple):
     h_tau: npt.NDArray[np.floating]
     segment_names: tuple[str, ...]
     internal: NetworkTransfer
+    internal_terms: TargetTerms
     reporting: NetworkTransfer
+    reporting_terms: TargetTerms
 
 
 def _build_system(
@@ -1103,7 +1102,7 @@ def _build_system(
         bin_end_integrated: npt.NDArray[np.bool_] | None = None,
         snapshot_rows: npt.NDArray[np.intp] | None = None,
         bin_end_scale: npt.NDArray[np.floating] | None = None,
-    ) -> NetworkTransfer:
+    ) -> tuple[NetworkTransfer, TargetTerms]:
         return paths_transfer(
             tedges_days=tedges_days,
             cout_tedges_days=cout,
@@ -1116,7 +1115,6 @@ def _build_system(
             bin_end_rate=bin_end_rate,
             bin_end_power=bin_end_power,
             bin_end_integrated=bin_end_integrated,
-            with_target_terms=True,
             n_target_modes=n_modes,
             snapshot_rows=snapshot_rows,
             bin_end_scale=bin_end_scale,
@@ -1170,6 +1168,20 @@ def _build_system(
     weight_rate = np.concatenate([np.zeros(n_seg) if r == 0.0 else rate for r, _, _ in specs + entry_specs])
     weight_power = np.concatenate([np.full(n_seg, p) for _, p, _ in specs + entry_specs])
     weight_integrated = np.concatenate([np.full(n_seg, g, dtype=bool) for _, _, g in specs + entry_specs])
+    internal, internal_terms = build(
+        int_paths,
+        int_active,
+        np.vstack([seg_flow] * len(specs + entry_specs)),
+        tedges_days,
+        weight_rate,
+        weight_power,
+        weight_integrated,
+        # The plain delivery rows lead the layout, one per segment: the content snapshots
+        # that restart the moment recursions are built on their cells.
+        snapshot_rows=np.arange(n_seg, dtype=np.intp),
+        bin_end_scale=np.tile(volume, len(specs) + len(entry_specs)),
+    )
+    reporting, reporting_terms = build(rep_paths, rep_active, rep_flow, cout_days, None)
     return _HeatSystem(
         nodes=requested,
         n_pad=n_pad,
@@ -1195,20 +1207,10 @@ def _build_system(
         # reverse coupling is invertible at all, so the diagnostics quote it.
         h_tau=rate * volume / np.where(running > 0.0, running, np.nan),
         segment_names=tuple(str(name) for name in segments.index),
-        internal=build(
-            int_paths,
-            int_active,
-            np.vstack([seg_flow] * len(specs + entry_specs)),
-            tedges_days,
-            weight_rate,
-            weight_power,
-            weight_integrated,
-            # The plain delivery rows lead the layout, one per segment: the content
-            # snapshots that restart the moment recursions are built on their cells.
-            snapshot_rows=np.arange(n_seg, dtype=np.intp),
-            bin_end_scale=np.tile(volume, len(specs) + len(entry_specs)),
-        ),
-        reporting=build(rep_paths, rep_active, rep_flow, cout_days, None),
+        internal=internal,
+        internal_terms=internal_terms,
+        reporting=reporting,
+        reporting_terms=reporting_terms,
     )
 
 
@@ -1420,7 +1422,7 @@ def _internal_pass(
         integrated-kernel weighted deliveries, and the two weighted families at the
         pipe's entry; see :class:`_HeatSystem`.
     """
-    t_int = transported + apply_segment_targets(system.internal, modes)
+    t_int = transported + apply_segment_targets(system.internal, system.internal_terms, modes)
     t_int[~system.internal.valid_out] = np.nan
     return t_int
 
@@ -1613,11 +1615,11 @@ def _update_targets(
     # through plain forgetting factors only, because each mode is corrected before the
     # next one's coupling reads it. Anchors inside the warm-start prefix, or whose
     # in-pipe water the record does not fully cover, keep the free-running state.
-    terms = system.internal.target_terms
+    terms = system.internal_terms
     if terms is None or terms.snapshots is None:
         msg = "the internal operator must carry target terms and content snapshots; this is a bug, please report it"
         raise RuntimeError(msg)
-    snap_abs, snap_unit = apply_content_snapshots(system.internal, modes, tin_padded)
+    snap_abs, snap_unit = apply_content_snapshots(system.internal_terms, modes, tin_padded)
     snapshot = snap_abs - t_ref[None] * snap_unit
     snap_valid = terms.snapshots.anchor_valid & (np.arange(snapshot.shape[-1])[None, :] > system.n_pad)
     chunk_start = terms.chunk_edge[:, 1:].astype(np.intp)
@@ -1884,7 +1886,9 @@ def source_to_endmember(
     tin_padded = np.concatenate([np.full(system.n_pad, tin[0]), tin])
 
     modes = _converge_targets(system, tin_padded, max_sweeps=max_sweeps, atol=atol)
-    out = apply_banded(system.reporting, tin_padded) + apply_segment_targets(system.reporting, modes)
+    out = apply_banded(system.reporting, tin_padded) + apply_segment_targets(
+        system.reporting, system.reporting_terms, modes
+    )
     out[~system.reporting.valid_out] = np.nan
     return dict(zip(system.nodes, out, strict=True))
 
@@ -2079,7 +2083,7 @@ def endmember_to_source(
         reporting: NetworkTransfer,
         modes: npt.NDArray[np.floating],
     ) -> npt.NDArray[np.floating]:
-        bias = apply_segment_targets(reporting, modes)
+        bias = apply_segment_targets(reporting, system.reporting_terms, modes)
         band_vals = reporting.band_vals.reshape(-1, reporting.band_vals.shape[-1])
         rhs = np.where(reporting.valid_out.ravel(), (observed - bias).ravel(), np.nan)
         return solve_inverse_transport_banded(

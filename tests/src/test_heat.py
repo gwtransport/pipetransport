@@ -27,7 +27,9 @@ from scipy.sparse.linalg import splu, spsolve
 from scipy.special import erfc, erfcx, exp1, hyperu, j1, kve, y1
 
 from pipetransport import heat, transport
-from pipetransport._transfer import apply_banded, apply_segment_targets, paths_transfer
+from pipetransport._heat_transfer import apply_segment_targets, paths_transfer
+from pipetransport._transfer import apply_banded
+from pipetransport._transfer import paths_transfer as core_paths_transfer
 from pipetransport.examples import example_network
 from pipetransport.network import PipeNetwork
 from pipetransport.utils import tedges_to_days
@@ -1196,10 +1198,8 @@ def test_segment_heat_rate_resistances_add_in_series():
 # ============================================================================
 
 
-def _build_operator(
-    network, demand, tedges, rates, *, nodes=None, with_target_terms=True, n_target_modes=1, bin_end_rate=None
-):
-    """Build one operator directly, bypassing the spin-up policy."""
+def _operator_inputs(network, demand, tedges, *, nodes=None):
+    """The path geometry both flavours of ``paths_transfer`` take, bypassing the spin-up policy."""
     requested = list(network.endmembers if nodes is None else nodes)
     paths = [network.segments.index.get_indexer(list(network.paths[node])) for node in requested]
     lengths = np.array([path.size for path in paths], dtype=np.intp)
@@ -1208,47 +1208,42 @@ def _build_operator(
     paths_idx = np.zeros((len(requested), max_depth), dtype=np.intp)
     paths_idx[active] = np.concatenate(paths)
     days = tedges_to_days(tedges)
+    return {
+        "tedges_days": days,
+        "cout_tedges_days": days,
+        "segment_volume": network.segments["volume"].to_numpy(dtype=float),
+        "segment_flow": network.segment_flow(flow=demand),
+        "node_flow": network.node_flow(flow=demand, nodes=requested),
+        "paths_idx": paths_idx,
+        "active": active,
+    }
+
+
+def _build_operator(network, demand, tedges, rates, *, nodes=None, n_target_modes=1, bin_end_rate=None):
+    """Build one operator and its bias factors, bypassing the spin-up policy."""
     return paths_transfer(
-        tedges_days=days,
-        cout_tedges_days=days,
-        segment_volume=network.segments["volume"].to_numpy(dtype=float),
-        segment_flow=network.segment_flow(flow=demand),
+        **_operator_inputs(network, demand, tedges, nodes=nodes),
         segment_decay=np.asarray(rates, dtype=float),
-        node_flow=network.node_flow(flow=demand, nodes=requested),
-        paths_idx=paths_idx,
-        active=active,
-        with_target_terms=with_target_terms,
         n_target_modes=n_target_modes,
         bin_end_rate=bin_end_rate,
     )
 
 
-def test_target_terms_leave_the_transport_operator_bit_identical(heat_network, hourly_tedges, diurnal_demand):
-    """Requesting the bias factors changes nothing about ``W`` itself."""
-    demand = heat_network.flow_array(diurnal_demand(heat_network, hourly_tedges))
-    rates = np.array(list(heat.segment_heat_rate(network=heat_network).values()))
-    plain = _build_operator(heat_network, demand, hourly_tedges, rates, with_target_terms=False)
-    with_terms = _build_operator(heat_network, demand, hourly_tedges, rates)
-
-    np.testing.assert_array_equal(plain.band_vals, with_terms.band_vals)
-    np.testing.assert_array_equal(plain.col_start, with_terms.col_start)
-    np.testing.assert_array_equal(plain.valid_out, with_terms.valid_out)
-    assert plain.target_terms is None
-
-
 @pytest.mark.parametrize("decay", ["zero", "heat"])
 @pytest.mark.parametrize("stagnant", [False, True])
-def test_zero_reading_weight_is_the_plain_closed_form_bit_for_bit(
-    heat_network, hourly_tedges, diurnal_demand, decay, stagnant
+@pytest.mark.parametrize("weighted", [False, True])
+def test_the_relaxation_operator_is_the_transport_operator_bit_for_bit(
+    heat_network, hourly_tedges, diurnal_demand, decay, stagnant, weighted
 ):
-    """A weight of ``exp(-0 (t_end - t))`` builds the same operator as no weight at all.
+    """Layering the bias machinery on top leaves ``W`` itself untouched, to the last bit.
 
-    The weighted route contracts the cell basis against ``E_0``, the plain route calls
-    :func:`~pipetransport._transfer._surviving_fraction`; the two are the same integral, so
-    the operators must agree to the last bit rather than merely to a tolerance. This is the
-    only place the two routes can be compared -- they live in separate packages once the
-    heat model ships on its own -- and it is what licenses the weighted route to be the
-    single path there.
+    Two claims in one, and both are cross-package contracts once the heat model ships on
+    its own. Building the bias factors must not perturb the operator; and a reading weight
+    of ``exp(-0 (t_end - t))`` must reproduce the plain closed form, because the weighted
+    route contracts the cell basis against ``E_0`` where the core route calls
+    :func:`~pipetransport._transfer._surviving_fraction` -- the same integral by two
+    evaluations. The second claim is what licenses the weighted route to be the single path
+    on the heat side.
     """
     demand = heat_network.flow_array(diurnal_demand(heat_network, hourly_tedges))
     if stagnant:
@@ -1260,23 +1255,18 @@ def test_zero_reading_weight_is_the_plain_closed_form_bit_for_bit(
     rates = (
         np.zeros(n_seg) if decay == "zero" else np.array(list(heat.segment_heat_rate(network=heat_network).values()))
     )
+    inputs = _operator_inputs(heat_network, demand, hourly_tedges)
 
-    unweighted = _build_operator(heat_network, demand, hourly_tedges, rates, with_target_terms=False)
-    zero_weight = _build_operator(
-        heat_network,
-        demand,
-        hourly_tedges,
-        rates,
-        with_target_terms=False,
-        bin_end_rate=np.zeros(len(heat_network.endmembers)),
+    core = core_paths_transfer(**inputs, segment_decay=rates)
+    relaxation, terms = paths_transfer(
+        **inputs,
+        segment_decay=rates,
+        bin_end_rate=np.zeros(len(heat_network.endmembers)) if weighted else None,
     )
 
-    for field in unweighted._fields:
-        left, right = getattr(unweighted, field), getattr(zero_weight, field)
-        if left is None:
-            assert right is None
-        else:
-            np.testing.assert_array_equal(left, right, err_msg=f"field {field}")
+    assert terms is not None
+    for field in core._fields:
+        np.testing.assert_array_equal(getattr(core, field), getattr(relaxation, field), err_msg=f"field {field}")
 
 
 @pytest.mark.parametrize("rate", [0.0, 0.5, 5.336, 40.0])
@@ -1296,7 +1286,7 @@ def test_end_of_bin_weight_reduces_to_its_closed_form_without_travel(rate):
     values = 10.0 + np.random.default_rng(0).normal(0.0, 3.0, n_bins)
     flow = np.full((1, n_bins), 500.0)
 
-    transfer = paths_transfer(
+    transfer, _ = paths_transfer(
         tedges_days=days,
         cout_tedges_days=days,
         segment_volume=np.array([100.0]),
@@ -1334,7 +1324,7 @@ def test_end_of_bin_weight_matches_the_brute_force_oracle_on_a_travelling_path(r
     segment_flow = np.vstack([downstream + 250.0 + 100.0 * np.cos(2.0 * np.pi * hours / 17.0), downstream])
     volume, decay = np.array([120.0, 45.0]), np.array([0.35, 0.6])
 
-    transfer = paths_transfer(
+    transfer, _ = paths_transfer(
         tedges_days=days,
         cout_tedges_days=days,
         segment_volume=volume,
@@ -1381,7 +1371,7 @@ def test_ramp_weight_reduces_to_its_closed_form_without_travel(rate):
     values = 10.0 + np.random.default_rng(1).normal(0.0, 3.0, n_bins)
     flow = np.full((1, n_bins), 500.0)
 
-    transfer = paths_transfer(
+    transfer, _ = paths_transfer(
         tedges_days=days,
         cout_tedges_days=days,
         segment_volume=np.array([100.0]),
@@ -1413,7 +1403,7 @@ def test_ramp_weight_matches_the_brute_force_oracle_on_a_travelling_path(rate):
     segment_flow = np.vstack([downstream + 250.0 + 100.0 * np.cos(2.0 * np.pi * hours / 17.0), downstream])
     volume, decay = np.array([120.0, 45.0]), np.array([0.35, 0.6])
 
-    transfer = paths_transfer(
+    transfer, _ = paths_transfer(
         tedges_days=days,
         cout_tedges_days=days,
         segment_volume=volume,
@@ -1467,7 +1457,7 @@ def test_ramp_readings_carry_the_bias_and_the_tilt_exactly(heat_network, short_t
     requested = [node]
     paths = [heat_network.segments.index.get_indexer(list(heat_network.paths[node]))]
     days = tedges_to_days(short_tedges)
-    transfer = paths_transfer(
+    transfer, terms = paths_transfer(
         tedges_days=days,
         cout_tedges_days=days,
         segment_volume=heat_network.segments["volume"].to_numpy(dtype=float),
@@ -1478,14 +1468,13 @@ def test_ramp_readings_carry_the_bias_and_the_tilt_exactly(heat_network, short_t
         active=np.ones((1, len(paths[0])), dtype=bool),
         bin_end_rate=np.array([reading_rate]),
         bin_end_power=np.array([1]),
-        with_target_terms=True,
         n_target_modes=2,
     )
     columns = np.clip(transfer.col_start[..., None] + np.arange(transfer.band_vals.shape[-1]), 0, n_bins - 1)
     actual = np.einsum("nkb,nkb->nk", transfer.band_vals, tin[columns])[0]
     # The tilt convention "tilt * (x/L - 1/2)" is mode 1 of the shifted Legendre basis at
     # half its amplitude: P1(2 xi - 1) = 2 xi - 1.
-    actual += apply_segment_targets(transfer, np.stack([targets, tilts / 2.0]))[0]
+    actual += apply_segment_targets(transfer, terms, np.stack([targets, tilts / 2.0]))[0]
     actual = np.where(transfer.valid_out[0], actual, np.nan)
 
     rows = paths[0]
@@ -1514,7 +1503,7 @@ def test_bias_weights_are_non_negative_and_complete_the_row_sum(heat_network, sh
     """
     demand = heat_network.flow_array(diurnal_demand(heat_network, short_tedges))
     rates = np.array(list(heat.segment_heat_rate(network=heat_network).values()))
-    transfer = _build_operator(heat_network, demand, short_tedges, rates)
+    transfer, terms = _build_operator(heat_network, demand, short_tedges, rates)
     n_seg, n_bins = len(heat_network.segments), len(short_tedges) - 1
 
     total = np.zeros_like(transfer.band_vals[..., 0])
@@ -1522,7 +1511,7 @@ def test_bias_weights_are_non_negative_and_complete_the_row_sum(heat_network, sh
         for bin_index in range(n_bins):
             impulse = np.zeros((n_seg, n_bins))
             impulse[segment, bin_index] = 1.0
-            weights = apply_segment_targets(transfer, impulse)
+            weights = apply_segment_targets(transfer, terms, impulse)
             assert weights.min() >= -1e-15, f"negative weight at segment {segment}, bin {bin_index}"
             total += weights
 
@@ -1534,10 +1523,12 @@ def test_constant_target_telescopes_to_the_surviving_fraction(heat_network, hour
     """A spatially and temporally constant target is delivered as ``c (1 - W row sum)``."""
     demand = heat_network.flow_array(diurnal_demand(heat_network, hourly_tedges))
     rates = np.array(list(heat.segment_heat_rate(network=heat_network).values()))
-    transfer = _build_operator(heat_network, demand, hourly_tedges, rates)
+    transfer, terms = _build_operator(heat_network, demand, hourly_tedges, rates)
 
     constant = 17.3
-    bias = apply_segment_targets(transfer, np.full((len(heat_network.segments), len(hourly_tedges) - 1), constant))
+    bias = apply_segment_targets(
+        transfer, terms, np.full((len(heat_network.segments), len(hourly_tedges) - 1), constant)
+    )
     expected = constant * (1.0 - transfer.band_vals.sum(axis=2))
     np.testing.assert_allclose(bias[transfer.valid_out], expected[transfer.valid_out], atol=1e-11)
 
@@ -1546,11 +1537,11 @@ def test_zero_rates_give_zero_bias_and_conservative_transport(heat_network, hour
     """With no exchange the bias vanishes and the operator is the conservative one."""
     demand = heat_network.flow_array(diurnal_demand(heat_network, hourly_tedges))
     n_seg, n_bins = len(heat_network.segments), len(hourly_tedges) - 1
-    transfer = _build_operator(heat_network, demand, hourly_tedges, np.zeros(n_seg))
+    transfer, terms = _build_operator(heat_network, demand, hourly_tedges, np.zeros(n_seg))
 
     rng = np.random.default_rng(3)
     targets = rng.uniform(5.0, 25.0, size=(n_seg, n_bins))
-    bias = apply_segment_targets(transfer, targets)
+    bias = apply_segment_targets(transfer, terms, targets)
     # Exact in real arithmetic; in floating point the telescoping of computed differences
     # leaves a residue of order eps times the target scale.
     assert np.abs(bias).max() < 1e-13 * np.abs(targets).max()
@@ -1573,10 +1564,10 @@ def test_bias_matches_the_brute_force_oracle(heat_network, short_tedges, diurnal
     targets = rng.uniform(8.0, 24.0, size=(n_seg, n_bins))
     tin = rng.uniform(6.0, 14.0, size=n_bins)
 
-    transfer = _build_operator(heat_network, demand, short_tedges, rates, nodes=[node])
+    transfer, terms = _build_operator(heat_network, demand, short_tedges, rates, nodes=[node])
     columns = np.clip(transfer.col_start[..., None] + np.arange(transfer.band_vals.shape[-1]), 0, n_bins - 1)
     actual = np.einsum("nkb,nkb->nk", transfer.band_vals, tin[columns])[0]
-    actual += apply_segment_targets(transfer, targets)[0]
+    actual += apply_segment_targets(transfer, terms, targets)[0]
     actual = np.where(transfer.valid_out[0], actual, np.nan)
 
     rows = heat_network.segments.index.get_indexer(list(heat_network.paths[node]))
@@ -1615,12 +1606,12 @@ def test_tilt_bias_matches_the_brute_force_oracle(heat_network, short_tedges, di
     tilts = rng.uniform(-6.0, 6.0, size=(n_seg, n_bins))
     tin = rng.uniform(6.0, 14.0, size=n_bins)
 
-    transfer = _build_operator(heat_network, demand, short_tedges, rates, nodes=[node], n_target_modes=2)
+    transfer, terms = _build_operator(heat_network, demand, short_tedges, rates, nodes=[node], n_target_modes=2)
     columns = np.clip(transfer.col_start[..., None] + np.arange(transfer.band_vals.shape[-1]), 0, n_bins - 1)
     actual = np.einsum("nkb,nkb->nk", transfer.band_vals, tin[columns])[0]
     # The tilt convention "tilt * (x/L - 1/2)" is mode 1 of the shifted Legendre basis at
     # half its amplitude: P1(2 xi - 1) = 2 xi - 1.
-    actual += apply_segment_targets(transfer, np.stack([targets, tilts / 2.0]))[0]
+    actual += apply_segment_targets(transfer, terms, np.stack([targets, tilts / 2.0]))[0]
     actual = np.where(transfer.valid_out[0], actual, np.nan)
 
     rows = heat_network.segments.index.get_indexer(list(heat_network.paths[node]))
@@ -1640,12 +1631,16 @@ def test_tilt_bias_matches_the_brute_force_oracle(heat_network, short_tedges, di
     np.testing.assert_allclose(actual[both], expected[both], atol=1e-11)
 
     # A zero tilt must not move a bit, and a zero-rate segment's tilt must not act at all.
-    plain = apply_segment_targets(transfer, targets)
-    np.testing.assert_array_equal(apply_segment_targets(transfer, np.stack([targets, np.zeros_like(tilts)])), plain)
-    conservative = _build_operator(heat_network, demand, short_tedges, np.zeros(n_seg), nodes=[node], n_target_modes=2)
+    plain = apply_segment_targets(transfer, terms, targets)
     np.testing.assert_array_equal(
-        apply_segment_targets(conservative, np.stack([targets, tilts / 2.0])),
-        apply_segment_targets(conservative, targets),
+        apply_segment_targets(transfer, terms, np.stack([targets, np.zeros_like(tilts)])), plain
+    )
+    conservative, cons_terms = _build_operator(
+        heat_network, demand, short_tedges, np.zeros(n_seg), nodes=[node], n_target_modes=2
+    )
+    np.testing.assert_array_equal(
+        apply_segment_targets(conservative, cons_terms, np.stack([targets, tilts / 2.0])),
+        apply_segment_targets(conservative, cons_terms, targets),
     )
 
 
@@ -1738,10 +1733,10 @@ def test_bias_handles_transits_landing_exactly_on_bin_edges():
     targets = rng.uniform(10.0, 20.0, size=(3, n_bins))
     tin = rng.uniform(5.0, 15.0, size=n_bins)
 
-    transfer = _build_operator(network, demand, tedges, rates)
+    transfer, terms = _build_operator(network, demand, tedges, rates)
     columns = np.clip(transfer.col_start[..., None] + np.arange(transfer.band_vals.shape[-1]), 0, n_bins - 1)
     actual = np.einsum("nkb,nkb->nk", transfer.band_vals, tin[columns])[0]
-    actual += apply_segment_targets(transfer, targets)[0]
+    actual += apply_segment_targets(transfer, terms, targets)[0]
 
     days = tedges_to_days(tedges)
     oracle = OraclePath(
@@ -1764,11 +1759,11 @@ def test_batched_nodes_of_mixed_depth_agree_with_single_node_calls(heat_network,
     rng = np.random.default_rng(29)
     targets = rng.uniform(8.0, 24.0, size=(len(heat_network.segments), len(short_tedges) - 1))
 
-    batched = _build_operator(heat_network, demand, short_tedges, rates, nodes=["A", "T4"])
-    batched_bias = apply_segment_targets(batched, targets)
+    batched, batched_terms = _build_operator(heat_network, demand, short_tedges, rates, nodes=["A", "T4"])
+    batched_bias = apply_segment_targets(batched, batched_terms, targets)
     for row, node in enumerate(["A", "T4"]):
-        alone = _build_operator(heat_network, demand, short_tedges, rates, nodes=[node])
-        np.testing.assert_allclose(apply_segment_targets(alone, targets)[0], batched_bias[row], rtol=1e-13)
+        alone, alone_terms = _build_operator(heat_network, demand, short_tedges, rates, nodes=[node])
+        np.testing.assert_allclose(apply_segment_targets(alone, alone_terms, targets)[0], batched_bias[row], rtol=1e-13)
         np.testing.assert_array_equal(alone.valid_out[0], batched.valid_out[row])
 
 
@@ -1783,7 +1778,7 @@ def test_target_terms_carry_only_the_rows_still_on_a_path(heat_network, short_te
     demand = heat_network.flow_array(diurnal_demand(heat_network, short_tedges))
     rates = np.array(list(heat.segment_heat_rate(network=heat_network).values()))
     nodes = ["A", "B", "T4"]  # paths of depth 1, 2 and 3
-    terms = _build_operator(heat_network, demand, short_tedges, rates, nodes=nodes).target_terms
+    _, terms = _build_operator(heat_network, demand, short_tedges, rates, nodes=nodes)
 
     depths = np.array([len(heat_network.paths[node]) for node in nodes])
     assert len(terms.segment_of) == int(depths.max())
@@ -2133,7 +2128,9 @@ def test_one_way_model_is_the_first_iterate(heat_network, hourly_tedges, diurnal
         spinup="constant",
     )
     padded = np.concatenate([np.full(system.n_pad, tin[0]), tin])
-    expected = apply_banded(system.reporting, padded) + apply_segment_targets(system.reporting, system.t_inf)
+    expected = apply_banded(system.reporting, padded) + apply_segment_targets(
+        system.reporting, system.reporting_terms, system.t_inf
+    )
     expected[~system.reporting.valid_out] = np.nan
 
     np.testing.assert_array_equal(np.isnan(one_way), np.isnan(expected))
@@ -2638,8 +2635,10 @@ def test_leaf_delivery_rows_agree_with_the_transport_module(heat_network, short_
     n_seg = len(heat_network.segments)
     # The rates the operator was built with, per cover class; what they should be is pinned
     # separately, and reusing them here keeps this test about the operator rows alone.
-    rates = dict(zip(heat_network.segments.index, system.internal.target_terms.segment_rate[:n_seg], strict=True))
-    bare = apply_banded(system.internal, tin) + apply_segment_targets(system.internal, np.zeros((n_seg, n)))
+    rates = dict(zip(heat_network.segments.index, system.internal_terms.segment_rate[:n_seg], strict=True))
+    bare = apply_banded(system.internal, tin) + apply_segment_targets(
+        system.internal, system.internal_terms, np.zeros((n_seg, n))
+    )
     bare = np.where(system.internal.valid_out, bare, np.nan)
 
     checked = 0
@@ -3454,7 +3453,6 @@ def test_a_multi_year_sub_daily_grid_counts_as_uniform(heat_pipe, freq, periods)
         node_flow=np.full((1, periods), volume * 12.0),
         paths_idx=np.zeros((1, 1), dtype=np.intp),
         active=np.ones((1, 1), dtype=bool),
-        with_target_terms=True,
     )
 
 
