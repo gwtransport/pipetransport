@@ -211,6 +211,7 @@ from pipetransport._heat_transfer import (
 )
 from pipetransport._transfer import NetworkTransfer, _running_start, apply_banded, pad_paths, resolve_spinup
 from pipetransport._validation import _validate_no_nan, _validate_positive, _validate_tedges
+from pipetransport.examples import example_network
 from pipetransport.network import PipeNetwork
 from pipetransport.utils import solve_inverse_transport_banded, tedges_to_days
 
@@ -725,7 +726,7 @@ class HeatNetwork(PipeNetwork):
     --------
     source_to_endmember : Forward direction, which reads this table.
     segment_heat_rate : The exchange rate this table implies, as a standalone diagnostic.
-    pipetransport.examples.example_heat_network : A ready-made four-endmember heat network.
+    example_heat_network : A ready-made four-endmember heat network.
 
     Examples
     --------
@@ -825,6 +826,57 @@ class HeatNetwork(PipeNetwork):
             raise ValueError(msg)
 
 
+def example_heat_network() -> HeatNetwork:
+    """Build the example network dressed for the heat pair: cover, burial and soil per segment.
+
+    The same seven segments as :func:`example_network`, plus the columns
+    :class:`~pipetransport.heat.HeatNetwork` needs. The trunk and the branches to T1, T2 and
+    T4 run under grass, the rest under pavement, and the burial depths vary a little from
+    pipe to pipe so no two pipes share a soil field by accident. The wall, film and surface
+    defaults are left alone: a bare pipe under a prescribed-temperature surface.
+
+    Returns
+    -------
+    HeatNetwork
+        The example network with ``cover``, ``depth``, ``alpha`` and ``kappa_soil`` per
+        segment and ``eta = 0.41`` throughout.
+
+    See Also
+    --------
+    example_network : The transport-only network these segments come from.
+    pipetransport.heat.source_to_endmember : Consumes this network.
+
+    Examples
+    --------
+    >>> from pipetransport.heat import example_heat_network
+    >>> network = example_heat_network()
+    >>> network.endmembers
+    ('T1', 'T2', 'T3', 'T4')
+    >>> row = network.segments.loc["C-T4"]
+    >>> row["cover"], float(row["depth"]), float(row["kappa_soil"])
+    ('grass', 0.8, 0.025)
+    """
+    soil = {
+        "grass": {"cover": "grass", "alpha": 0.05, "kappa_soil": 0.025, "eta": 0.41},
+        "paved": {"cover": "paved", "alpha": 0.075, "kappa_soil": 0.035, "eta": 0.41},
+    }
+    buried = {
+        "Plant-A": ("grass", 1.2),
+        "A-B": ("grass", 1.0),
+        "A-C": ("paved", 1.0),
+        "B-T1": ("paved", 0.9),
+        "B-T2": ("grass", 1.0),
+        "C-T3": ("paved", 1.0),
+        "C-T4": ("grass", 0.8),
+    }
+    pipes = example_network().segments.drop(columns="volume").to_dict(orient="index")
+    segments = {
+        name: {**pipe, **soil[cover], "depth": depth}
+        for (name, pipe), (cover, depth) in zip(pipes.items(), buried.values(), strict=True)
+    }
+    return HeatNetwork(segments=segments, source="Plant")
+
+
 def segment_heat_rate(*, network: HeatNetwork) -> dict[str, float]:
     """Compute the per-segment heat exchange rate [1/day] from the wall and soil resistances.
 
@@ -874,7 +926,7 @@ def segment_heat_rate(*, network: HeatNetwork) -> dict[str, float]:
     Small pipes equilibrate much faster: a 100 mm service line runs a tenfold higher rate
     than the 400 mm trunk main.
 
-    >>> from pipetransport.examples import example_heat_network
+    >>> from pipetransport.heat import example_heat_network
     >>> from pipetransport.heat import segment_heat_rate
     >>> rates = segment_heat_rate(network=example_heat_network())
     >>> round(rates["C-T4"], 2), round(rates["Plant-A"], 2)
@@ -1839,7 +1891,8 @@ def source_to_endmember(
 
     >>> import numpy as np
     >>> import pandas as pd
-    >>> from pipetransport.examples import example_heat_network, example_demand
+    >>> from pipetransport.examples import example_demand
+    >>> from pipetransport.heat import example_heat_network
     >>> from pipetransport.heat import source_to_endmember
     >>>
     >>> network = example_heat_network()
@@ -2015,7 +2068,8 @@ def endmember_to_source(
 
     >>> import numpy as np
     >>> import pandas as pd
-    >>> from pipetransport.examples import example_heat_network, example_demand
+    >>> from pipetransport.examples import example_demand
+    >>> from pipetransport.heat import example_heat_network
     >>> from pipetransport.heat import (
     ...     HeatNetwork,
     ...     source_to_endmember,

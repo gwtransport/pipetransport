@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from _oracle import OraclePath
+from _oracle_heat import RelaxingOraclePath
 from scipy.fft import rfft
 from scipy.integrate import quad
 from scipy.linalg import solve_banded
@@ -1478,7 +1479,7 @@ def test_ramp_readings_carry_the_bias_and_the_tilt_exactly(heat_network, short_t
     actual = np.where(transfer.valid_out[0], actual, np.nan)
 
     rows = paths[0]
-    expected = OraclePath(
+    expected = RelaxingOraclePath(
         tedges_days=days,
         segment_flow=heat_network.segment_flow(flow=demand)[rows],
         segment_volume=heat_network.segments["volume"].to_numpy(dtype=float)[rows],
@@ -1572,7 +1573,7 @@ def test_bias_matches_the_brute_force_oracle(heat_network, short_tedges, diurnal
 
     rows = heat_network.segments.index.get_indexer(list(heat_network.paths[node]))
     days = tedges_to_days(short_tedges)
-    oracle = OraclePath(
+    oracle = RelaxingOraclePath(
         tedges_days=days,
         segment_flow=heat_network.segment_flow(flow=demand)[rows],
         segment_volume=heat_network.segments["volume"].to_numpy(dtype=float)[rows],
@@ -1616,7 +1617,7 @@ def test_tilt_bias_matches_the_brute_force_oracle(heat_network, short_tedges, di
 
     rows = heat_network.segments.index.get_indexer(list(heat_network.paths[node]))
     days = tedges_to_days(short_tedges)
-    expected = OraclePath(
+    expected = RelaxingOraclePath(
         tedges_days=days,
         segment_flow=heat_network.segment_flow(flow=demand)[rows],
         segment_volume=heat_network.segments["volume"].to_numpy(dtype=float)[rows],
@@ -1667,7 +1668,7 @@ def test_oracle_tilt_target_is_its_own_splitting_limit():
     shared = dict(tedges_days=tedges_days, node_flow=flow)
 
     # The slope convention "slope * (x/L - 1/2)" is mode 1 at half its amplitude.
-    tilt = OraclePath(
+    tilt = RelaxingOraclePath(
         segment_flow=flow[None],
         segment_volume=[volume],
         segment_decay=[rate],
@@ -1679,7 +1680,7 @@ def test_oracle_tilt_target_is_its_own_splitting_limit():
 
     def split(m):
         mids = (np.arange(m) + 0.5) / m - 0.5
-        return OraclePath(
+        return RelaxingOraclePath(
             segment_flow=np.tile(flow, (m, 1)),
             segment_volume=np.full(m, volume / m),
             segment_decay=np.full(m, rate),
@@ -1694,7 +1695,7 @@ def test_oracle_tilt_target_is_its_own_splitting_limit():
     assert gap_fine < 0.05, gap_fine
     assert gap_fine < gap_coarse / 3.0, (gap_coarse, gap_fine)
 
-    zeroed = OraclePath(
+    zeroed = RelaxingOraclePath(
         segment_flow=flow[None],
         segment_volume=[volume],
         segment_decay=[rate],
@@ -1702,7 +1703,7 @@ def test_oracle_tilt_target_is_its_own_splitting_limit():
         segment_target_modes=np.zeros((1, 1, n)),
         **shared,
     ).tout(tin=tin, cout_tedges_days=tedges_days)
-    plain = OraclePath(
+    plain = RelaxingOraclePath(
         segment_flow=flow[None], segment_volume=[volume], segment_decay=[rate], segment_target=c0[None], **shared
     ).tout(tin=tin, cout_tedges_days=tedges_days)
     np.testing.assert_array_equal(zeroed, plain)
@@ -1739,7 +1740,7 @@ def test_bias_handles_transits_landing_exactly_on_bin_edges():
     actual += apply_segment_targets(transfer, terms, targets)[0]
 
     days = tedges_to_days(tedges)
-    oracle = OraclePath(
+    oracle = RelaxingOraclePath(
         tedges_days=days,
         segment_flow=network.segment_flow(flow=demand),
         segment_volume=network.segments["volume"].to_numpy(dtype=float),

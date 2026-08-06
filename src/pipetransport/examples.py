@@ -20,9 +20,6 @@ Available functions:
 - :func:`example_demand` - Diurnal demand for its endmembers on a given time grid, as a mapping
   from endmember name to a bin-constant array.
 
-- :func:`example_heat_network` - The same network dressed for :mod:`pipetransport.heat`: land
-  cover, burial depth and soil properties per segment.
-
 This file is part of pipetransport which is released under AGPL-3.0 license.
 See the ./LICENSE file or go to https://github.com/gwtransport/pipetransport/blob/main/LICENSE for full license details.
 """
@@ -33,7 +30,6 @@ import numpy as np
 import numpy.typing as npt
 import pandas as pd
 
-from pipetransport.heat import HeatNetwork
 from pipetransport.network import PipeNetwork
 
 # Mean demand [m³/day], relative diurnal amplitude [-] and peak hour [h] of each endmember of
@@ -137,54 +133,3 @@ def example_demand(*, tedges: pd.DatetimeIndex, network: PipeNetwork) -> dict[st
             for i, name in enumerate(network.endmembers)
         )
     }
-
-
-def example_heat_network() -> HeatNetwork:
-    """Build the example network dressed for the heat pair: cover, burial and soil per segment.
-
-    The same seven segments as :func:`example_network`, plus the columns
-    :class:`~pipetransport.heat.HeatNetwork` needs. The trunk and the branches to T1, T2 and
-    T4 run under grass, the rest under pavement, and the burial depths vary a little from
-    pipe to pipe so no two pipes share a soil field by accident. The wall, film and surface
-    defaults are left alone: a bare pipe under a prescribed-temperature surface.
-
-    Returns
-    -------
-    HeatNetwork
-        The example network with ``cover``, ``depth``, ``alpha`` and ``kappa_soil`` per
-        segment and ``eta = 0.41`` throughout.
-
-    See Also
-    --------
-    example_network : The transport-only network these segments come from.
-    pipetransport.heat.source_to_endmember : Consumes this network.
-
-    Examples
-    --------
-    >>> from pipetransport.examples import example_heat_network
-    >>> network = example_heat_network()
-    >>> network.endmembers
-    ('T1', 'T2', 'T3', 'T4')
-    >>> row = network.segments.loc["C-T4"]
-    >>> row["cover"], float(row["depth"]), float(row["kappa_soil"])
-    ('grass', 0.8, 0.025)
-    """
-    soil = {
-        "grass": {"cover": "grass", "alpha": 0.05, "kappa_soil": 0.025, "eta": 0.41},
-        "paved": {"cover": "paved", "alpha": 0.075, "kappa_soil": 0.035, "eta": 0.41},
-    }
-    buried = {
-        "Plant-A": ("grass", 1.2),
-        "A-B": ("grass", 1.0),
-        "A-C": ("paved", 1.0),
-        "B-T1": ("paved", 0.9),
-        "B-T2": ("grass", 1.0),
-        "C-T3": ("paved", 1.0),
-        "C-T4": ("grass", 0.8),
-    }
-    pipes = example_network().segments.drop(columns="volume").to_dict(orient="index")
-    segments = {
-        name: {**pipe, **soil[cover], "depth": depth}
-        for (name, pipe), (cover, depth) in zip(pipes.items(), buried.values(), strict=True)
-    }
-    return HeatNetwork(segments=segments, source="Plant")
