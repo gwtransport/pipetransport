@@ -829,7 +829,7 @@ class HeatNetwork(PipeNetwork):
 def example_heat_network() -> HeatNetwork:
     """Build the example network dressed for the heat pair: cover, burial and soil per segment.
 
-    The same seven segments as :func:`example_network`, plus the columns
+    The same seven segments as :func:`pipetransport.examples.example_network`, plus the columns
     :class:`~pipetransport.heat.HeatNetwork` needs. The trunk and the branches to T1, T2 and
     T4 run under grass, the rest under pavement, and the burial depths vary a little from
     pipe to pipe so no two pipes share a soil field by accident. The wall, film and surface
@@ -843,7 +843,7 @@ def example_heat_network() -> HeatNetwork:
 
     See Also
     --------
-    example_network : The transport-only network these segments come from.
+    pipetransport.examples.example_network : The transport-only network these segments come from.
     pipetransport.heat.source_to_endmember : Consumes this network.
 
     Examples

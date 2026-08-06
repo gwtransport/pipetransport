@@ -340,7 +340,6 @@ def segment_decay_rate(
     See Also
     --------
     pipetransport.transport.source_to_endmember : Consumes the returned mapping.
-    pipetransport.heat.segment_heat_rate : The heat analogue of this helper.
 
     Examples
     --------

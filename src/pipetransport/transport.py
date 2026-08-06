@@ -94,8 +94,7 @@ def source_to_endmember(
         ``"constant"`` (default) warm-starts the record by extending it backwards at the
         first observed demand and quality, so the earliest output bins carry a value instead
         of NaN. ``None`` keeps strict validity: any output bin fed even partly from before
-        the record is NaN. The heat pair layers two slower memories on top of this one; see
-        :func:`pipetransport.heat.source_to_endmember`.
+        the record is NaN.
 
     Returns
     -------
@@ -126,7 +125,8 @@ def source_to_endmember(
     ``decay_rate`` and ``retardation_factor`` combine as
     ``exp(-decay_rate * retardation_factor * t_water)``, with ``t_water`` the residence time of
     the water: the rate applies over the whole retarded transit, so the adsorbed and dissolved
-    phases decay alike. This matches :mod:`gwtransport`, which feeds a retarded residence time
+    phases decay alike. This matches the `gwtransport <https://github.com/gwtransport/gwtransport>`_
+    package, which feeds a retarded residence time
     to its log-removal, and is the convention of radioactive decay (Bear and Cheng, 2010,
     eq. 7.4.7). A compound that degrades only while dissolved decays as
     ``exp(-decay_rate * t_water)`` instead -- the retardation cancels, since the compound is

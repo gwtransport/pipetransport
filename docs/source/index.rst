@@ -163,6 +163,8 @@ For the label coordinate, the arrival map, and why the flow-weighted average is 
 
    user_guide/concepts
    user_guide/assumptions
+   user_guide/concepts_heat
+   user_guide/assumptions_heat
    user_guide/modules
 
 .. toctree::

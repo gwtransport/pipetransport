@@ -776,9 +776,10 @@ def resolve_spinup(
     usefully be warm-started, holding every endmember demand at its first *running* value --
     the first observed one for a record that opens flowing, the first nonzero one for a
     record that opens idle -- so the earliest output bins are fed by a defined (if assumed)
-    history instead of coming back NaN. The idle case matters most for the heat pair: a
-    record opening on standing water otherwise opens on an unseeded content state, and the
-    first flow resumption books a violent record-opening transient. A path is discarded as a candidate when its warm start is undefined -- a zero or
+    history instead of coming back NaN. The idle case matters most to a model carrying a
+    memory of its own: a record opening on standing water otherwise opens on an unseeded
+    state, and the first flow resumption books a violent record-opening transient. A path
+    is discarded as a candidate when its warm start is undefined -- a zero or
     non-finite leading flow -- or when the padding it implies is so long that a constant
     history is not a meaningful assumption; those paths keep their strict-validity NaN. Both
     judgements are made **per path**, so one stagnant or unreachably deep branch costs only

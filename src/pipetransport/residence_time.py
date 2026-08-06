@@ -21,8 +21,8 @@ Available functions, the two directions of the same travel time:
   reported on ``cout_tedges``.
 
 Both averages are volume-weighted, matching the bin averaging of :mod:`pipetransport.transport`,
-and both are NaN where the record does not constrain the bin. The names match the transport and
-heat pairs, but the asymmetry there does not apply: neither direction takes an observation, so
+and both are NaN where the record does not constrain the bin. The names match the transport
+pair, but the asymmetry there does not apply: neither direction takes an observation, so
 both report per node and both keep ``report_nodes``. In particular this
 :func:`endmember_to_source` is a per-node report looking backward in time, not a reconstruction
 of a source series.
