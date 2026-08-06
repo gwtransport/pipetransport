@@ -57,7 +57,6 @@ from pipetransport._transfer import (
     NetworkTransfer,
     _cell_edges,
     _CellGrid,
-    _surviving_fraction,
 )
 
 # A segment's content snapshot is anchored on the water it actually delivered; the anchor is
@@ -807,7 +806,6 @@ def paths_transfer(
     weight_integrated = (
         np.zeros(n_nodes, dtype=bool) if bin_end_integrated is None else np.asarray(bin_end_integrated, dtype=bool)
     )
-    weighted_rows = bin_end_rate is not None or bin_end_power is not None or bin_end_integrated is not None
     lag_to_bin_end = np.maximum(bin_end[:, None, :] - cells.quarter_arrival, 0.0)
     lag_lo, lag_hi = _cell_edges(lag_to_bin_end)
 
@@ -817,13 +815,14 @@ def paths_transfer(
             np.take_along_axis(node_flow, np.clip(cout_bin, 0, n_cin - 1), axis=1)
             / np.asarray(bin_end_scale, dtype=float)[:, None]
         )
-    if weighted_rows:
-        band_weights = _WeightedBasis(
-            phi_lo, phi_hi, lag_lo, lag_hi, weight_rate, weight_power, weight_integrated, poly_scale
-        )
-        cell_survive = band_weights.powers(np.zeros_like(phi_lo), np.zeros_like(phi_hi), 0)[0]
-    else:
-        cell_survive = _surviving_fraction(phi_lo, phi_hi)
+    # One route, weighted or not. At zero rate and power the basis contracts against
+    # ``E_0``, which is the closed form :func:`~pipetransport._transfer._surviving_fraction`
+    # evaluates -- bitwise, not merely to a tolerance, so an unweighted reading needs no
+    # branch of its own.
+    band_weights = _WeightedBasis(
+        phi_lo, phi_hi, lag_lo, lag_hi, weight_rate, weight_power, weight_integrated, poly_scale
+    )
+    cell_survive = band_weights.powers(np.zeros_like(phi_lo), np.zeros_like(phi_hi), 0)[0]
     band_vals, col_start, valid_out, residence_time_out = cells.bands(cell_survive)
 
     # The per-depth stages of the forward sweep, re-run here rather than kept by the
